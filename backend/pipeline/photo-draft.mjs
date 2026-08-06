@@ -595,6 +595,15 @@ function fixLabels(svg, designI18n) {
   return svg.replace(/>([^<>]+)</g, (m, text) => '>' + translate(text) + '<')
 }
 
+// freesewing's rendered SVG occasionally carries a bare "&" (branding link query
+// strings, a label built from free text) that's valid in a JS string but not in
+// XML — resvg's strict parser throws "malformed entity reference" on it. Escape
+// any "&" that isn't already a real entity (&amp; &lt; &#160; etc) before doing
+// anything else with the markup.
+function escapeBareAmpersands(svg) {
+  return svg.replace(/&(?!amp;|lt;|gt;|quot;|apos;|#[0-9]+;|#x[0-9a-fA-F]+;)/g, '&amp;')
+}
+
 // freesewing tiles each guideline's label (chest line, waist line, etc) many times
 // along the dashed line as one literal repeated string, so the label stays visible
 // wherever you look along the line — but on a printed/on-screen sheet it just reads
@@ -679,7 +688,7 @@ if (errors.length) {
   process.exit(1)
 }
 
-let svg = inlineFillStroke(stripBranding(stripTitleAndLogo(collapseRepeatedLabels(fixLabels(pattern.render(), i18n)))))
+let svg = inlineFillStroke(stripBranding(stripTitleAndLogo(collapseRepeatedLabels(fixLabels(escapeBareAmpersands(pattern.render()), i18n)))))
 // A design with no sleeveLength option (buildOptions already logged this to `skipped`)
 // always drafts a full sleeve, even for a photo that's actually sleeveless — remove the
 // sleeve (and its cuff/placket-overlap pieces) entirely instead of shipping an unwanted

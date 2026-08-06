@@ -4,8 +4,9 @@ import { STRINGS } from "../strings"
 
 // A wipe, not two shrinking panes: both images fill the SAME box at the same
 // object-fit, and the left layer is clipped at the divider, so the two plates
-// stay in register (variations.py renders the realistic at the sketch's own
-// aspect ratio, so `contain` in a shared box lands them pixel-for-pixel).
+// stay in register (variations.py renders the realistic as the same two
+// closed views, front-left/back-right, at the sketch's own aspect ratio, so
+// `contain` in a shared box lands them pixel-for-pixel).
 // Collapses to a single plate when there is genuinely nothing on the right.
 export default function SplitCompare({
   leftUrl,

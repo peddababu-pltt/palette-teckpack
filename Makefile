@@ -1,8 +1,9 @@
 \
 # Techpack Studio (Palette plugin) — dev, compatibility, and publish flow.
 # `pltt` runs via node_modules/.bin so nothing needs a global npm install.
-# Backend targets (ruff, contract-test's pip install) expect the repo's Python
-# venv activated first: `source ../venv/bin/activate`.
+# `pltt dev`/`pltt test`/`pltt preview`/`pltt publish` manage their own
+# Python venvs (.palette/dev/backend-venv, .palette/test-venv) automatically.
+# Only `make ruff`/`make install` need a venv of your own activated first.
 
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
@@ -19,7 +20,7 @@ help: ## Show this list
 
 install: ## Install frontend (npm) deps and backend (pip) lint/runtime deps
 	npm install
-	pip install fastapi httpx sqlalchemy --group dev
+	pip install --group dev .
 
 doctor: ## Check local tooling: Node version, ports, manifest, entries, bundling
 	$(PLTT) doctor

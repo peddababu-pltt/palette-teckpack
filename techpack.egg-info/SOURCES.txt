@@ -1,6 +1,9 @@
 README.md
 pyproject.toml
 backend/api/main.py
+backend/pipeline/_bootstrap_deps.py
+backend/pipeline/_bootstrap_node.py
+backend/pipeline/_svg_render.py
 backend/pipeline/block_rules.py
 backend/pipeline/body_measurment.py
 backend/pipeline/detect_parts.py

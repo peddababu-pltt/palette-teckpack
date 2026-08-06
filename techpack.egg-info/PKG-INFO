@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: techpack
-Version: 1.0.1
+Version: 1.0.13
 Requires-Python: >=3.12
 Requires-Dist: fastapi>=0.129.0
 Requires-Dist: python-multipart==0.0.32
@@ -9,7 +9,9 @@ Requires-Dist: pillow==12.3.0
 Requires-Dist: python-dotenv==1.2.2
 Requires-Dist: anthropic==0.116.0
 Requires-Dist: numpy==2.5.1
-Requires-Dist: scipy
+Requires-Dist: scipy==1.18.0
 Requires-Dist: scikit-image==0.26.0
 Requires-Dist: vtracer==0.6.15
 Requires-Dist: svgpathtools==1.7.2
+Requires-Dist: cairosvg==2.9.0
+Requires-Dist: pymupdf==1.27.2

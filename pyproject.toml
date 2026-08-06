@@ -10,6 +10,12 @@ dependencies = [
   # measure_garment.py, flat2svg_auto.py + their own subprocess children) run
   # under this same interpreter (`sys.executable`), so their runtime deps must
   # be declared here.
+  # sqlalchemy: not used by this plugin's own code, but palette_sdk
+  # (node_modules/@palettelab/cli/backend-sdk) imports it at module load time,
+  # and `pltt test`'s .palette/test-venv only installs deps listed here — omit
+  # it and every fresh clone hits "ModuleNotFoundError: No module named
+  # 'sqlalchemy'" on `pltt test` / `pltt preview` / `pltt publish`.
+  "sqlalchemy>=2.0.47",
   "requests==2.34.2",
   "pillow==12.3.0",
   "python-dotenv==1.2.2",

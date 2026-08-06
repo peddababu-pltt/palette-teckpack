@@ -28,31 +28,24 @@ from warp_pattern import (
     extract_outputs, download_output,
 )
 
-# Both views ship inside ONE render: closed on top, opened underneath. Keeping them
-# in a single image is what lets the overlay's compare slider wipe the flat against
-# the whole garment story at once -- and the flat itself is a front/back pair, so a
-# closed+open realistic still registers row-for-row against it.
-# The open row is where the lining, facings and inner panels become visible -- the
-# whole reason construction references get uploaded -- so it is asked for explicitly
-# rather than left to the model's mood. Conditional on purpose: a pullover has
-# nothing to open, and forcing a second row onto one invents construction that
-# isn't there.
+# Exactly the two views, closed, front-left/back-right -- matching the flat's own
+# layout is what lets the overlay's compare slider wipe the flat against the
+# realistic render pixel-for-pixel. No open/lining row: it inflated the canvas
+# height past the flat's aspect ratio (triggering SplitCompare's misalignment
+# warning) and the model kept duplicating the closed row alongside it.
 _OPEN_CLOSED_LAYOUT = (
     "LAYOUT — READ CAREFULLY, the output is compared against the input by overlaying one on "
     "the other, so its geometry is not a free choice. "
     "1) The output image must have the SAME width-to-height proportion as the input image. "
     "Never return a square image for a wide input. "
-    "2) The TOP ROW must reproduce the input's layout EXACTLY: the same views in the same "
-    "left-to-right order at the same relative positions and scale — front view on the LEFT, "
-    "back view on the RIGHT, side by side. NEVER stack the front view above the back view, "
-    "never reorder them, never re-centre or re-crop them. Laid over the input, each garment "
-    "in the top row must sit directly on top of its counterpart in the input. "
-    "3) THEN, only if the garment has a real front opening (zip, buttons, snaps, or a wrap), "
-    "add a SECOND ROW underneath showing the SAME garment OPENED — opened front view on the "
-    "left, opened back view on the right, in the same two columns as the row above, with the "
-    "opening spread apart so the lining, facings and inner panels are clearly visible. "
-    "4) If the garment has NO front opening (a pullover, tee, or one-piece), output the top "
-    "row ONLY and leave no second row — never invent an opening the garment does not have."
+    "2) Reproduce the input's layout EXACTLY: the same two views in the same left-to-right "
+    "order at the same relative positions and scale — front view on the LEFT, back view on "
+    "the RIGHT, side by side. NEVER stack the front view above the back view, never reorder "
+    "them, never re-centre or re-crop them. Laid over the input, each garment must sit "
+    "directly on top of its counterpart in the input. "
+    "3) EXACTLY two views, closed, nothing else. Never add an opened/lining view, never add "
+    "a second row, never repeat a view — the finished image contains front and back and "
+    "nothing more."
 )
 
 # Same rule warp_pattern.py applies to the default flat, so the variants and the
