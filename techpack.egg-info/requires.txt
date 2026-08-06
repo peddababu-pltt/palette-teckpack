@@ -1,0 +1,11 @@
+fastapi>=0.129.0
+python-multipart==0.0.32
+requests==2.34.2
+pillow==12.3.0
+python-dotenv==1.2.2
+anthropic==0.116.0
+numpy==2.5.1
+scipy
+scikit-image==0.26.0
+vtracer==0.6.15
+svgpathtools==1.7.2

@@ -1,0 +1,508 @@
+// Typed fetch helpers + SSE plumbing for the techpack backend
+// (backend/api/main.py, mounted at /api/v1/plugins/<pluginId>/*).
+//
+// Every call here goes through plain `fetch` against `getBaseUrl()`, not the
+// SDK's own `apiFetch` — see `bootstrapBaseUrl` and `apiCall` below for why:
+// in short, `apiFetch` forces both a JSON content-type (breaks multipart
+// uploads) and `credentials: "include"` (breaks under pltt dev's local
+// simulator, whose generated CORS config is allow_origins="*" +
+// allow_credentials=False — those two can never coexist for a browser).
+
+import { getBaseUrl, setBaseUrl } from "@palettelab/sdk"
+
+// The SDK's module-level `getBaseUrl()` defaults to a hardcoded
+// "http://localhost:8000" and is only ever corrected by a call to
+// `setBaseUrl()` — nothing in `pltt dev`'s local no-Docker simulator makes
+// that call (the simulator instead wires a *context-scoped* `platform.apiFetch`
+// straight to the real, dynamically-chosen backend port; that's the only
+// thing guaranteed to be wired correctly there). `getBaseUrl()` is still what
+// every plain `<img src>`, download `<a href>`, `EventSource`, and multipart
+// `fetch` in this file needs, since none of those can be routed through a
+// fetch-wrapper function. Fix it once, at startup, by making one real
+// `platform.apiFetch` call and reading the *actual* URL the browser fetched
+// (`Response.url`, after the simulator's rewrite to `http://127.0.0.1:<port>`)
+// instead of the path we asked for — then `setBaseUrl()` to that origin so
+// every subsequent getBaseUrl()-based call resolves correctly for the rest of
+// the session. Call this once, before rendering anything that depends on it.
+export async function bootstrapBaseUrl(
+  platformApiFetch: (path: string, init?: RequestInit) => Promise<Response>,
+  pluginId: string,
+): Promise<void> {
+  bootstrappedPluginId = pluginId
+  try {
+    const res = await platformApiFetch(`/api/v1/plugins/${pluginId}/health`)
+    if (res.url) {
+      const u = new URL(res.url)
+      setBaseUrl(u.origin)
+      // A preview publish is served through a per-publish gateway prefix
+      // (/api/v1/appstore/previews/<id>/plugins/<pluginId>/...), not the
+      // direct /api/v1/plugins/<pluginId>/... path every other call in this
+      // file assumes, and it's gated by a `preview_token` query param. Both
+      // only show up in the *resolved* health URL — capture them here so
+      // every later call (and every backend-returned file/thumb path) can be
+      // rewritten onto the same gateway instead of 404ing against the direct
+      // path. For a live (non-preview) install these are a no-op: the
+      // resolved path already matches the default and there's no token.
+      resolvedPrefix = u.pathname.replace(/\/health$/, "")
+      previewQuery = u.search
+    }
+  } catch {
+    // Left at the SDK's default; real hosted deployments may already point
+    // it correctly (that path isn't exercised by pltt dev's local simulator).
+  }
+}
+
+let resolvedPrefix: string | null = null
+let previewQuery = ""
+let bootstrappedPluginId: string | null = null
+
+function withPreviewQuery(path: string): string {
+  if (!previewQuery) return path
+  return `${path}${path.includes("?") ? "&" : "?"}${previewQuery.slice(1)}`
+}
+
+// Rewrites a direct /api/v1/plugins/<pluginId>/... path (the shape every
+// backend-returned file/thumb URL uses, and the shape every call below
+// defaults to before bootstrap resolves) onto the preview gateway prefix
+// captured above, when one was captured.
+function rewritePrefix(path: string): string {
+  if (!resolvedPrefix || !bootstrappedPluginId) return path
+  const defaultPrefix = `/api/v1/plugins/${bootstrappedPluginId}`
+  return path.startsWith(defaultPrefix) ? resolvedPrefix + path.slice(defaultPrefix.length) : path
+}
+
+export const SIZES = ["XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL"] as const
+export type Size = (typeof SIZES)[number]
+
+export type OverlayTab = "overview" | "parts" | "pattern" | "spec"
+
+// ---------------- shapes returned by the backend ----------------
+
+export interface AnalyzeMeasurement {
+  key: string
+  label: string
+  cm: number | null
+  how: string
+}
+
+export interface AnalyzeResult {
+  imageKind: "photo" | "flat_sketch" | "not_a_garment" | string
+  garmentCategory: string
+  design: string | null
+  designLabel: string | null
+  bodyRegion: "upper" | "lower" | "full" | null
+  apparentSize: string
+  confidence: number
+  notes: string
+  measurements: AnalyzeMeasurement[]
+}
+
+export interface AnalyzeUnavailable {
+  unavailable: string
+}
+
+export type AnalyzeResponse = AnalyzeResult | AnalyzeUnavailable
+
+export function isAnalyzeUnavailable(a: AnalyzeResponse | null): a is AnalyzeUnavailable {
+  return !!a && "unavailable" in a
+}
+
+export interface Variation {
+  id: string
+  label: string
+  sketch: string | null
+  realistic: string | null
+}
+
+export interface JobOutputs {
+  parts_svg: string | null
+  pattern_svg: string | null
+  pattern_pages: string | null
+  design: string | null
+  measurements: string | null
+  redraw: string | null
+}
+
+export interface PomEntry {
+  name: string
+  values: Record<string, number>
+}
+
+export interface Classification {
+  status: "success" | "failure" | string
+  category?: string
+  subcategory?: string
+  block_type?: string
+  confidence?: number
+  reasoning?: string
+  construction_elements?: string[]
+  selected_size?: string
+  poms?: PomEntry[]
+}
+
+export interface Job {
+  job_id: string
+  sketch: string
+  thumb: string
+  input: string | null
+  size_kb: number
+  mtime: number
+  classification: Classification | null
+  has_sketch: boolean
+  variations: Variation[]
+  references: string[]
+  outputs: JobOutputs
+}
+
+export interface PatternDesign {
+  fit?: string
+  closure?: string
+  buttonCount?: number
+  pockets?: { type: string; count?: number; position?: string }
+  collarStyle?: string
+  neckline?: string
+  sleeveLength?: string
+  [key: string]: unknown
+}
+
+export interface PartInfo {
+  name: string
+  label: string
+  image: string
+  bbox: { x: number; y: number; w: number; h: number; cw: number; ch: number } | null
+}
+
+export interface PartsResponse {
+  garment_type: string | null
+  recombined: string | null
+  parts: PartInfo[]
+}
+
+export type MeasureResult = Classification
+
+// ---------------- SSE event contract ----------------
+
+export type SseHandlers = {
+  onProgress?: (d: { event: "stage_progress"; stage: string; completed: number; total: number; percent: number }) => void
+  onStageDone?: (d: Record<string, any>) => void
+  onError?: (message: string) => void
+  onCancelled?: () => void
+  onDone?: () => void
+  onLine?: (line: string) => void
+}
+
+// Opens an SSE stream for job_id, routes events to the matching handler.
+// `done` is a separate terminal sentinel from `stage_done`, which carries the
+// stage's payload (file urls, classification, etc).
+export function watchJob(pluginId: string, jobId: string, handlers: SseHandlers, stage?: string): EventSource {
+  // No credentials: pltt dev's local simulator CORS-allows any origin but not
+  // credentialed requests (allow_credentials=False), and local dev has no
+  // real session cookie to send anyway. Revisit if a hosted deployment turns
+  // out to need one.
+  //
+  // stage names which of the job's queues to read: parts and pattern run as
+  // independent slots server-side, so omitting it only works for the
+  // create-a-job routes, which never have a second stage running alongside.
+  const query = stage ? `?stage=${encodeURIComponent(stage)}` : ""
+  const path = withPreviewQuery(`${jobsBase(pluginId)}/${jobId}/events${query}`)
+  const es = new EventSource(`${getBaseUrl()}${path}`)
+  es.onmessage = (ev) => {
+    let parsed: any = null
+    try {
+      parsed = JSON.parse(ev.data)
+    } catch {
+      // not JSON -> a raw subprocess log line
+    }
+    if (parsed && parsed.event === "stage_progress") {
+      handlers.onProgress?.(parsed)
+    } else if (parsed && parsed.event === "stage_done") {
+      handlers.onStageDone?.(parsed)
+    } else if (parsed && parsed.event === "error") {
+      handlers.onError?.(parsed.message)
+      es.close()
+    } else if (parsed && parsed.event === "cancelled") {
+      handlers.onCancelled?.()
+      es.close()
+    } else if (parsed && parsed.event === "done") {
+      handlers.onDone?.()
+      es.close()
+    } else {
+      handlers.onLine?.(ev.data)
+    }
+  }
+  // A dropped connection (network hiccup, dev server reload) otherwise leaves
+  // the caller's run promise unresolved forever -- the stage's spinner never
+  // clears and, since the engine's `live` entry is never removed, isLive()
+  // stays true and Rerun silently no-ops on it for good. Surface it instead.
+  es.onerror = () => {
+    handlers.onError?.("lost connection to the server")
+    es.close()
+  }
+  return es
+}
+
+// ---------------- url helpers ----------------
+
+// Job/output URLs from the backend are absolute PATHS on the API host
+// (e.g. "/api/v1/plugins/techpack/jobs/<id>/file/flat_sketch.png"), not full
+// URLs. The plugin frontend runs in its own document (a different origin
+// than the API host in local dev), so every one of those has to be resolved
+// against getBaseUrl() before it can be used as an <img src>, fetch target,
+// download href, etc.
+export function resolveUrl(u: string | null | undefined): string | null {
+  if (!u) return null
+  if (/^https?:\/\//i.test(u)) return u
+  return `${getBaseUrl()}${withPreviewQuery(rewritePrefix(u))}`
+}
+
+// pattern-pages.pdf and parts.svg (+ its part PNGs) are overwritten in place
+// on every (re)trace, so their URL never changes and the browser happily
+// serves a stale cached copy. Cache-bust with the job's mtime.
+export function withCacheBust(url: string | null, mtime: number | null | undefined): string | null {
+  if (!url) return null
+  const v = Math.round((mtime || 0) * 1000)
+  return `${url}${url.includes("?") ? "&" : "?"}v=${v}`
+}
+
+// job_file serves the same URL inline (for <object>/<img> embeds) by default.
+// An <a download> link needs the backend to send Content-Disposition:
+// attachment instead, or Chrome ignores the download attribute cross-origin
+// and navigates to the file — append dl=1 to opt into that.
+export function downloadUrl(url: string | null): string | null {
+  if (!url) return null
+  return `${url}${url.includes("?") ? "&" : "?"}dl=1`
+}
+
+// NOTE: intentionally no preview-query suffix here — every call site below
+// appends more path (`/analyze`, `/jobs/generate`, ...) after `base()`, and a
+// query string has to be last. Those call sites wrap their full URL in
+// withPreviewQuery() themselves instead.
+function base(pluginId: string) {
+  const prefix = resolvedPrefix ?? `/api/v1/plugins/${pluginId}`
+  return `${getBaseUrl()}${prefix}`
+}
+
+function jobsBase(pluginId: string) {
+  return resolvedPrefix ? `${resolvedPrefix}/jobs` : `/api/v1/plugins/${pluginId}/jobs`
+}
+
+// The SDK's own `apiFetch` unconditionally sends `credentials: "include"`
+// (hardcoded inside the SDK, not overridable via init) — which pltt dev's
+// local simulator CORS-rejects (allow_origins="*" only pairs with
+// allow_credentials=False; a credentialed request against a wildcard origin
+// is always blocked by the browser). Use this instead for every JSON call:
+// same relative-path convention, but no credentials, so it matches what the
+// local simulator's generated CORS config actually allows.
+async function apiCall(path: string, init?: RequestInit): Promise<Response> {
+  return fetch(`${getBaseUrl()}${withPreviewQuery(path)}`, init)
+}
+
+// ---------------- REST calls ----------------
+
+export async function analyzeImage(pluginId: string, file: File): Promise<AnalyzeResponse> {
+  const fd = new FormData()
+  fd.append("image", file, file.name || "upload.png")
+  try {
+    const res = await fetch(withPreviewQuery(`${base(pluginId)}/analyze`), { method: "POST", body: fd })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok || data.error) return { unavailable: data.error || "analysis failed" }
+    return data as AnalyzeResult
+  } catch (err: any) {
+    return { unavailable: err?.message || String(err) }
+  }
+}
+
+export interface GenerateParams {
+  photo: File
+  references: File[]
+  prompt: string
+  measurements: Record<string, number> | null
+  mode: "sketch" | "both"
+  variants?: number
+  colors?: string[]
+  season?: string
+}
+
+export async function generateJob(
+  pluginId: string,
+  params: GenerateParams,
+): Promise<{ job_id: string } | { error: string }> {
+  const fd = new FormData()
+  fd.append("photo", params.photo, params.photo.name)
+  params.references.forEach((f) => fd.append("references", f))
+  if (params.prompt) fd.append("prompt", params.prompt)
+  if (params.measurements && Object.keys(params.measurements).length) {
+    fd.append("measurements", JSON.stringify(params.measurements))
+  }
+  fd.append("mode", params.mode)
+  if (params.mode === "sketch") {
+    fd.append("variants", String(params.variants ?? 2))
+  } else {
+    if (params.colors) params.colors.forEach((c) => fd.append("colors", c))
+    if (params.season) fd.append("season", params.season)
+  }
+  try {
+    const res = await fetch(withPreviewQuery(`${base(pluginId)}/jobs/generate`), { method: "POST", body: fd })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok || data.error) return { error: data.error || "request failed" }
+    return data
+  } catch (err: any) {
+    return { error: err?.message || String(err) }
+  }
+}
+
+export async function listJobs(pluginId: string): Promise<Job[]> {
+  try {
+    const res = await apiCall(`${jobsBase(pluginId)}/list`)
+    const data = await res.json()
+    return data.jobs || []
+  } catch {
+    // Network hiccup or a host that hasn't wired the API base yet — degrade
+    // to an empty dashboard rather than crashing the mount effect.
+    return []
+  }
+}
+
+export async function deleteJobApi(pluginId: string, jobId: string): Promise<void> {
+  await apiCall(`${jobsBase(pluginId)}/${jobId}`, { method: "DELETE" })
+}
+
+export async function cancelJobApi(pluginId: string, jobId: string, stage?: string): Promise<void> {
+  const query = stage ? `?stage=${encodeURIComponent(stage)}` : ""
+  try {
+    await apiCall(`${jobsBase(pluginId)}/${jobId}/cancel${query}`, { method: "POST" })
+  } catch {
+    // best-effort — the subprocess may already have exited
+  }
+}
+
+export async function startStage4(pluginId: string, jobId: string): Promise<{ ok?: boolean; error?: string }> {
+  try {
+    const res = await apiCall(`${jobsBase(pluginId)}/${jobId}/stage4`, { method: "POST" })
+    return await res.json()
+  } catch (err: any) {
+    return { error: err?.message || String(err) }
+  }
+}
+
+export async function startStage5(pluginId: string, jobId: string): Promise<{ ok?: boolean; error?: string }> {
+  try {
+    const res = await apiCall(`${jobsBase(pluginId)}/${jobId}/stage5`, { method: "POST" })
+    return await res.json()
+  } catch (err: any) {
+    return { error: err?.message || String(err) }
+  }
+}
+
+export async function startMeasure(
+  pluginId: string,
+  jobId: string,
+  size: string,
+): Promise<{ ok?: boolean; error?: string }> {
+  const fd = new FormData()
+  fd.append("size", size)
+  try {
+    const res = await fetch(withPreviewQuery(`${base(pluginId)}/jobs/${jobId}/measure`), {
+      method: "POST",
+      body: fd,
+    })
+    return await res.json()
+  } catch (err: any) {
+    return { error: err?.message || String(err) }
+  }
+}
+
+export async function getParts(pluginId: string, jobId: string, bust?: number): Promise<PartsResponse | null> {
+  try {
+    const qs = bust ? `?v=${bust}` : ""
+    const res = await apiCall(`${jobsBase(pluginId)}/${jobId}/parts${qs}`)
+    if (!res.ok) return null
+    return await res.json()
+  } catch {
+    return null
+  }
+}
+
+// Fetch a backend-hosted JSON file (pattern-design.json, measurements.json)
+// given its resolved absolute URL.
+export async function fetchJson<T>(absUrl: string): Promise<T | null> {
+  try {
+    const res = await fetch(absUrl)
+    if (!res.ok) return null
+    return (await res.json()) as T
+  } catch {
+    return null
+  }
+}
+
+// Fetch an arbitrary (possibly cross-origin) URL back as a File, used when a
+// gallery thumbnail is dropped onto the sidebar dropzone.
+export async function fetchAsFile(absUrl: string): Promise<File> {
+  const res = await fetch(absUrl)
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const blob = await res.blob()
+  if (!blob.type.startsWith("image/")) throw new Error("not an image")
+  const name = absUrl.split("/").pop()?.split("?")[0] || "dropped.png"
+  return new File([blob], name, { type: blob.type })
+}
+
+// ---------------- progress heuristics (single-stage runs) ----------------
+// A single-script stage (parts SVG, sewing pattern, measure) is ONE backend
+// step, so `stage_progress` fires once at 0% and never moves again. Progress
+// for those is read off milestones the underlying script already prints on
+// stdout — real events in the run, never a timer, so the bar only advances
+// when the pipeline actually reaches that point and never goes backwards.
+type Kind = "parts" | "pattern" | "measure"
+
+const STAGE_MILESTONES: Record<Kind, [RegExp, number][]> = {
+  parts: [
+    [/\binput ok:/, 4],
+    [/\bink threshold:/, 12],
+    [/\d+ regions ->/, 22],
+    [/\bgarment:/, 42],
+    [/groups\.json/, 52],
+    [/relationship graph:/, 60],
+    [/wrote .*\.svg \(\d+ layers/, 90],
+    [/part images ->/, 96],
+    [/\bDone: .*\.svg/, 99],
+  ],
+  pattern: [
+    [/\bPieces:/, 55],
+    [/\bSize:/, 80],
+    [/\bSaved: /, 90],
+    [/one page per part/, 97],
+  ],
+  measure: [[/\bdetected:/, 90], [/not a garment/, 90]],
+}
+
+export function isUpscaleWarningLine(line: string): { exhausted: boolean } | null {
+  if (!/upscale warning/i.test(line)) return null
+  return { exhausted: /exhausted balance|user is locked/i.test(line) }
+}
+
+// Returns a stateful line-consumer: feed it every raw log line, it calls
+// `setPercent` with a monotonically increasing 0-99 estimate.
+export function makeLogProgress(setPercent: (pct: number) => void, kind: Kind) {
+  const milestones = STAGE_MILESTONES[kind] || []
+  let best = 0
+  let regions = 0
+  let layers = 0
+  const TRACE_LO = 60
+  const TRACE_HI = 88
+  const set = (pct: number) => {
+    const p = Math.min(99, Math.max(best, Math.round(pct)))
+    if (p !== best) {
+      best = p
+      setPercent(p)
+    }
+  }
+  return (line: string) => {
+    const m = line.match(/(\d+) regions ->/)
+    if (m) regions = parseInt(m[1], 10)
+    if (/\]\s+\d+ paths/.test(line) && regions > 0) {
+      layers++
+      set(TRACE_LO + Math.min(1, layers / regions) * (TRACE_HI - TRACE_LO))
+    }
+    for (const [re, pct] of milestones) if (re.test(line)) set(pct)
+  }
+}

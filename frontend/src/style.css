@@ -1,0 +1,1947 @@
+/* ============================================================================
+   Palette Techpack — workspace UI
+   ----------------------------------------------------------------------------
+   Design brief: the product of this tool is BLACK LINE ART. Every UI decision
+   below defers to that. The shell is monochrome zinc with a single emerald
+   accent, so nothing on screen competes with the drawing; colour is spent only
+   where it carries meaning (done / error / focus).
+
+   Dark mode is supported for the shell, but every surface that displays
+   artwork stays LIGHT in both themes -- the sketches are black strokes on
+   transparency, so a dark canvas would erase them.
+
+   Class names are unchanged from the previous stylesheet so the existing
+   markup and JS keep working.
+   ========================================================================= */
+
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&family=Syne:wght@600;700;800&display=swap');
+
+:root {
+  /* type ------------------------------------------------------------------ */
+  --font-display: 'Syne', 'Avenir Next', 'Segoe UI', system-ui, sans-serif;
+  --font-ui: 'Manrope', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+
+  /* 4px spacing rhythm ---------------------------------------------------- */
+  --sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px; --sp-4: 16px;
+  --sp-5: 20px; --sp-6: 24px; --sp-8: 32px; --sp-10: 40px;
+
+  --r-sm: 6px; --r-md: 8px; --r-lg: 12px; --r-xl: 16px;
+
+  /* neutral ramp ---------------------------------------------------------- */
+  --zinc-50:  #FAFAFA; --zinc-100: #F4F4F5; --zinc-200: #E4E4E7;
+  --zinc-300: #D4D4D8; --zinc-400: #A1A1AA; --zinc-500: #71717A;
+  --zinc-600: #52525B; --zinc-700: #3F3F46; --zinc-800: #27272A;
+  --zinc-900: #18181B; --zinc-950: #09090B;
+
+  /* semantic -------------------------------------------------------------- */
+  --bg:            var(--zinc-50);
+  --surface:       #FFFFFF;
+  --surface-2:     var(--zinc-100);
+  --canvas:        #FFFFFF;   /* artwork only -- never themed */
+  --canvas-border: var(--zinc-200);
+  --fg:            var(--zinc-900);
+  --fg-muted:      var(--zinc-500);
+  --fg-subtle:     var(--zinc-400);
+  --border:        var(--zinc-200);
+  --border-strong: var(--zinc-300);
+
+  /* Emerald is the brand: it fills the active segment of every toggle, the
+     Generate CTA and the step badges. Zinc stays the neutral shell so the black
+     line art is never competing with UI colour. */
+  --primary:       #0E8A5F;
+  --primary-hover: #0B6E4C;
+  --on-primary:    #FFFFFF;
+  --accent:        #059669;   /* done / success / go */
+  --accent-weak:   #ECFDF5;
+  --accent-text:   #047857;
+  --danger:        #DC2626;
+  --danger-weak:   #FEF2F2;
+  --info-weak:     #EFF6FF;
+  --info-text:     #1D4ED8;
+
+  --shadow-sm: 0 1px 2px rgba(9, 9, 11, .06);
+  --shadow-md: 0 4px 12px rgba(9, 9, 11, .08);
+  --shadow-lg: 0 16px 48px rgba(9, 9, 11, .18);
+
+  --sidebar-w: 380px;
+
+  --dur: 180ms;
+  --ease: cubic-bezier(.4, 0, .2, 1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) {
+    --bg:            var(--zinc-950);
+    --surface:       var(--zinc-900);
+    --surface-2:     var(--zinc-800);
+    --fg:            var(--zinc-100);
+    --fg-muted:      var(--zinc-400);
+    --fg-subtle:     var(--zinc-500);
+    --border:        var(--zinc-800);
+    --border-strong: var(--zinc-700);
+    /* Lifted, not inverted -- the brand stays green in dark mode, just bright
+       enough to keep white label text above 4.5:1. */
+    --primary:       #10996B;
+    --primary-hover: #14B37E;
+    --on-primary:    #FFFFFF;
+    --accent:        #10B981;
+    --accent-weak:   rgba(16, 185, 129, .12);
+    --accent-text:   #34D399;
+    --danger:        #F87171;
+    --danger-weak:   rgba(248, 113, 113, .12);
+    --info-weak:     rgba(59, 130, 246, .14);
+    --info-text:     #93C5FD;
+    --shadow-lg: 0 16px 48px rgba(0, 0, 0, .6);
+  }
+}
+
+/* The in-app colorMode toggle sets/clears `.dark` on <html> (see
+   applyPaletteColorMode in .palette/dev/simulator-entry.jsx). These mirror
+   the media-query block above so the manual toggle wins over the OS
+   preference in both directions. */
+:root.dark {
+  --bg:            var(--zinc-950);
+  --surface:       var(--zinc-900);
+  --surface-2:     var(--zinc-800);
+  --fg:            var(--zinc-100);
+  --fg-muted:      var(--zinc-400);
+  --fg-subtle:     var(--zinc-500);
+  --border:        var(--zinc-800);
+  --border-strong: var(--zinc-700);
+  --primary:       #10996B;
+  --primary-hover: #14B37E;
+  --on-primary:    #FFFFFF;
+  --accent:        #10B981;
+  --accent-weak:   rgba(16, 185, 129, .12);
+  --accent-text:   #34D399;
+  --danger:        #F87171;
+  --danger-weak:   rgba(248, 113, 113, .12);
+  --info-weak:     rgba(59, 130, 246, .14);
+  --info-text:     #93C5FD;
+  --shadow-lg: 0 16px 48px rgba(0, 0, 0, .6);
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+/* The shell is full-bleed: the nav rail is pinned to the viewport's left edge
+   and runs the full height, so body carries no max-width, margin or padding. */
+body {
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.55;
+  margin: 0;
+  padding: 0;
+  color: var(--fg);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* --- header ------------------------------------------------------------- */
+.page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  padding-bottom: var(--sp-4);
+  border-bottom: 1px solid var(--border);
+}
+h1 {
+  font-family: var(--font-display);
+  font-size: 24px;
+  font-weight: 800;
+  letter-spacing: -.02em;
+  margin: 0;
+}
+h2, h3 { font-family: var(--font-display); letter-spacing: -.01em; }
+
+/* --- shell -------------------------------------------------------------- */
+/* One page, two columns -- there is no stage rail: every feature is an action
+   on a dashboard card. */
+.app-shell { display: flex; align-items: stretch; gap: 0; min-height: 100vh; }
+.app-brand {
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: -.02em;
+}
+.app-main { flex: 1; min-width: 0; padding: var(--sp-5) var(--sp-6) var(--sp-10); }
+.dash-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  padding-bottom: var(--sp-4);
+  margin-bottom: var(--sp-5);
+  border-bottom: 1px solid var(--border);
+}
+
+/* Local-dev-only widget: live Palette user/org + theme/language toggles. */
+.platform-bar { display: flex; align-items: center; gap: var(--sp-3); }
+.platform-bar-user { font-size: 12px; color: var(--fg-subtle); white-space: nowrap; }
+
+/* Degraded-run notice: the pipeline finished, but with a stage skipped. */
+.app-banner {
+  margin-bottom: var(--sp-4);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--danger);
+  border-left-width: 3px;
+  border-radius: var(--r-md);
+  background: var(--danger-weak);
+  color: var(--fg);
+  font-size: 13px;
+}
+
+/* --- buttons ------------------------------------------------------------ */
+button { font: inherit; cursor: pointer; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+
+:where(button, a, input, select, textarea, [contenteditable], [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+
+.btn-reset {
+  min-height: 36px;
+  padding: var(--sp-2) var(--sp-3);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.btn-reset:hover { background: var(--surface-2); color: var(--fg); }
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  min-height: 36px;
+  padding: var(--sp-2) var(--sp-4);
+  margin-top: var(--sp-2);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--on-primary);
+  background: var(--primary);
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  text-decoration: none;
+  box-shadow: var(--shadow-sm);
+  transition: transform var(--dur) var(--ease), background var(--dur) var(--ease),
+              box-shadow var(--dur) var(--ease);
+}
+.btn:hover { background: var(--zinc-700); box-shadow: var(--shadow-md); }
+.btn:active { transform: translateY(1px); box-shadow: var(--shadow-sm); }
+.btn-download::before { content: "\2B07"; font-size: 12px; }
+.btn-next { background: var(--accent); }
+.btn-next:hover { background: var(--accent-text); }
+
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) .btn:hover { background: var(--zinc-300); }
+}
+:root.dark .btn:hover { background: var(--zinc-300); }
+
+fieldset {
+  margin: var(--sp-4) 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: var(--sp-4);
+  background: var(--surface);
+}
+legend { font-size: 12px; font-weight: 700; color: var(--fg-muted); padding: 0 var(--sp-2); }
+label { display: inline-block; width: 160px; font-size: 13px; margin: var(--sp-1) 0; }
+
+input[type=number], input[type=text], select, textarea {
+  font: inherit;
+  font-size: 13px;
+  min-height: 36px;
+  padding: var(--sp-1) var(--sp-2);
+  color: var(--fg);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+}
+input[type=number] { width: 84px; }
+
+/* --- dropzone ----------------------------------------------------------- */
+/* The dropzones are <label for> elements so click-to-browse is native, which
+   means the global 160px label width has to be undone here. */
+.dropzone {
+  position: relative;   /* anchors the preview's clear button */
+  width: auto;
+  height: 260px;
+  border: 2px dashed var(--border-strong);
+  border-radius: var(--r-lg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: var(--sp-2);
+  text-align: center;
+  color: var(--fg-muted);
+  cursor: pointer;
+  font-size: 15px;
+  margin-bottom: var(--sp-4);
+  background: var(--surface);
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.dropzone:hover { border-color: var(--fg-subtle); }
+.dropzone.small { height: 160px; font-size: 14px; }
+.dropzone.dragover { border-color: var(--accent); background: var(--accent-weak); color: var(--fg); }
+/* artwork preview keeps a light plate in both themes. It's a confirmation of
+   what's queued, not a viewer -- hence the modest cap. */
+.dropzone img {
+  max-height: 120px;
+  max-width: 80%;
+  background: var(--canvas);
+  border-radius: var(--r-sm);
+}
+.dropzone input[type=file] { display: none; }
+
+.direct-upload {
+  margin: var(--sp-5) 0 var(--sp-8);
+  padding: var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+}
+.direct-upload h2 {
+  font-size: 13px;
+  font-weight: 700;
+  margin: 0 0 var(--sp-3);
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: .06em;
+}
+
+/* --- log ---------------------------------------------------------------- */
+#log {
+  background: var(--zinc-950);
+  color: var(--zinc-200);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  padding: var(--sp-3);
+  height: 200px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+}
+#log .err { color: #FCA5A5; }
+
+.result-panel { margin: var(--sp-5) 0; }
+.thumbs { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.thumbs img {
+  height: 100px;
+  background: var(--canvas);
+  border: 1px solid var(--canvas-border);
+  border-radius: var(--r-sm);
+}
+/* traced artwork -- always on a white plate so black strokes stay visible */
+img.result, object.result {
+  max-width: 100%;
+  background: var(--canvas);
+  border: 1px solid var(--canvas-border);
+  border-radius: var(--r-md);
+}
+/* The staged upload is a confirmation that the right file is queued, not a
+   viewer -- keep it thumbnail-sized so the steps below stay reachable. */
+.upload-preview-wrap {
+  position: relative;
+  display: inline-block;
+  margin-top: var(--sp-3);
+}
+#upload-preview {
+  display: block;
+  width: 96px;
+  height: 96px;
+  object-fit: cover;
+}
+/* Inside a dropzone or a skeleton card it has to sit INSIDE the box -- both
+   clip their overflow, so a negative offset would hide it. Only the staged
+   upload's own wrapper lets it overhang the corner. */
+.dropzone .upload-preview-clear,
+.tp-card-media .upload-preview-clear {
+  top: var(--sp-2);
+  right: var(--sp-2);
+  z-index: 2;
+}
+.upload-preview-clear {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  width: 22px;
+  height: 22px;
+  display: flex; align-items: center; justify-content: center;
+  padding: 0;
+  font-size: 15px;
+  line-height: 1;
+  color: var(--fg-muted);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  box-shadow: var(--shadow-sm);
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.upload-preview-clear:hover {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+.hidden { display: none; }
+
+/* --- manual colour picker ------------------------------------------------
+   One full-width row per slot: enable box, name, swatch. Deselecting a slot
+   greys the whole row instead of only clearing a checkbox. */
+.color-fields { display: flex; flex-direction: column; gap: var(--sp-3); margin: var(--sp-3) 0; }
+.color-field {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+.color-field-name {
+  flex: 1;
+  min-width: 0;
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  font-size: 14px;
+  color: var(--fg);
+  cursor: pointer;
+  user-select: none;
+}
+.color-field input[type="color"] {
+  width: 56px;
+  height: 46px;
+  flex-shrink: 0;
+  padding: var(--sp-1);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  cursor: pointer;
+}
+.color-field.off .color-field-name {
+  background: var(--surface-2);
+  border-color: transparent;
+  color: var(--fg-subtle);
+}
+.color-field.off input[type="color"] { opacity: .4; }
+
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  color: var(--fg-muted);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.link-btn:hover { color: var(--fg); }
+
+#extra-prompt {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: inherit;
+  font-size: 13px;
+  min-height: 150px;
+  padding: var(--sp-3);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  resize: vertical;
+  background: var(--surface);
+  color: var(--fg);
+}
+/* The hint is long -- at body size it wrapped to four lines and dwarfed the
+   box, so it sits a step smaller than the text the user will type. */
+#extra-prompt::placeholder {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--fg-subtle);
+}
+
+/* --- variations --------------------------------------------------------- */
+.variation-grid { display: flex; flex-wrap: wrap; gap: var(--sp-4); align-items: flex-start; }
+.variation-panel {
+  width: 260px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  transition: box-shadow var(--dur) var(--ease);
+}
+.variation-panel:hover { box-shadow: var(--shadow-md); }
+.panel-realistic { width: 100%; display: block; background: var(--canvas); }
+.panel-loading {
+  height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-subtle);
+  font-size: 13px;
+  background: repeating-linear-gradient(-45deg,
+              var(--surface-2) 0 10px, var(--surface) 10px 20px);
+}
+.panel-loading.err {
+  color: var(--danger);
+  flex-direction: column; gap: var(--sp-3);
+  height: auto; min-height: 200px;
+  text-align: left; white-space: pre-wrap;
+  font-family: var(--font-mono, monospace);
+  padding: var(--sp-4);
+  overflow-y: auto;
+}
+.panel-label {
+  background: var(--surface-2);
+  color: var(--fg);
+  text-align: center;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  padding: var(--sp-2);
+  border-top: 1px solid var(--border);
+}
+.panel-downloads { display: flex; gap: var(--sp-2); padding: var(--sp-2); justify-content: center; flex-wrap: wrap; }
+.panel-downloads .btn { margin: 0; min-height: 32px; padding: var(--sp-1) var(--sp-3); font-size: 12px; }
+
+/* --- tables ------------------------------------------------------------- */
+.measure-table {
+  border-collapse: collapse;
+  font-size: 13px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.measure-table th, .measure-table td {
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  text-align: right;
+}
+.measure-table th {
+  background: var(--surface-2);
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: .03em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+.measure-table th:first-child, .measure-table td:first-child { text-align: left; }
+.measure-table th.hl, .measure-table td.hl {
+  background: var(--accent-weak);
+  color: var(--accent-text);
+  font-weight: 700;
+}
+
+/* --- studio layout ------------------------------------------------------ */
+.studio-layout { display: flex; gap: var(--sp-6); align-items: flex-start; position: relative; }
+/* Vertical rule between the form column and the dashboard. Drawn as a
+   pseudo-element on the layout rather than a border on the sidebar: the sidebar
+   is sticky and height-capped, so its own border would stop partway down
+   instead of running the length of the two columns. */
+.studio-layout::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(var(--sidebar-w) + var(--sp-3));
+  width: 1px;
+  background: var(--border);
+  pointer-events: none;
+  z-index: 1;
+}
+/* Grey plate behind the dashboard column so the white cards read as raised off
+   it -- on the near-white page background a white card on white was almost
+   invisible. Painted as a pseudo-element rather than a background on
+   .studio-main: that column is only as tall as its content, so with two cards
+   the tint would have stopped in mid-air. Bleeds right into .app-main's own
+   padding so it reaches the window edge. */
+.studio-layout::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(var(--sidebar-w) + var(--sp-3));
+  right: calc(var(--sp-6) * -1);
+  background: var(--surface-2);
+  pointer-events: none;
+  z-index: -1;
+}
+/* Keeps the plate filling the viewport when only a card or two exist.
+   --sidebar-max is the measured height of the sticky sidebar; see index.html. */
+.studio-layout { min-height: var(--sidebar-max, calc(100vh - 112px)); }
+/* The form column owns its own scroll so the Generate footer can stay pinned
+   to the bottom of the viewport while the steps above it scroll past. */
+.studio-sidebar {
+  width: var(--sidebar-w);
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  position: sticky;
+  top: var(--sp-5);
+  /* --sidebar-max is set from JS to (viewport bottom - the sidebar's ACTUAL top).
+     A static calc can't do this: unpinned the sidebar starts below the page
+     header (~92px) and calc(100vh - 40px) overflowed the viewport, cutting off
+     Generate; pinned it starts at 20px and any header-sized allowance would
+     waste that space instead. The fallback covers the unpinned case before the
+     first measurement lands. */
+  max-height: var(--sidebar-max, calc(100vh - 112px));
+  overflow: hidden;
+}
+/* The scroll lives here, NOT on .studio-sidebar -- with the footer inside the
+   scrolling box the scrollbar track ran the full height and passed behind
+   Output type / Generate. As a sibling of the footer it stops at the footer's
+   top edge, which is where the scrollable content actually ends.
+   min-height:0 is required: a flex child defaults to min-height:auto and would
+   refuse to shrink below its content, so nothing would scroll at all. */
+.studio-sidebar-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+  padding-right: var(--sp-3);
+}
+/* Mirrors the sidebar: the column is capped to the viewport and the cards own
+   the scroll, so the track lives inside the dashboard plate. Before this the
+   right column had no scroll of its own -- the whole page scrolled, so the
+   window scrollbar sat at the far right spanning the Techpack header and the
+   Generate footer as well as the cards. */
+.studio-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  position: sticky;
+  top: var(--sp-5);
+  max-height: var(--sidebar-max, calc(100vh - 112px));
+}
+/* min-height:0 for the same reason as the sidebar scroll: a flex child won't
+   shrink below its content otherwise and nothing would scroll. */
+.studio-main-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: var(--sp-2);
+}
+.studio-main h2 { font-size: 17px; margin: 0; font-weight: 700; }
+.studio-main-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-3);
+}
+
+.studio-step { padding-bottom: var(--sp-4); border-bottom: 1px solid var(--border); }
+.studio-step:last-child { border-bottom: none; }
+.studio-step-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--sp-3);
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+.studio-step-title {
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: .02em;
+}
+.studio-substep { margin-top: var(--sp-4); }
+/* No longer sticky -- it sits outside the scrolling box now, so it is pinned by
+   being the last flex row rather than by overlaying the scrolled content. */
+.studio-footer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  flex-shrink: 0;
+  padding: var(--sp-4) var(--sp-3) 0 0;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+}
+.studio-note { font-size: 12px; color: var(--fg-subtle); margin: var(--sp-1) 0; }
+.studio-substep-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--fg-muted);
+  display: block;
+  margin-bottom: var(--sp-2);
+}
+.studio-substep-label span { font-weight: 400; color: var(--fg-subtle); }
+
+/* --- segmented controls ------------------------------------------------- */
+.toggle-group, .toolbar-group {
+  display: inline-flex;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  overflow: hidden;
+  background: var(--surface);
+}
+.toggle-btn, .toolbar-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-height: 34px;
+  padding: var(--sp-1) var(--sp-3);
+  font-size: 12px;
+  font-weight: 600;
+  background: transparent;
+  border: none;
+  border-right: 1px solid var(--border);
+  color: var(--fg-muted);
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.toggle-btn:last-child, .toolbar-btn:last-child { border-right: none; }
+.toggle-btn:hover, .toolbar-btn:hover { background: var(--surface-2); color: var(--fg); }
+.toggle-btn.active, .toolbar-btn.active { background: var(--primary); color: var(--on-primary); }
+.toggle-btn.active:hover, .toolbar-btn.active:hover {
+  background: var(--zinc-700); color: var(--on-primary);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) .toggle-btn.active:hover, :root:not(.light) .toolbar-btn.active:hover { background: var(--zinc-300); }
+}
+:root.dark .toggle-btn.active:hover, :root.dark .toolbar-btn.active:hover { background: var(--zinc-300); }
+
+.tab-panel { margin-top: var(--sp-2); }
+
+/* A step the current output type ignores: visible, but plainly not in play. */
+
+/* --- season cards -------------------------------------------------------- */
+.season-cards {
+  display: grid;
+  /* Five across, one row -- with a 4-column grid Rain wrapped onto a row of its
+     own. Narrower columns also shrink the icon plates, which is the point. */
+  grid-template-columns: repeat(5, 1fr);
+  gap: var(--sp-1);
+  margin: var(--sp-3) 0;
+}
+.season-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-1);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  cursor: pointer;
+  font-size: 11px;
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.season-card:hover { border-color: var(--border-strong); }
+.season-card.active {
+  border-color: var(--fg);
+  box-shadow: 0 0 0 1px var(--fg);
+}
+.season-icon {
+  width: 100%;
+  aspect-ratio: 1;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: var(--r-sm);
+  font-size: 17px;
+  line-height: 1;
+}
+.season-icon.spring { background: #E6F6EC; }
+.season-icon.summer { background: #FDEBD8; }
+.season-icon.autumn { background: #FBF0CE; }
+.season-icon.winter { background: #DCE9F9; }
+.season-icon.rain   { background: #D9EDF2; }
+
+/* --- upload gate -------------------------------------------------------- */
+.upload-error {
+  font-size: 12px;
+  margin: var(--sp-2) 0 0;
+  padding: var(--sp-2) var(--sp-3);
+  color: var(--danger);
+  background: var(--danger-weak);
+  border-radius: var(--r-sm);
+}
+
+/* --- measurements ------------------------------------------------------- */
+.measure-detected { margin: var(--sp-3) 0; }
+.measure-detected-region {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  text-transform: capitalize;
+}
+.measure-detected .studio-note { margin-top: 2px; }
+/* Two columns: a dozen-plus fields in one column would push Color and Season
+   off the bottom of the sidebar. */
+.measure-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-2);
+  margin: var(--sp-3) 0;
+}
+.measure-field { display: flex; flex-direction: column; gap: 2px; cursor: help; }
+.measure-field span {
+  font-size: 11px;
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.measure-field input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--sp-2);
+  font: inherit;
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+.measure-field input:focus { outline: none; border-color: var(--border-strong); }
+
+/* --- reference thumbs --------------------------------------------------- */
+.ref-thumbs { display: flex; gap: var(--sp-2); flex-wrap: wrap; margin-bottom: var(--sp-2); }
+.ref-thumb { position: relative; width: 56px; height: 56px; }
+.ref-thumb img {
+  width: 100%; height: 100%;
+  object-fit: cover;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  background: var(--canvas);
+}
+.ref-thumb-remove {
+  position: absolute; top: -6px; right: -6px;
+  width: 20px; height: 20px; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--fg-muted);
+  font-size: 12px; line-height: 1;
+  box-shadow: var(--shadow-sm);
+}
+.ref-thumb-remove:hover { background: var(--danger-weak); color: var(--danger); border-color: var(--danger); }
+
+/* --- upload ------------------------------------------------------------- */
+.upload-mode { transition: opacity var(--dur) var(--ease); }
+.s2-dropzone {
+  height: 180px !important;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: var(--sp-2);
+  cursor: pointer;
+}
+.s2-dropzone.dragover { border-color: var(--accent); background: var(--accent-weak); }
+.dropzone-icon { margin-bottom: 2px; color: var(--fg-subtle); }
+.dropzone-title { font-size: 14px; font-weight: 700; color: var(--fg); }
+.dropzone-hint { font-size: 12px; color: var(--fg-muted); }
+.dropzone-formats { font-size: 11px; color: var(--fg-subtle); }
+
+/* --- output cards ------------------------------------------------------- */
+.tp-card-grid { display: flex; flex-direction: column; gap: var(--sp-2); }
+.tp-output-card {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease),
+              box-shadow var(--dur) var(--ease);
+}
+.tp-output-card.ready { border-color: var(--border-strong); }
+.tp-output-card.ready:hover { border-color: var(--accent); box-shadow: var(--shadow-md); }
+.tp-output-card.disabled { opacity: .45; }
+.tp-output-icon {
+  width: 36px; height: 36px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--surface-2);
+  color: var(--fg-muted);
+  border-radius: var(--r-md);
+  flex-shrink: 0;
+}
+.tp-output-card.ready .tp-output-icon { background: var(--accent-weak); color: var(--accent-text); }
+.tp-output-info { flex: 1; min-width: 0; }
+.tp-output-title { font-size: 13px; font-weight: 700; color: var(--fg); }
+.tp-output-status { font-size: 11px; color: var(--fg-muted); margin-top: 2px; }
+.tp-output-card.ready .tp-output-status { color: var(--accent-text); font-weight: 600; }
+.tp-output-open {
+  min-height: 34px;
+  padding: var(--sp-1) var(--sp-4);
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--fg-muted);
+  flex-shrink: 0;
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease),
+              color var(--dur) var(--ease);
+}
+.tp-output-open:disabled { cursor: not-allowed; opacity: .45; }
+.tp-output-card.ready .tp-output-open { border-color: var(--primary); color: var(--fg); }
+.tp-output-card.ready .tp-output-open:hover {
+  background: var(--primary); color: var(--on-primary); border-color: var(--primary);
+}
+
+/* --- overlays ----------------------------------------------------------- */
+.tp-overlay {
+  position: fixed; inset: 0;
+  background: rgba(9, 9, 11, .55);
+  backdrop-filter: blur(3px);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 100;
+  padding: var(--sp-4);
+  animation: overlay-in var(--dur) var(--ease);
+}
+.tp-overlay.hidden { display: none; }
+.tp-overlay-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-xl);
+  max-width: 720px; width: 100%;
+  /* Percentage, not `vh`: the plugin frontend renders inside Palette OS's own
+     app window, which can be shorter than the real browser viewport, so `vh`
+     let the panel size itself past the window's edge. `.tp-overlay` is
+     `position: fixed; inset: 0`, so its own box always matches whatever
+     that window actually gives us, and a percentage height stays inside it. */
+  max-height: 100%; overflow-y: auto;
+  padding: var(--sp-5);
+  box-shadow: var(--shadow-lg);
+  animation: panel-in var(--dur) var(--ease);
+}
+/* Every scrolling pane inside a card overlay hides its bar and keeps its scroll.
+   The overlay is already a floating plate over a blurred backdrop, and a grey
+   rail down its right edge cut across the drawing, the parts list and the
+   pattern pages -- three bars visible at once on the pattern tab. Scrolling
+   still works by wheel, trackpad, drag and keyboard; only the rail is gone.
+   Deliberately scoped to the overlay: the sidebar and the dashboard keep their
+   bars, since those are full-page columns where the rail is the only cue that
+   there is more below. */
+.tp-overlay-panel,
+.tp-parts-list,
+.tp-pdf-pages-card,
+.tp-measure-table-wrap,
+.tp-detail-side {
+  scrollbar-width: none;          /* Firefox */
+  -ms-overflow-style: none;       /* old Edge/IE */
+}
+.tp-overlay-panel::-webkit-scrollbar,
+.tp-parts-list::-webkit-scrollbar,
+.tp-pdf-pages-card::-webkit-scrollbar,
+.tp-measure-table-wrap::-webkit-scrollbar,
+.tp-detail-side::-webkit-scrollbar {
+  width: 0; height: 0;
+}
+.tp-overlay-wide { max-width: 1100px; }
+.tp-overlay-header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: var(--sp-3);
+  margin-bottom: var(--sp-4);
+}
+.tp-overlay-header h2 { font-size: 17px; margin: 0; }
+.tp-overlay-close {
+  background: none; border: none;
+  width: 36px; height: 36px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 22px; line-height: 1;
+  color: var(--fg-muted);
+  border-radius: var(--r-md);
+  flex-shrink: 0;
+}
+.tp-overlay-close:hover { color: var(--fg); background: var(--surface-2); }
+
+/* --- detail overlay: artwork left, spec right --------------------------- */
+.tp-badge-generated {
+  display: inline-block;
+  margin-left: var(--sp-2);
+  padding: 2px var(--sp-2);
+  border-radius: 999px;
+  background: var(--accent-weak);
+  color: var(--accent-text);
+  font-size: 11px; font-weight: 600;
+  vertical-align: middle;
+}
+.tp-detail-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: var(--sp-5);
+  align-items: start;
+}
+.tp-detail-media {
+  position: relative;
+  background: var(--canvas);
+  border: 1px solid var(--canvas-border);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+}
+.tp-tag {
+  position: absolute; top: var(--sp-3); left: var(--sp-3); z-index: 1;
+  padding: 2px var(--sp-2);
+  border-radius: var(--r-sm);
+  background: var(--zinc-700); color: #fff;
+  font-size: 10px; font-weight: 700; letter-spacing: .06em;
+}
+.tp-detail-image { display: block; width: 100%; height: auto; }
+.tp-detail-side h3 {
+  font-size: 13px; font-weight: 700;
+  margin: 0 0 var(--sp-3);
+}
+.tp-detail-side h3 + * { margin-bottom: var(--sp-5); }
+
+.tp-spec-table {
+  width: 100%;
+  border-collapse: collapse;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  overflow: hidden;
+  font-size: 13px;
+}
+.tp-spec-table tr + tr { border-top: 1px solid var(--border); }
+.tp-spec-table th,
+.tp-spec-table td { padding: var(--sp-3); vertical-align: top; }
+.tp-spec-table th { text-align: left; font-weight: 500; color: var(--fg-muted); white-space: nowrap; }
+.tp-spec-table td { text-align: right; color: var(--fg); }
+
+.tp-thumb-row { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.tp-thumb-item {
+  width: 88px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  overflow: hidden;
+  background: var(--canvas);
+}
+.tp-thumb-item img { display: block; width: 100%; height: auto; }
+.tp-thumb-item span {
+  display: block;
+  padding: var(--sp-1) var(--sp-2);
+  background: var(--zinc-700); color: #fff;
+  font-size: 10px; text-align: center;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+@keyframes overlay-in { from { opacity: 0 } to { opacity: 1 } }
+@keyframes panel-in {
+  from { opacity: 0; transform: translateY(8px) scale(.99) }
+  to   { opacity: 1; transform: none }
+}
+
+/* --- modal actions ------------------------------------------------------ */
+.tp-modal-actions { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.tp-modal-btn {
+  min-height: 34px;
+  padding: var(--sp-1) var(--sp-3);
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--fg-muted);
+  white-space: nowrap;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.tp-modal-btn:hover { background: var(--surface-2); color: var(--fg); }
+
+/* --- SVG viewer --------------------------------------------------------- */
+.tp-svg-viewer { border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; }
+.tp-svg-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.tp-ctrl-btn {
+  min-width: 34px; min-height: 30px;
+  padding: var(--sp-1) var(--sp-2);
+  font-size: 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  line-height: 1.2;
+  color: var(--fg-muted);
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.tp-ctrl-btn:hover { background: var(--surface-2); color: var(--fg); }
+.tp-svg-zoom-level {
+  font-size: 12px;
+  color: var(--fg-muted);
+  min-width: 44px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.tp-layer-toggle {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--fg-muted);
+  display: flex; align-items: center; gap: var(--sp-1);
+}
+/* the drawing surface itself -- white in both themes */
+.tp-svg-canvas {
+  width: 100%;
+  height: 500px;
+  overflow: hidden;
+  background: var(--canvas);
+  position: relative;
+  cursor: grab;
+}
+.tp-svg-canvas:active { cursor: grabbing; }
+.tp-svg-scroll {
+  transform-origin: center center;
+  transition: transform var(--dur) var(--ease);
+  width: 100%; height: 100%;
+  display: flex; align-items: center; justify-content: center;
+}
+.tp-svg-scroll object { max-width: 100%; max-height: 100%; pointer-events: none; }
+
+/* --- sketch / realistic split ------------------------------------------- */
+/* The plate itself carries the frame, so the wrapper drops its own border to
+   avoid doubling it. */
+.tp-detail-media-plain { border: none; background: none; border-radius: 0; }
+.tp-split {
+  position: relative;
+  height: 520px;
+  border: 1px solid var(--canvas-border);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  background: var(--canvas);
+  cursor: col-resize;
+  touch-action: none;
+}
+/* Both layers occupy the whole plate identically -- that shared box is what
+   keeps front-behind-front and back-behind-back as the wipe moves. */
+.tp-split-layer {
+  position: absolute;
+  inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--canvas);
+}
+.tp-split-layer img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+/* The sketch rides on top, revealed from the left edge up to the divider. */
+.tp-split-clip { clip-path: inset(0 calc(100% - var(--split)) 0 0); }
+.tp-split-single { cursor: default; }
+.tp-tag-right { left: auto; right: var(--sp-3); }
+/* Grabbable rail at the wipe edge: 16px of hit area over a 2px visual line. */
+.tp-split-divider {
+  position: absolute;
+  top: 0; bottom: 0;
+  left: var(--split);
+  width: 16px;
+  margin-left: -8px;
+  cursor: col-resize;
+  display: flex; align-items: center; justify-content: center;
+  touch-action: none;
+}
+.tp-split-divider::before {
+  content: "";
+  position: absolute;
+  top: 0; bottom: 0; left: 7px;
+  width: 2px;
+  background: var(--border-strong);
+}
+.tp-split-grip {
+  position: absolute;
+  width: 34px; height: 34px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-md);
+  color: var(--fg-muted);
+  font-size: 13px;
+  letter-spacing: -1px;
+  pointer-events: none;
+}
+.tp-split-warn {
+  position: absolute;
+  left: 50%;
+  bottom: var(--sp-3);
+  transform: translateX(-50%);
+  max-width: 92%;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-sm);
+  background: var(--danger-weak);
+  color: var(--danger);
+  font-size: 12px;
+  text-align: center;
+  pointer-events: none;
+}
+.tp-split.is-dragging { user-select: none; }
+.tp-split.is-dragging .tp-split-divider::before { background: var(--accent); }
+
+.tp-thumb-item { cursor: pointer; transition: border-color var(--dur) var(--ease); }
+.tp-thumb-item:hover { border-color: var(--border-strong); }
+.tp-thumb-item.is-active { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-weak); }
+.tp-notes-list {
+  margin: 0;
+  padding-left: var(--sp-5);
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--fg);
+}
+
+/* --- viewer + parts list ------------------------------------------------ */
+/* Drawing on the left, every traced part listed on the right, read together. */
+.tp-viewer-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 260px;
+  gap: var(--sp-4);
+  align-items: start;
+}
+.tp-viewer-main { min-width: 0; }
+.tp-parts-card {
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  overflow: hidden;
+}
+.tp-parts-head {
+  padding: var(--sp-3);
+  border-bottom: 1px solid var(--border);
+}
+.tp-parts-head h3 { font-size: 13px; font-weight: 700; margin: 0; }
+.tp-parts-count {
+  margin-left: var(--sp-1);
+  padding: 1px var(--sp-2);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--fg-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+/* 20+ parts is normal, so the list scrolls inside the card instead of
+   stretching the overlay past the drawing. */
+.tp-parts-list {
+  max-height: 470px;
+  overflow-y: auto;
+  padding: var(--sp-1);
+}
+.tp-part-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  min-height: 40px;
+  padding: var(--sp-1) var(--sp-2);
+  border: none;
+  background: none;
+  border-radius: var(--r-sm);
+  font: inherit;
+  font-size: 12px;
+  color: var(--fg);
+  text-align: left;
+}
+.tp-part-row:hover { background: var(--surface-2); }
+.tp-part-row.is-active { background: var(--accent-weak); color: var(--accent-text); font-weight: 600; }
+.tp-part-row img {
+  width: 32px; height: 32px;
+  flex-shrink: 0;
+  object-fit: contain;
+  background: var(--canvas);
+  border: 1px solid var(--canvas-border);
+  border-radius: var(--r-sm);
+}
+.tp-part-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A single part on the stage sits under the same zoom/pan transform as the SVG. */
+.tp-part-stage { max-width: 100%; max-height: 100%; object-fit: contain; }
+
+/* --- PDF viewer (sewing pattern pages) --------------------------------- */
+/* pattern-pages.pdf, one page per cut piece: every page stacked in a scrollable
+   column on the left, a page thumbnail list on the right. Reuses the parts-card
+   shell for the list so the pattern tab reads like the parts tab. */
+.tp-pdf-viewer { border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; }
+/* No inner scroller: a 560px window inside an already-scrolling overlay panel
+   put two scrollbars on the same gesture and made the pages feel boxed in. The
+   column runs to its full height and the panel is the only thing that scrolls. */
+.tp-pdf-scroll {
+  position: relative;
+  background: var(--canvas);
+  padding: var(--sp-4);
+}
+/* The page list has to stay reachable now that the column beside it can run
+   several screens tall. */
+.tp-pdf-pages-card {
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+  max-height: 80vh;
+  overflow-y: auto;
+}
+.tp-pdf-page {
+  display: flex;
+  justify-content: center;
+  margin: 0 0 var(--sp-4);
+  cursor: zoom-in;
+}
+.tp-pdf-page:last-child { margin-bottom: 0; }
+.tp-pdf-page canvas {
+  max-width: 100%;
+  height: auto;
+  background: #fff;
+  border: 1px solid var(--canvas-border);
+  border-radius: var(--r-sm);
+  box-shadow: var(--shadow-md);
+}
+.tp-pdf-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  padding: var(--sp-10) 0;
+  font-size: 13px;
+  color: var(--fg-muted);
+}
+.tp-pdf-thumb {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  min-height: 40px;
+  padding: var(--sp-1) var(--sp-2);
+  border: none;
+  background: none;
+  border-radius: var(--r-sm);
+  font: inherit;
+  font-size: 12px;
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+}
+.tp-pdf-thumb:hover { background: var(--surface-2); }
+.tp-pdf-thumb.is-active { background: var(--accent-weak); color: var(--accent-text); font-weight: 600; }
+.tp-pdf-thumb canvas {
+  width: 46px;
+  height: auto;
+  flex-shrink: 0;
+  background: #fff;
+  border: 1px solid var(--canvas-border);
+  border-radius: var(--r-sm);
+}
+
+/* --- measurements modal ------------------------------------------------- */
+.tp-measure-table-wrap { overflow-x: auto; margin-top: var(--sp-3); }
+.tp-measure-table-wrap .measure-table { width: 100%; }
+.tp-measure-table-wrap .measure-table td {
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+}
+.tp-measure-table-wrap .measure-table td[contenteditable] {
+  background: var(--surface);
+  cursor: text;
+  min-width: 60px;
+}
+.tp-measure-table-wrap .measure-table td[contenteditable]:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+/* width:auto beats the global 160px label width -- this one is a flex row that
+   has to shrink-wrap its select. */
+.tp-units-label { width: auto; font-size: 12px; color: var(--fg-muted); display: flex; align-items: center; gap: var(--sp-1); }
+.tp-units-select {
+  min-height: 32px;
+  padding: var(--sp-1) var(--sp-2);
+  font-size: 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--fg);
+}
+
+/* --- spec sheet --------------------------------------------------------- */
+.tp-spec-editor { margin-top: var(--sp-3); }
+.tp-spec-section {
+  margin-bottom: var(--sp-4);
+  padding-bottom: var(--sp-3);
+  border-bottom: 1px solid var(--border);
+}
+.tp-spec-section h3 {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--fg-muted);
+  margin: 0 0 var(--sp-2);
+  text-transform: uppercase;
+  letter-spacing: .06em;
+}
+.tp-spec-content {
+  font-size: 13px;
+  color: var(--fg);
+  padding: var(--sp-2);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  min-height: 20px;
+  line-height: 1.6;
+}
+.tp-spec-content[contenteditable]:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  background: var(--surface);
+}
+
+/* --- colour swatches ---------------------------------------------------- */
+.color-swatch-row { display: flex; gap: var(--sp-2); flex-wrap: wrap; margin: var(--sp-2) 0; }
+.color-swatch {
+  width: 32px; height: 32px;
+  border-radius: var(--r-sm);
+  border: 2px solid var(--border);
+  cursor: pointer;
+  transition: transform var(--dur) var(--ease), border-color var(--dur) var(--ease),
+              box-shadow var(--dur) var(--ease);
+}
+.color-swatch:hover { transform: scale(1.12); border-color: var(--fg); box-shadow: var(--shadow-md); }
+
+/* --- gallery cards ------------------------------------------------------
+   Every dashboard card is one garment output and carries the whole pipeline:
+   download / parts SVG / overflow menu float over the artwork, Edit and Spec
+   sit in the card's footer. */
+.tp-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: var(--sp-4);
+  align-items: start;
+}
+.tp-card {
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface-2);
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.tp-card:hover { border-color: var(--border-strong); box-shadow: var(--shadow-md); }
+.tp-card-media {
+  position: relative;
+  aspect-ratio: 4 / 5;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--surface-2);
+}
+/* Clips just the thumbnail to the card's top corners -- not the whole media
+   tile, which also holds the "..." dropdown. That menu can be taller than
+   this tile (5 items vs. 3) and needs to spill past it into the caption/foot
+   area below without getting cut off; only the image needs rounded corners. */
+.tp-card-thumb-clip {
+  width: 100%; height: 100%;
+  overflow: hidden;
+  border-radius: var(--r-lg) var(--r-lg) 0 0;
+}
+/* The sketch is black line art on transparency -- it needs a light band
+   behind it in both themes, hence --canvas rather than --surface. */
+/* Fills the whole tile rather than sizing itself off the image: with height:auto
+   a 1344x768 flat left the tile short and a 832x1248 one left it narrow, so the
+   light band behind the line art changed shape card to card. The thumbnail the
+   server hands over is already cropped to the ink and padded to this tile's
+   aspect ratio, so filling it draws every garment at the same scale. */
+.tp-card-media .tp-thumb {
+  display: block; cursor: pointer;
+  width: 100%; height: 100%;
+  object-fit: contain;
+  background: var(--canvas);
+}
+/* Draggable onto the sidebar's upload box -- grab cursor only while the pointer
+   is held, so a plain click still reads as "open this card". */
+.tp-card-media .tp-thumb:active { cursor: grabbing; }
+/* The dropzone accepts dragged dashboard flats too, not just files. */
+.dropzone.dragover {
+  border-color: var(--accent);
+  background: var(--accent-weak);
+}
+.tp-card-actions {
+  position: absolute; top: var(--sp-2); right: var(--sp-2); z-index: 1;
+  display: flex; flex-direction: column; gap: var(--sp-2);
+  opacity: 0;
+  transition: opacity var(--dur) var(--ease);
+}
+.tp-card:hover .tp-card-actions,
+.tp-card:focus-within .tp-card-actions { opacity: 1; }
+/* A single result card isn't a grid of thumbnails to keep clean -- its
+   download/delete are the point, so they stay on screen. */
+.tp-card-actions-always { opacity: 1; }
+/* A parts SVG is a front+back pair -- landscape. In the default 4:5 portrait
+   tile it letterboxes down to a sliver, so give it a tile of its own shape. */
+.tp-card-wide { max-width: 320px; }
+.tp-card-wide .tp-card-media { aspect-ratio: 3 / 2; }
+
+/* An <object> ignores object-fit, but the SVG inside preserves its own aspect
+   ratio, so filling the tile letterboxes it correctly. pointer-events off so
+   the card's hover actions stay clickable over the embedded document. */
+.tp-card-object {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--canvas);
+  pointer-events: none;
+}
+.tp-card-caption {
+  padding: var(--sp-2) var(--sp-3);
+  font-size: 12px;
+  color: var(--fg-muted);
+  text-align: center;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* A run in flight occupies the slot its result will land in. */
+.tp-card-skeleton { border-style: dashed; }
+.tp-card-skeleton .tp-card-media {
+  background: linear-gradient(90deg,
+    var(--surface-2) 25%, var(--surface) 50%, var(--surface-2) 75%);
+  background-size: 300% 100%;
+  animation: skeleton-sweep 1.4s var(--ease) infinite;
+}
+@keyframes skeleton-sweep {
+  from { background-position: 150% 0 }
+  to   { background-position: -150% 0 }
+}
+/* Open-ended ring: the gap is what reads as motion once it spins. */
+.tp-spinner {
+  width: 32px; height: 32px;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--fg);
+  border-radius: 50%;
+  animation: spinner-turn .8s linear infinite;
+}
+@keyframes spinner-turn { to { transform: rotate(360deg) } }
+.tp-skeleton-pct {
+  position: absolute;
+  right: var(--sp-3);
+  bottom: var(--sp-3);
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-muted);
+}
+/* Applies to both <button> and the download <a>, hence the explicit
+   text-decoration and centring. */
+.tp-icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  min-width: 28px;
+  min-height: 28px;
+  padding: var(--sp-1) var(--sp-2);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  text-decoration: none;
+  box-shadow: var(--shadow-sm);
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.tp-icon-btn:hover { background: var(--primary); color: var(--on-primary); border-color: var(--primary); }
+
+/* File size sits opposite the action stack so the two never collide. */
+.tp-size-badge {
+  position: absolute; top: var(--sp-2); left: var(--sp-2); z-index: 1;
+  padding: 2px var(--sp-2);
+  border-radius: var(--r-sm);
+  background: rgba(9, 9, 11, .55);
+  color: #fff;
+  font-size: 11px; font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Card footer: the two actions that are about the garment itself rather than
+   about a file, so they stay visible instead of hiding behind hover. */
+.tp-card-foot {
+  display: flex;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-2) var(--sp-2);
+}
+.tp-card-foot-btn {
+  flex: 1;
+  min-height: 34px;
+  display: flex; align-items: center; justify-content: center; gap: var(--sp-1);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--fg-muted);
+  font-size: 12px; font-weight: 600;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
+              border-color var(--dur) var(--ease);
+}
+.tp-card-foot-btn:hover {
+  background: var(--primary); color: var(--on-primary); border-color: var(--primary);
+}
+/* A spec that already exists opens instantly; one that doesn't costs a run.
+   Worth telling apart before the click. */
+.tp-card-foot-btn.is-ready { border-color: var(--accent); color: var(--accent-text); }
+.tp-card-foot-btn.is-ready:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* --- card overflow menu -------------------------------------------------- */
+/* Anchored beside the action stack rather than under it, so its position does
+   not depend on how many icon buttons that card happens to show. */
+.tp-menu {
+  position: absolute;
+  top: var(--sp-2);
+  right: calc(var(--sp-2) + 36px);
+  left: var(--sp-2);
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  padding: var(--sp-1);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-lg);
+}
+.tp-menu.hidden { display: none; }
+.tp-menu-item {
+  text-align: left;
+  min-height: 34px;
+  padding: var(--sp-2);
+  border: none;
+  background: none;
+  border-radius: var(--r-sm);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg);
+  text-decoration: none;
+  white-space: nowrap;
+}
+.tp-menu-item:hover { background: var(--surface-2); }
+.tp-menu-item:disabled { opacity: .45; cursor: not-allowed; }
+.tp-menu-danger { color: var(--danger); }
+.tp-menu-danger:hover { background: var(--danger-weak); }
+
+/* --- card overlay tabs -------------------------------------------------- */
+/* The tab bar lives in the overlay header, so it has to wrap rather than push
+   the close button off the panel. */
+.ov-tabs { flex-wrap: wrap; }
+.ov-tabs .toggle-btn { gap: var(--sp-1); }
+/* A filled dot means that output already exists -- switching to the tab shows
+   it, rather than offering the run button. */
+.ov-tab-dot {
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  vertical-align: middle;
+}
+.toggle-btn.active .ov-tab-dot { background: var(--on-primary); }
+
+/* --- overlay task (a run started from a card) --------------------------- */
+.tp-task {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-5);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--r-lg);
+  background: var(--surface-2);
+}
+/* Tracing/drafting runs report inside the viewer frame the artefact will land
+   in, so the tab shows the output area from the first click instead of a bare
+   strip that is then replaced by a different-looking panel. */
+.tp-task-center {
+  position: absolute;
+  inset: 0;
+  flex-direction: column;
+  justify-content: center;
+  gap: var(--sp-3);
+  border: none;
+  background: none;
+  text-align: center;
+}
+.tp-task-center .tp-task-info { flex: 0 0 auto; }
+.tp-task-center .tp-task-pct { font-size: 15px; font-weight: 700; color: var(--fg); }
+.tp-task-info { flex: 1; min-width: 0; }
+.tp-task-label { font-size: 13px; font-weight: 700; color: var(--fg); }
+.tp-task-pct {
+  font-size: 12px;
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+  margin-top: 2px;
+}
+
+/* --- responsive --------------------------------------------------------- */
+/* Two-column desktop: both columns are capped to the viewport and scroll
+   internally, so the page has nothing left to scroll. Locking it keeps the
+   window scrollbar (the one that ran the full height, past the header and the
+   Generate footer) from appearing at all. */
+@media (min-width: 1025px) {
+  html, body { height: 100%; overflow: hidden; }
+}
+@media (max-width: 1024px) {
+  .studio-layout { flex-direction: column; }
+  /* Stacked: the page scrolls again, so the dashboard gives up its own box. */
+  .studio-main { position: static; max-height: none; }
+  .studio-main-scroll { overflow-y: visible; padding-right: 0; }
+  .studio-sidebar {
+    width: 100%;
+    position: static;
+    max-height: none;
+    overflow-y: visible;
+    padding-right: 0;
+  }
+  .studio-footer { position: static; }
+}
+@media (max-width: 768px) {
+  .app-shell { flex-direction: column; min-height: 0; }
+  .app-main { padding: var(--sp-4) var(--sp-4) var(--sp-8); }
+  .dash-head { flex-wrap: wrap; gap: var(--sp-2); }
+  .variation-panel { width: 100%; }
+  h1 { font-size: 20px; }
+  .tp-gallery { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: var(--sp-3); }
+  .tp-detail-body { grid-template-columns: minmax(0, 1fr); }
+  .tp-viewer-layout { grid-template-columns: minmax(0, 1fr); }
+  .tp-parts-list { max-height: 240px; }
+}
+
+/* coarse pointers get full-size touch targets */
+@media (pointer: coarse) {
+  .btn, .btn-reset, .toggle-btn, .toolbar-btn, .tp-modal-btn,
+  .tp-output-open, .tp-ctrl-btn, .tp-card-foot-btn, .tp-menu-item { min-height: 44px; }
+  .tp-icon-btn { min-height: 36px; }
+  /* no hover on touch -- the delete affordance has to be permanently visible */
+  .tp-card-actions { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
+  .color-swatch:hover { transform: none; }
+}
+
+/* ==========================================================================
+   Green-accent redesign
+   --------------------------------------------------------------------------
+   Overrides layered on top of the base sheet rather than edited into it, so
+   the structural rules above stay readable and this pass can be reviewed (or
+   reverted) as one block. Colour comes only from --primary / --danger tokens;
+   nothing here hardcodes a hex.
+   ========================================================================== */
+
+/* --- brand --------------------------------------------------------------- */
+.app-brand { display: flex; align-items: center; gap: var(--sp-2); }
+.app-brand-mark { color: var(--primary); flex-shrink: 0; }
+.btn-danger-text { color: var(--danger); }
+.btn-danger-text:hover { background: var(--danger-weak); color: var(--danger); }
+
+/* --- segmented toggles: joined pill, title on the left ------------------- */
+/* One bordered pill split into segments -- not two detached buttons. The active
+   segment stays white and takes the brand colour on its text and ring, so the
+   control reads as a selector rather than as two competing CTAs. */
+.studio-step-head {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: nowrap;
+  gap: var(--sp-3);
+}
+.studio-step-title { flex: 0 0 auto; }
+.toggle-group, .toolbar-group {
+  display: flex;
+  width: auto;
+  flex: 0 1 auto;
+  gap: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  overflow: hidden;
+}
+.toggle-btn, .toolbar-btn {
+  flex: 0 0 auto;
+  min-height: 40px;
+  padding: 0 var(--sp-3);
+  display: flex; align-items: center; justify-content: center; gap: var(--sp-2);
+  border: none;
+  border-right: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 13px; font-weight: 600;
+  white-space: nowrap;
+}
+.toggle-btn:last-child, .toolbar-btn:last-child { border-right: none; }
+.toggle-btn:hover, .toolbar-btn:hover { background: var(--surface-2); color: var(--fg); }
+.toggle-btn.active, .toolbar-btn.active,
+.toggle-btn.active:hover, .toolbar-btn.active:hover {
+  background: var(--primary);
+  color: var(--on-primary);
+  /* Inset ring rather than a border so the segment keeps its width when it
+     activates and doesn't shift its neighbour. */
+  box-shadow: inset 0 0 0 1.5px var(--primary);
+  border-radius: var(--r-md);
+}
+/* The filled segment supplies its own edge; the shared hairline would show as a
+   grey nick against it. */
+.toggle-btn.active, .toolbar-btn.active { border-right-color: transparent; }
+
+/* --- reference images: full dashed dropzone ------------------------------ */
+.ref-dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  height: 150px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--r-lg);
+  background: var(--surface-2);
+  color: var(--fg-muted);
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.ref-dropzone:hover { border-color: var(--primary); color: var(--primary); background: var(--accent-weak); }
+
+/* --- primary CTA --------------------------------------------------------- */
+#generate-btn {
+  display: flex; align-items: center; justify-content: center; gap: var(--sp-2);
+  width: 100%;
+  min-height: 48px;
+  border: none;
+  border-radius: var(--r-md);
+  background: var(--primary);
+  color: var(--on-primary);
+  font-size: 14px; font-weight: 700;
+  box-shadow: var(--shadow-sm);
+  transition: background var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+#generate-btn:hover:not(:disabled) { background: var(--primary-hover); box-shadow: var(--shadow-md); }
+
+/* --- dashboard header: title block + search + layout toggle -------------- */
+.studio-main-head { align-items: flex-start; flex-wrap: wrap; }
+.studio-main-head h2 { font-size: 26px; }
+.dash-tools { display: flex; align-items: center; gap: var(--sp-3); }
+.search-field { position: relative; display: flex; align-items: center; }
+.search-field svg {
+  position: absolute; left: var(--sp-3);
+  color: var(--fg-subtle);
+  pointer-events: none;
+}
+.search-field input {
+  width: 260px;
+  min-height: 40px;
+  padding: var(--sp-2) var(--sp-3) var(--sp-2) 38px;
+  font: inherit; font-size: 13px;
+  color: var(--fg);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+}
+.search-field input:focus { outline: none; border-color: var(--primary); }
+/* The layout switch is two icon squares, so it opts out of the equal-halves
+   sizing the text segmented controls use. */
+#view-toolbar { width: auto; flex: 0 0 auto; }
+.toolbar-btn.icon-only { flex: 0 0 40px; width: 40px; padding: 0; }
+
+/* --- cards --------------------------------------------------------------- */
+.tp-card { background: var(--surface); }
+.tp-size-badge { background: var(--primary); color: var(--on-primary); }
+.tp-card-caption {
+  display: flex; flex-direction: column; gap: 1px;
+  padding: var(--sp-3) var(--sp-3) var(--sp-2);
+  text-align: left;
+  white-space: normal;
+}
+.tp-card-cat {
+  font-size: 14px; font-weight: 700; color: var(--fg);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tp-card-sub {
+  font-size: 12px; color: var(--fg-muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tp-card-foot { padding: 0 var(--sp-3) var(--sp-3); gap: var(--sp-2); }
+.tp-card-foot-btn { min-height: 38px; color: var(--fg); }
+.tp-card-foot-btn:hover { background: var(--surface-2); color: var(--fg); border-color: var(--border-strong); }
+/* Spec is the green-outlined action in the mock; Edit stays neutral. */
+.tp-card-foot-btn[data-act="spec"] { border-color: var(--primary); color: var(--primary); }
+.tp-card-foot-btn[data-act="spec"]:hover { background: var(--primary); color: var(--on-primary); border-color: var(--primary); }
+
+/* --- card media: less dead space around the flat -------------------------
+   Flats come out around 1.79:1 (front + back side by side), so a 4/5 portrait
+   box letterboxed them with thick grey bands top and bottom. 16/10 sits just
+   under the artwork's own ratio. Still a fixed ratio, not auto height, so cards
+   in a row keep aligning; portrait flats just render narrower in the same box.
+   The plate is white, not zinc-100: the flats are white PNGs, so a grey plate
+   showed the letterbox as a coffee-coloured band across the top and bottom of
+   every card. White makes the padding invisible. Stays white in dark mode too --
+   the artwork is black strokes on white and would vanish on a dark plate. */
+.tp-card-media { aspect-ratio: 4 / 3; background: var(--canvas); }
+.tp-card-media .tp-thumb { background: var(--canvas); }
+
+/* Skeleton placeholders: inert bars that occupy exactly the space the caption
+   and footer will take, so the card doesn't grow when the run finishes. */
+.tp-ph {
+  display: block;
+  border: none;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+/* Heights track the real caption's LINE BOXES (14px and 12px text at
+   line-height 1.55 = ~21.7px and ~18.6px), not the font sizes -- matching the
+   font sizes left the skeleton 6px short. */
+.tp-ph-cat { width: 60%; height: 18px; margin: 2px 0; }
+.tp-ph-sub { width: 40%; height: 15px; margin: 2px 0; }
+.tp-card-skeleton .tp-card-media { background: var(--surface-2); }
+
+/* --- list layout --------------------------------------------------------- */
+.tp-gallery.is-list { grid-template-columns: 1fr; }
+.tp-gallery.is-list .tp-card { display: grid; grid-template-columns: 180px 1fr auto; align-items: center; }
+.tp-gallery.is-list .tp-card-media { aspect-ratio: 16 / 9; }
+.tp-gallery.is-list .tp-card-foot { padding: var(--sp-3); }
+.tp-gallery.is-list .tp-card-foot-btn { min-width: 96px; flex: 0 0 auto; }
+
+@media (max-width: 900px) {
+  .search-field input { width: 100%; }
+  .dash-tools { width: 100%; }
+  .tp-gallery.is-list .tp-card { grid-template-columns: 1fr; }
+}
+
+/* --- parts layer list: per-part visibility -------------------------------
+   The rows became real layer toggles: an eye per part, and the stage composites
+   only the visible ones. Hidden rows dim rather than disappear so the list keeps
+   a stable order to click back through. */
+.tp-part-row { cursor: pointer; }
+.tp-part-eye {
+  flex-shrink: 0;
+  width: 26px; height: 26px;
+  display: flex; align-items: center; justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--fg-muted);
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.tp-part-eye:hover { background: var(--surface-2); color: var(--fg); }
+.tp-part-eye.is-on { color: var(--primary); }
+.tp-part-row.is-hidden { opacity: .45; }
+.tp-part-row.is-hidden .tp-part-name { text-decoration: line-through; }
+.tp-parts-bulk { display: flex; gap: var(--sp-3); margin-top: var(--sp-2); }
+/* Composited garment. Width-driven so it scales with the viewer's zoom
+   transform; the canvas keeps its own full-resolution backing store. */
+.tp-part-canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  background: var(--canvas);
+}
+/* Cropped part thumbnail: a fixed tile with the full-canvas PNG scaled and
+   offset so only the part's bbox shows. See thumbStyle() in index.html. */
+.tp-part-thumb {
+  width: 32px; height: 32px;
+  flex-shrink: 0;
+  display: block;
+  background-color: var(--canvas);
+  border: 1px solid var(--canvas-border);
+  border-radius: var(--r-sm);
+}

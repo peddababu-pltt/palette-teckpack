@@ -1,0 +1,39 @@
+[project]
+name = "techpack"
+version = "1.0.13"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.129.0",
+  "python-multipart==0.0.32",
+  # `pltt test` ships the backend SDK on PYTHONPATH.
+  # Pipeline scripts (backend/pipeline/warp_pattern.py, variations.py,
+  # measure_garment.py, flat2svg_auto.py + their own subprocess children) run
+  # under this same interpreter (`sys.executable`), so their runtime deps must
+  # be declared here.
+  "requests==2.34.2",
+  "pillow==12.3.0",
+  "python-dotenv==1.2.2",
+  "anthropic==0.116.0",
+  "numpy==2.5.1",
+  "scipy==1.18.0",
+  "scikit-image==0.26.0",
+  "vtracer==0.6.15",
+  "svgpathtools==1.7.2",
+  "cairosvg==2.9.0",
+  "pymupdf==1.27.2",
+]
+
+[dependency-groups]
+dev = [
+  "ruff>=0.14.0",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 115
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+[tool.setuptools.packages.find]
+include = ["backend*"]
+exclude = ["frontend*", "node_modules*"]
