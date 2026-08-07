@@ -1271,6 +1271,7 @@ img.result, object.result {
   position: relative;
   background: var(--canvas);
   padding: var(--sp-4);
+  overflow-x: auto;
 }
 /* The page list has to stay reachable now that the column beside it can run
    several screens tall. */
@@ -1289,7 +1290,6 @@ img.result, object.result {
 }
 .tp-pdf-page:last-child { margin-bottom: 0; }
 .tp-pdf-page canvas {
-  max-width: 100%;
   height: auto;
   background: #fff;
   border: 1px solid var(--canvas-border);

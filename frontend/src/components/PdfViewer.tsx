@@ -94,9 +94,9 @@ export default function PdfViewer({ url, downloads }: { url: string; downloads: 
         if (dir === "in") zoom = Math.min(4, zoom * 1.25)
         else if (dir === "out") zoom = Math.max(0.25, zoom / 1.25)
         // Clicking a page toggles it between its fit-to-width size and a
-        // fixed 2x close-up — a single click to read fine print, a second
+        // fixed 3x close-up — a single click to read fine print, a second
         // to back out, instead of hunting for the +/- buttons.
-        else if (dir === "toggle") zoom = zoom > 1.2 ? 1 : 2
+        else if (dir === "toggle") zoom = zoom > 1.2 ? 1 : 3
         else zoom = 1
         setZoomPct(Math.round(zoom * 100))
         window.clearTimeout(zoomTimer)

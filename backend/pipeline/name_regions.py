@@ -86,21 +86,20 @@ Group ALL region ids into named garment parts. Rules:
   the sections above the cuff seam. Do this for EVERY sleeve, front and
   back: if one sleeve's cuff is split out and its pair's is not, the two
   sleeves come out different lengths.
-- A HEM ALLOWANCE IS NOT A PART. Along the bottom of a skirt/body/sleeve the
+- A HEM ALLOWANCE IS ITS OWN PART, the same way a cuff is its own part and
+  never the sleeve's last band. Along the bottom of a skirt/body/sleeve the
   sketch usually shows a topstitch line running parallel to, and a little
   above, the piece's real bottom edge. The thin strip between that stitch
-  line and the edge is the turned-up hem of the SAME piece, not a separate
-  band, and it is only a region of its own because the stitch line sealed
-  it off. Merge that strip's region into the panel above it (e.g.
-  "front_skirt_center_panel": {{"regions": [21, 34]}}), so the panel is cut
-  to its true bottom edge. Never emit it as "..._hem".
+  line and the edge is the turned-up hem -- split it out into its own part
+  (e.g. "front_left_hem": {{"regions": [21]}}) and leave the panel above
+  holding only the sections above that stitch line, so the panel is cut to
+  the stitch line, not the garment's outer edge.
   Do this for EVERY panel along that hem, not just some: if the left and
-  right panels swallow their strip and the center one emits a "hem" part,
-  the center panel comes out ~30px shorter than its neighbours and the
-  seams between them step. Symmetry is the check.
-  A band IS its own part only when it is genuinely a separate piece: a
-  contrast/ribbed band, or one bounded by a real seam on BOTH long edges
-  (not by the garment's own outer edge on one side).
+  right panels split their strip out into "front_left_hem" /
+  "front_right_hem" and the center one keeps its strip fused into
+  "front_center_panel", the center panel runs ~30px longer than its
+  neighbours and the seams between them step. Symmetry is the check: name a
+  hem part for every panel along that same hem line, or none.
 - A BELT / STRAP / TIE crossed by loops, keepers or a buckle is still ONE
   piece. Each loop laid over it chops its interior into a separate region,
   so one belt arrives as a ROW of regions sitting side by side along the
@@ -589,6 +588,71 @@ def merge_hem_allowance(parts: dict, info: dict) -> dict:
             if p.get("regions") or p.get("grab_box")}
 
 
+def split_hem_from_panel(parts: dict, info: dict) -> dict:
+    """Lift the turned-up hem allowance out of the body panel it belongs to.
+
+    The mirror of split_cuff_bands, one tier up: a hem is now its own part
+    (see the naming prompt), but the prompt's own "group every section into
+    ONE panel" instinct can still swallow the strip back into a panel the
+    model didn't reach for a hem on. Where a view has several body panels
+    (a zip splits front into left/right, say), symmetry is the same test
+    merge_hem_allowance uses, pointed the other way: if EVERY body panel in
+    that view already carries its own hem strip, the hold-out panel that
+    doesn't is the naming slip, not the strip. A view with only one body
+    panel (a plain back, a dress front) has no sibling to check against, but
+    unlike a cuff -- which may genuinely not exist on a given garment -- a
+    hem allowance is not optional, so that lone panel is still judged on its
+    own shape.
+    """
+    for view in ("front", "back", "side"):
+        panels = [nm for nm in parts
+                  if nm.startswith(view + "_")
+                  and ("panel" in nm or "body" in nm)
+                  and "hem" not in nm and "yoke" not in nm
+                  and len(parts[nm].get("regions", [])) > 1
+                  and not parts[nm].get("grab_box")]
+        if not panels:
+            continue
+        cand = {}
+        for nm in panels:
+            boxes = {r: info[str(r)]["bbox"] for r in parts[nm]["regions"]
+                     if str(r) in info}
+            if len(boxes) < 2:
+                continue
+            py0 = min(b[1] for b in boxes.values())
+            py1 = max(b[3] for b in boxes.values())
+            ph = py1 - py0
+            if ph <= 0:
+                continue
+            band = [r for r, b in boxes.items()
+                    if b[3] >= py1 - HEM_JOIN_TOL * ph
+                    and (b[3] - b[1]) > 0
+                    and (b[3] - b[1]) <= HEM_MAX_FRAC * ph
+                    and (b[2] - b[0]) >= HEM_MIN_ASPECT * (b[3] - b[1])]
+            if not band or len(band) >= len(boxes):
+                continue
+            cand[nm] = band
+        if len(panels) >= 2 and len(cand) != len(panels):
+            if cand:
+                print(f"  {view}: only {len(cand)}/{len(panels)} panels end "
+                      f"in a thin strip -> left fused, not symmetric enough "
+                      f"to split")
+            continue
+        for nm, band in cand.items():
+            new = (nm.replace("body_panel", "hem") if "body_panel" in nm
+                   else nm.replace("panel", "hem") if "panel" in nm
+                   else nm + "_hem")
+            i = 2
+            while new in parts:
+                new = f"{new.rstrip('0123456789_')}_{i}"
+                i += 1
+            parts[nm]["regions"] = [r for r in parts[nm]["regions"]
+                                    if r not in band]
+            parts[new] = {"regions": sorted(band)}
+            print(f"  {nm} ends in strip {sorted(band)} -> own part {new}")
+    return parts
+
+
 APPLIED_KEYWORDS = ("pocket", "flap", "badge", "label", "trim", "welt")
 HOST_KEYWORDS = ("panel", "body", "sleeve", "yoke", "skirt", "leg", "front",
                  "back")
@@ -924,11 +988,26 @@ def split_cuff_bands(parts: dict, info: dict, segdir: str) -> dict:
               "with their sleeve")
         return parts
     for view in ("front", "back", "side"):
+        # A sleeve whose cuff the naming model already split out on its own
+        # (never touched by demote_false_cuffs, e.g. this view's cuffs all
+        # tiled the opening) still carries a small leftover region -- a strap
+        # tab, a sleeve-tag mark -- that can coincidentally clear this band's
+        # width/aspect/position gates (measured: a 90x33 decorative tab 17px
+        # short of the sleeve's own bottom edge). Lifting it out manufactured
+        # a second, bogus "..._cuff_2" alongside the real cuff. This function
+        # exists to give a sleeve ITS OWN cuff when none was named -- a sleeve
+        # that already has one is not its business.
+        def _has_own_cuff(nm):
+            side = next((s for s in ("left", "right") if s in nm), None)
+            return any(n != nm and "cuff" in n and n.startswith(view + "_")
+                       and (side is None or side in n) and parts[n].get("regions")
+                       for n in parts)
         sleeves = [nm for nm in parts
                    if nm.startswith(view + "_") and "sleeve" in nm
                    and not any(k in nm for k in SLEEVE_SKIP)
                    and len(parts[nm].get("regions", [])) > 1
-                   and not parts[nm].get("grab_box")]
+                   and not parts[nm].get("grab_box")
+                   and not _has_own_cuff(nm)]
         if len(sleeves) < 2:
             continue
         cand = {}
@@ -1457,9 +1536,11 @@ def normalize_part_names(parts: dict, info: dict) -> dict:
 
 
 CUFF_STACK_OVERLAP = 0.25  # x-overlap (share of the narrower one) above which
-                           # two end-of-sleeve strips are one strip split by a
-                           # fold line, not a band tiling the opening
-
+                           # two end-of-sleeve strips MIGHT be one strip split
+                           # by a fold line, not a band tiling the opening
+CUFF_Y_COINCIDE = 0.5      # ...and only counts as that fold-line split when
+                           # the two boxes also coincide this much in y (share
+                           # of the shorter one) -- see below
 
 def _tiles_opening(regs, info):
     """True when these strips sit side by side across the sleeve opening.
@@ -1478,6 +1559,17 @@ def _tiles_opening(regs, info):
     STACK: they cover the same x, one just sits slightly lower. Aspect ratio
     cannot separate these (the biker's halves run 2.6-2.8 and the bomber's real
     knit cuff runs 1.5, so any cut that keeps the cuff keeps the hem too).
+
+    x-overlap alone is not enough, though: a real one-piece cuff band drawn
+    with an internal topstitch line splits into two regions that ALSO overlap
+    heavily in x (one sits directly above the other) -- measured on a job
+    where regions 94x21179-1273 and 133x1253-1304 shared 125 of their 133px
+    width, got called a fold-line stack, and lost the top 2/3 of the cuff to
+    the sleeve. The two cases differ in y: fold-line duplicates are the SAME
+    crease seen twice, so they mostly COINCIDE in y (one just sits slightly
+    lower); a stitch line through one band instead cuts it TOP/BOTTOM, so the
+    pieces are adjacent with next to no y overlap. Require real coincidence,
+    not just adjacency, before calling it a fold-line stack.
     """
     boxes = [info[str(r)]["bbox"] for r in regs if str(r) in info]
     if len(boxes) < 2:
@@ -1487,7 +1579,10 @@ def _tiles_opening(regs, info):
             aw, bw = a[2] - a[0], b[2] - b[0]
             ov = max(0, min(a[2], b[2]) - max(a[0], b[0]))
             if ov > CUFF_STACK_OVERLAP * max(1, min(aw, bw)):
-                return False
+                ah, bh = a[3] - a[1], b[3] - b[1]
+                yov = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+                if yov > CUFF_Y_COINCIDE * max(1, min(ah, bh)):
+                    return False
     return True
 
 
@@ -1668,6 +1763,22 @@ def evict_offcolumn_from_sleeve(parts: dict, info: dict, segdir: str) -> dict:
                                 break
                             if shared > best:
                                 host, best = h, shared
+                # A quilted/textured region evicted from the sleeve routinely
+                # borders nothing at all in the label map -- it is one cell of
+                # a diamond-quilt pattern, sealed off from its own body panel
+                # by the sleeve seam and from the panel's OTHER quilt cells by
+                # the stitch lines between them. The border scan above then
+                # never gets the chance to even consider `preferred`, and every
+                # such cell spins up its own orphan "..._panel" part instead of
+                # joining the body panel it is textural fill for (measured: a
+                # quilted bomber's six shoulder/chest diamond cells came out as
+                # front_left_panel/_2/_3 and front_right_panel/_2/_3, each a
+                # single region, instead of folding into the two body panels).
+                # Trust the same-side body panel outright when it already
+                # exists, before falling back to minting a new orphan.
+                if host is None and preferred and _can_host(preferred) \
+                        and parts.get(preferred, {}).get("regions"):
+                    host = preferred
                 if host is None:
                     host = f"{view}_{'_'.join(nm.split('_')[1:-1]) or 'side'}_panel"
                     i = 2
@@ -2019,6 +2130,7 @@ def deterministic_repairs(parts: dict, all_ids: set, info: dict,
     parts = merge_numbered_sibling_panels(parts)
     parts = split_offaxis_belt_regions(parts, info)
     parts = merge_hem_allowance(parts, info)
+    parts = split_hem_from_panel(parts, info)
     parts = merge_collar_parts(parts)
     parts = separate_collar_placket(parts, info)
     parts = reunite_sleeve_columns(parts, info)

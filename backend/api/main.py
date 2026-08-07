@@ -148,6 +148,27 @@ def image_error(data: bytes) -> str | None:
         return "not a valid raster image (PNG/JPEG/WEBP) — SVG and other formats aren't supported here"
 
 
+def save_reference_png(data: bytes, dest: Path) -> None:
+    """Normalize an uploaded reference image to real PNG bytes before saving.
+
+    Uploads arrive as PNG, JPEG, or WEBP (image_error() above accepts all
+    three), but every reference gets written to a hardcoded "ref_N.png" path
+    that downstream code (the image-edit request, _reference_images_response's
+    *.png glob) assumes is genuinely PNG. Writing the original JPEG bytes
+    under that name left the file readable by anything that sniffs real image
+    bytes, but broke strict media-type validation elsewhere (observed:
+    Anthropic's vision API rejected a JPEG-labeled-as-PNG reference outright
+    with an image/png-vs-image/jpeg mismatch), and left the image-edit
+    router's own handling of the same mismatch unverified. Re-encoding to
+    real PNG here makes the extension truthful for every consumer, not just
+    the tolerant ones.
+    """
+    img = Image.open(io.BytesIO(data))
+    if img.mode == "CMYK":
+        img = img.convert("RGB")
+    img.save(dest, format="PNG")
+
+
 def job_paths(job_id: str):
     job_dir = JOBS_DIR / job_id
     return {
@@ -461,7 +482,7 @@ async def generate(
             if rerr:
                 return JSONResponse({"error": f"reference image {rerr}"}, status_code=400)
             p = ref_dir / f"ref_{i + 1}.png"
-            p.write_bytes(rdata)
+            save_reference_png(rdata, p)
             ref_paths.append(str(p))
 
     var_cmd = [sys.executable, str(PIPELINE_DIR / "variations.py"),
@@ -651,7 +672,7 @@ async def stage2(
             if err:
                 return JSONResponse({"error": f"reference image {err}"}, status_code=400)
             p = ref_dir / f"ref_{i + 1}.png"
-            p.write_bytes(data)
+            save_reference_png(data, p)
             ref_paths.append(str(p))
 
     def on_success():

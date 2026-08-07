@@ -13,6 +13,7 @@ import random
 import argparse
 import mimetypes
 import requests
+import anthropic
 from pathlib import Path
 from PIL import Image
 from dotenv import load_dotenv
@@ -39,10 +40,12 @@ FLAT_SKETCH_PROMPT = (
     "(back view inferred from the same garment). "
     "Only pure black outline lines on a pure white background, flat 2D, no body, no mannequin, "
     "no shadows, no shading, no fill of any kind — white fabric with black lines only. "
-    "The outer silhouette outline must be solid, fully opaque pure black (#000000) and hold ONE "
+    "The outer silhouette outline must be solid, fully opaque pure black (#000000), drawn as thin a "
+    "hairline as it can be while staying fully opaque and unbroken, and hold ONE "
     "constant width along its ENTIRE length, all the way around the garment — never tapering from "
     "thick to thin, never fading to gray or low-contrast partway through, never breaking into a "
-    "thinner or fainter line at corners, curves, or seam junctions. Every segment of the outline, "
+    "thinner or fainter line at corners, curves, or seam junctions, and never drawn as a bold/heavy "
+    "marker-thick line either — a heavy outline is as much a defect as an inconsistent one. Every segment of the outline, "
     "front and back, must look like it was drawn with the same pen in a single continuous pass — "
     "that outline is what gets cut/traced, so any variation in its width or darkness along the way "
     "is a defect, not a style choice. "
@@ -69,6 +72,12 @@ FLAT_SKETCH_PROMPT = (
     "undifferentiated blob. The collar and the shoulder/yoke are SEPARATE parts — draw the seam line "
     "between the collar and the shoulder/yoke explicitly, all the way across; never let the collar "
     "outline blend directly into the shoulder line with no seam between them. "
+    "The same separation applies at the BOTTOM of the garment: the hem is its own line, distinct from "
+    "whatever closure runs down the center front. Where a zip strip, button placket, or snap placket "
+    "reaches the bottom of the garment, its vertical rail lines must stop AT the hem line, not run "
+    "through it, merge into it, or blend into one continuous stroke with it — the hem's curve and the "
+    "placket/zip's bottom edge are two separate lines that meet at a corner, each still individually "
+    "visible, never a single fused shape. "
     "EXACTLY ONE front closure. The center front carries a zip, OR a button placket, OR a snap "
     "placket — never two of them at once. Do NOT draw a zipper strip and a vertical row of "
     "buttons/snaps stacked on or beside each other down the same center front; that is a defect, not "
@@ -98,11 +107,18 @@ FLAT_SKETCH_PROMPT = (
     "stopping partway down the chest or a full zip running all the way to the hem — must exactly match "
     "what the input photo shows. NEVER extend a zip further than the input photo's zip actually goes, and "
     "never shorten one either. Only the TEETH within that same photo-matched length must be drawn TIGHT "
-    "and DENSE, like a ladder/herringbone coil zipper: short perpendicular ticks packed close together "
-    "with almost no gap between one tick and the next, every tick the exact same length and spacing as "
+    "and DENSE, like a ladder/herringbone coil zipper: short perpendicular ticks packed close together, "
+    "each one separated from its neighbor by a small but clearly visible gap of white background — "
+    "'packed close together' means a short repeating rhythm of tooth-gap-tooth-gap down the strip, it "
+    "does NOT mean the ticks touch or merge into each other. If the ticks are drawn so close that the "
+    "gaps between them disappear, the whole strip reads as one solid black bar with no teeth visible at "
+    "all, which is the single worst version of this mistake — every tooth must stay individually "
+    "countable, with white clearly showing between each one and the next, all the way down the strip. "
+    "Every tick the exact same length and spacing as "
     "its neighbors, covering that zip's own real length with no interruption — this is a rule about tooth "
     "spacing WITHIN the zip's true length, not a reason to make the zip itself any longer. Sparse, "
-    "widely-spaced, or irregular ticks are NOT an acceptable zip texture. Add the pull/slider shape at "
+    "widely-spaced, or irregular ticks are NOT an acceptable zip texture, but neither is a fused solid bar. "
+    "Add the pull/slider shape at "
     "the top of the "
     "strip. A single plain or dashed line with no tick marks, or teeth on only one side, is NOT an "
     "acceptable zip, it reads as ordinary topstitching and must not be used for a zip. EVERY line in the "
@@ -116,10 +132,19 @@ FLAT_SKETCH_PROMPT = (
     "ONE explicit exception to all of the above: the zipper TEETH themselves (the small tick marks "
     "crossing the rails, not the rails and not the pull/slider) must be drawn as small SOLID filled "
     "black shapes, not hollow hairline outlines — each tooth is a tiny solid black mark, packed tight "
-    "and dense as already described. This solid-fill rule applies ONLY to the teeth; the rails on "
-    "either side of them and the pull/slider stay hairline-thin outlines as normal. "
+    "and dense as already described, but still a row of SEPARATE marks with visible white gaps between "
+    "them, never one continuous filled rectangle. This solid-fill rule applies ONLY to each individual "
+    "tooth; the rails on either side of them and the pull/slider stay hairline-thin outlines as normal, "
+    "and the strip as a whole must never become a single solid black block. "
     "Technical tech-pack drawing style, uniform hairline-thin line weight throughout the ENTIRE image, "
     "no bold, no thick, no filled lines or shapes anywhere. "
+    "If the input photo has a contrast-colored trim, panel, or material — a different-colored leather "
+    "waistband/belt, a contrast collar underside, contrast pocket welts or flap binding, a two-tone yoke "
+    "— NEVER represent that color/material contrast by filling the region solid black. Draw ONLY its "
+    "outline as the same hairline stroke as everything else and leave its interior blank white, exactly "
+    "like every other panel on the garment. Color and material differences are not drawn at all in this "
+    "flat sketch; only construction lines are. A solid black waistband, collar facing, belt loop, or "
+    "pull tab copied from a dark-colored photo is exactly the defect to avoid. "
     "To be unambiguous: outline, seams, darts, pleat/fold/gather lines, topstitch dashes, buttons, "
     "snaps, zip rails and pull, badges, patches, and labels — every single mark anywhere in this "
     "drawing, front and back, with no exception besides the zip teeth rule above — is drawn in the "
@@ -150,25 +175,123 @@ def upload_image(path: str) -> str:
 # only ever seen by variations.py, and the default flat — the one that gets traced
 # into parts and drafted into a pattern — ignored them entirely.
 REFERENCE_DETAIL_RULE = (
-    "ADDITIONAL REFERENCE IMAGES: the extra images provided alongside the main photo are "
-    "construction references for THIS SAME garment, usually shot open or inside-out to show "
-    "detail the main photo cannot. Use them as follows. The main subject photo remains the "
-    "authority on garment type, overall silhouette, and proportions — never restyle the "
-    "garment into a different one. But for any of these specific parts — collar and collar "
-    "stand, sleeves and sleeve construction, cuffs, pockets, plackets and closures, lining, "
-    "facings, inner panels, yokes and seam placement — if a reference image shows that part "
-    "clearly, draw that part the way the REFERENCE shows it, not the way the main photo shows "
-    "it. Where no reference shows a given part, follow the main photo as usual. Internal parts "
-    "visible only in the references (lining panels, facings, inner seams) should be drawn as "
-    "construction detail on the corresponding outer part. "
-    "CRITICAL — REPLACE, NEVER ADD: when a reference's version of a part differs from the main "
-    "photo's, the reference version REPLACES it. Draw one version only. Never draw both and never "
-    "overlay them. If the photo shows a zip at center front and a reference shows a button or snap "
-    "placket there (or the reverse), the garment ends up with exactly ONE of those closures — the "
-    "reference's — and the other is omitted entirely, not drawn alongside it. Two closures stacked "
-    "down the same center front is a defect. Same for every other part: one collar, one cuff "
-    "treatment, one pocket per position."
+    "IMAGE ORDER IS MEANING, NOT JUST INPUT ORDER: IMAGE 1 is the main photo. Every image "
+    "after it (IMAGE 2, IMAGE 3, ...) is a PARTS CATALOG for this design — a donor garment "
+    "whose individual construction pieces get grafted onto IMAGE 1. "
+    "THE DONOR IS ALMOST ALWAYS A DIFFERENT GARMENT TYPE, AND THAT IS EXPECTED, NOT A "
+    "MISTAKE TO GUARD AGAINST: a reference is attached specifically because it shows some "
+    "construction detail — a closure, a pocket, a collar, a quilting/panel pattern — that "
+    "the user wants pulled onto IMAGE 1's garment, even though the reference as a whole is a "
+    "completely different silhouette (e.g. IMAGE 1 is a tunic and IMAGE 2 is a puffer jacket). "
+    "Do not reject or discount a reference for looking like a different kind of garment — "
+    "that mismatch is the normal case, not a signal to ignore it. "
+    "IMAGE 1 is the ONLY authority on garment TYPE, overall silhouette, proportions, pose, "
+    "and layout — the output must still read as the SAME kind of garment as IMAGE 1 (a tunic "
+    "stays a tunic-length top, it does not grow a puffer's bulk or length), so never copy the "
+    "donor's overall shape, garment category, or length. Within that fixed silhouette, though, "
+    "graft its CONSTRUCTION PIECES freely. "
+    "The parts eligible to graft — collar and collar stand, sleeves and sleeve construction, "
+    "cuffs, pockets, plackets and closures (including their hardware: zips, snaps, buttons, "
+    "studs), lining, facings, inner panels, yokes and seam placement, and surface construction "
+    "like quilting/panel-stitch patterns — get drawn the way a reference shows them whenever "
+    "one shows that part clearly, replacing IMAGE 1's version of it. Where no reference shows a "
+    "given part, follow IMAGE 1 as usual. Internal parts visible only in the references (lining "
+    "panels, facings, inner seams) should be drawn as construction detail on the corresponding "
+    "outer part. "
+    "CRITICAL — REPLACE, NEVER ADD: when a reference's version of a part differs from IMAGE "
+    "1's, the reference version REPLACES it. Draw one version only. Never draw both and never "
+    "overlay them. If IMAGE 1 shows a zip at center front and a reference shows a button or "
+    "snap placket there (or the reverse), the garment ends up with exactly ONE of those "
+    "closures — the reference's — and the other is omitted entirely, not drawn alongside it. "
+    "Two closures stacked down the same center front is a defect. Same for every other part: "
+    "one collar, one cuff treatment, one pocket per position. "
+    "MANDATORY SELF-CHECK BEFORE YOU DRAW: reference images were attached to this job for a "
+    "reason — go through the eligible part list one item at a time (collar/collar stand, "
+    "sleeve/cuff construction, pockets, plackets/closures, lining, facings, inner panels, "
+    "yoke/seam placement, quilting/panel-stitch pattern) and for EACH one ask 'does IMAGE 2 or "
+    "later show this part clearly, at a different construction than IMAGE 1?'. If yes, you MUST "
+    "draw that reference's version — defaulting back to IMAGE 1 out of caution when a reference "
+    "clearly shows otherwise is just as much a mistake as inventing a detail, because it means "
+    "the reference images were uploaded and then silently ignored. The donor being a different "
+    "garment type is never a valid reason to skip this check. Only fall back to IMAGE 1 for a "
+    "part when NO reference shows that specific part clearly enough to draw from."
 )
+
+
+def _check_reference_compliance(output_bytes: bytes, reference_paths: list[str]) -> str | None:
+    """Ask a vision model whether the drawn flat actually grafted the references'
+    construction parts, per REFERENCE_DETAIL_RULE's eligible-part list. Returns
+    None when compliant (or when there is nothing to check), or corrective
+    feedback naming the specific parts that were skipped, for one retry.
+
+    An image-edit model is far less reliable at following a multi-part grafting
+    instruction than a text model is at reading one: the same prompt, same
+    reference pair, and a fresh seed drew the reference's collar/pockets/quilting
+    faithfully on one run and a plain unmodified flat on the next -- nothing in
+    the request changed, only the model's compliance did. A text-model
+    compliance check catches that miss before it reaches the user instead of
+    silently shipping a flat the references never touched.
+    """
+    if not reference_paths:
+        return None
+
+    def _png_b64(data: bytes) -> str:
+        # Re-encode rather than trust the file's extension or a guessed mime
+        # type: a reference saved with a ".png" name but JPEG bytes inside
+        # (seen in practice — an upstream upload path didn't re-encode on
+        # save) makes Anthropic's vision API reject the whole request with a
+        # media-type mismatch, which silently read as "compliant" once that
+        # error was swallowed below. Decoding and re-saving as real PNG here
+        # makes the declared media_type true regardless of what is on disk.
+        buf = io.BytesIO()
+        img = Image.open(io.BytesIO(data))
+        (img.convert("RGB") if img.mode == "CMYK" else img).save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+
+    client = anthropic.Anthropic()
+    content = [
+        {"type": "text", "text": "OUTPUT (the newly drawn flat sketch):"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+         "data": _png_b64(output_bytes)}},
+    ]
+    for i, p in enumerate(reference_paths, 1):
+        content.append({"type": "text", "text": f"REFERENCE {i}:"})
+        content.append({"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                        "data": _png_b64(Path(p).read_bytes())}})
+    content.append({"type": "text", "text": (
+        "OUTPUT was supposed to graft specific construction parts from each REFERENCE onto "
+        "its own garment wherever a reference shows that part clearly and differently from "
+        "how OUTPUT drew it: collar/collar stand, sleeve/cuff construction, pockets, "
+        "plackets/closures (zips, snaps, buttons), lining/facings/inner panels, yokes/seam "
+        "placement, quilting/panel-stitch pattern. The reference being a totally different "
+        "garment type from OUTPUT is expected and is never a reason a part should have been "
+        "skipped. "
+        "Go through that list. For each part a reference shows clearly, does OUTPUT actually "
+        "draw that reference's version of it (not the generic version OUTPUT would draw with "
+        "no reference at all)? "
+        "Reply with ONLY a JSON object, no markdown fence: "
+        '{"ok": true} if every clearly-shown part was grafted, or '
+        '{"ok": false, "missing": ["<part>: <what the reference shows that OUTPUT is missing>", ...]} '
+        "listing each part that was skipped."
+    )})
+    try:
+        msg = client.messages.create(model="claude-sonnet-4-6", max_tokens=1024,
+                                     messages=[{"role": "user", "content": content}])
+    except anthropic.APIError as e:
+        print(f"reference compliance check: judge call failed ({e}) -- skipping check")
+        return None  # judge unavailable -- don't block the pipeline on it
+    text = "".join(b.text for b in msg.content if b.type == "text").strip()
+    text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        print(f"reference compliance check: judge reply wasn't JSON ({text[:120]!r}) -- skipping check")
+        return None  # can't parse the judge's answer -- don't block on it
+    missing = result.get("missing") or []
+    if result.get("ok", True) or not missing:
+        return None
+    return ("REVISION REQUIRED: the previous attempt at this same request skipped these "
+            "reference parts -- draw them this time: " + "; ".join(missing))
 
 
 def build_payload(image_url: str, seed: int, reference_urls: list[str] | None = None) -> dict:
@@ -257,6 +380,12 @@ def photo_to_flat(input_path: str, output_path: str, seed: int | None,
     if reference_urls:
         print(f"using {len(reference_urls)} construction reference(s)")
     img_bytes = _generate(image_url, seed, reference_urls=reference_urls)
+
+    feedback = _check_reference_compliance(img_bytes, reference_paths or [])
+    if feedback:
+        print(f"reference compliance check flagged a miss -> retrying once: {feedback}")
+        img_bytes = _generate(image_url, seed, extra_prompt=feedback,
+                              reference_urls=reference_urls)
 
     Path(output_path).write_bytes(img_bytes)
     print(f"saved → {output_path}")

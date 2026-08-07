@@ -154,7 +154,6 @@ export function PartsCanvas({ parts, visible }: { parts: PartInfo[]; visible: bo
     sizedRef.current = false
     imagesRef.current = parts.map((p) => {
       const img = new Image()
-      img.crossOrigin = "anonymous"
       img.onload = () => {
         const canvas = canvasRef.current
         if (canvas && !sizedRef.current) {

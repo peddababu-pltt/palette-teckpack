@@ -457,7 +457,7 @@ def grab_halo(p, H, W, margin):
     return m
 
 
-def extend_box_along_strip(gb, ink, gap_tol=12):
+def extend_box_along_strip(gb, ink, gap_tol=20):
     """Grow a grab_box along its own long axis to cover the whole strip.
 
     A hand-placed (or model-placed) box routinely stops partway down a zip --
@@ -2152,12 +2152,32 @@ def main(in_png, labels_npy, groups_json, out_svg):
         # The marks are still visible in the export: each one is composited
         # into the PNG of the part it sits on, which is where you would look
         # for it anyway.
+        # The component-boundary path is emitted fill="none" so it stays
+        # invisible in the composed drawing (out_svg, _recombined.png below) --
+        # visible there it would double every shared seam a neighbour already
+        # draws. A part exported alone has no neighbour to double against, and
+        # for a part whose own ink never draws one of its sides at all (a cuff
+        # whose top edge is topstitching "owned" by the sleeve above it, per
+        # the ring-ownership comment above) that boundary is the ONLY copy of
+        # that edge that exists anywhere -- invisible, the per-part PNG came
+        # out open on that side. Paint it in, matching the ink fill, for this
+        # standalone crop only.
+        def _visible_boundary(svg_fragment: str) -> str:
+            return re.sub(r'(<path class="component-boundary"[^>]*?fill=")none(")',
+                          r'\g<1>#000000\g<2>', svg_fragment)
+
         for nm, g in groups.items():
             if nm.startswith(("stitch_", "button_")):
                 continue
+            # Stitch dashes render gray (STITCH_FILL) and construction-only --
+            # useful in the full composed drawing, but a part viewed on its own
+            # is meant to read as a clean cut piece: solid black outline, no
+            # gray topstitch ticks laid over it. Buttons/hardware stay (they
+            # are already solid black, not gray, and are part of the piece's
+            # own silhouette detail).
             extra_g = "".join(groups[m] for m in owned_marks.get(nm, [])
-                               if m in groups)
-            svg2png(svg_bytes=(head + g + extra_g + "</svg>").encode(),
+                               if m in groups and not m.startswith("stitch_"))
+            svg2png(svg_bytes=(head + _visible_boundary(g) + extra_g + "</svg>").encode(),
                     write_to=os.path.join(pdir, nm + ".png"),
                     output_width=min(W, 1600))
         svg2png(svg_path=out_svg,
