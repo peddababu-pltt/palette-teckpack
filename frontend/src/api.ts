@@ -195,17 +195,12 @@ export type SseHandlers = {
 // `done` is a separate terminal sentinel from `stage_done`, which carries the
 // stage's payload (file urls, classification, etc).
 export function watchJob(pluginId: string, jobId: string, handlers: SseHandlers, stage?: string): EventSource {
-  // No credentials: pltt dev's local simulator CORS-allows any origin but not
-  // credentialed requests (allow_credentials=False), and local dev has no
-  // real session cookie to send anyway. Revisit if a hosted deployment turns
-  // out to need one.
-  //
   // stage names which of the job's queues to read: parts and pattern run as
   // independent slots server-side, so omitting it only works for the
   // create-a-job routes, which never have a second stage running alongside.
   const query = stage ? `?stage=${encodeURIComponent(stage)}` : ""
   const path = withPreviewQuery(`${jobsBase(pluginId)}/${jobId}/events${query}`)
-  const es = new EventSource(`${getBaseUrl()}${path}`)
+  const es = new EventSource(`${getBaseUrl()}${path}`, { withCredentials: credentialsMode() === "include" })
   es.onmessage = (ev) => {
     let parsed: any = null
     try {
@@ -273,6 +268,19 @@ export function downloadUrl(url: string | null): string | null {
   return `${url}${url.includes("?") ? "&" : "?"}dl=1`
 }
 
+// pltt dev's local simulator runs its CORS config wildcard-open
+// (allow_origins="*" + allow_credentials=False in backend_runner.py) and
+// DevPluginContextMiddleware fakes an authenticated user on every request
+// regardless, so no cookie is needed — and a credentialed fetch against a
+// wildcard origin is one browsers refuse outright. The real hosted backend
+// (apps-api.pltt.xyz) is a different subdomain than the app frontend
+// (apps.pltt.xyz) and gates every non-/health route behind an actual
+// session cookie, which `fetch` only attaches cross-origin when told to.
+// Toggle on the resolved backend origin so the same call sites work in both.
+function credentialsMode(): RequestCredentials {
+  return /^https?:\/\/(127\.0\.0\.1|localhost)(:|\/|$)/.test(getBaseUrl()) ? "omit" : "include"
+}
+
 // NOTE: intentionally no preview-query suffix here — every call site below
 // appends more path (`/analyze`, `/jobs/generate`, ...) after `base()`, and a
 // query string has to be last. Those call sites wrap their full URL in
@@ -287,14 +295,12 @@ function jobsBase(pluginId: string) {
 }
 
 // The SDK's own `apiFetch` unconditionally sends `credentials: "include"`
-// (hardcoded inside the SDK, not overridable via init) — which pltt dev's
-// local simulator CORS-rejects (allow_origins="*" only pairs with
-// allow_credentials=False; a credentialed request against a wildcard origin
-// is always blocked by the browser). Use this instead for every JSON call:
-// same relative-path convention, but no credentials, so it matches what the
-// local simulator's generated CORS config actually allows.
+// (hardcoded inside the SDK, not overridable via init), which breaks under
+// pltt dev's local simulator (see `credentialsMode` above) — so every call
+// here goes through plain `fetch` with credentials toggled per-environment
+// instead.
 async function apiCall(path: string, init?: RequestInit): Promise<Response> {
-  return fetch(`${getBaseUrl()}${withPreviewQuery(path)}`, init)
+  return fetch(`${getBaseUrl()}${withPreviewQuery(path)}`, { ...init, credentials: credentialsMode() })
 }
 
 // ---------------- REST calls ----------------
@@ -303,7 +309,11 @@ export async function analyzeImage(pluginId: string, file: File): Promise<Analyz
   const fd = new FormData()
   fd.append("image", file, file.name || "upload.png")
   try {
-    const res = await fetch(withPreviewQuery(`${base(pluginId)}/analyze`), { method: "POST", body: fd })
+    const res = await fetch(withPreviewQuery(`${base(pluginId)}/analyze`), {
+      method: "POST",
+      body: fd,
+      credentials: credentialsMode(),
+    })
     const data = await res.json().catch(() => ({}))
     if (!res.ok || data.error) return { unavailable: data.error || "analysis failed" }
     return data as AnalyzeResult
@@ -342,7 +352,11 @@ export async function generateJob(
     if (params.season) fd.append("season", params.season)
   }
   try {
-    const res = await fetch(withPreviewQuery(`${base(pluginId)}/jobs/generate`), { method: "POST", body: fd })
+    const res = await fetch(withPreviewQuery(`${base(pluginId)}/jobs/generate`), {
+      method: "POST",
+      body: fd,
+      credentials: credentialsMode(),
+    })
     const data = await res.json().catch(() => ({}))
     if (!res.ok || data.error) return { error: data.error || "request failed" }
     return data
@@ -405,6 +419,7 @@ export async function startMeasure(
     const res = await fetch(withPreviewQuery(`${base(pluginId)}/jobs/${jobId}/measure`), {
       method: "POST",
       body: fd,
+      credentials: credentialsMode(),
     })
     return await res.json()
   } catch (err: any) {
@@ -427,7 +442,7 @@ export async function getParts(pluginId: string, jobId: string, bust?: number): 
 // given its resolved absolute URL.
 export async function fetchJson<T>(absUrl: string): Promise<T | null> {
   try {
-    const res = await fetch(absUrl)
+    const res = await fetch(absUrl, { credentials: credentialsMode() })
     if (!res.ok) return null
     return (await res.json()) as T
   } catch {

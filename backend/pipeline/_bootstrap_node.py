@@ -98,9 +98,21 @@ def ensure_npm_packages(pipeline_dir: Path, packages: list[str]) -> None:
             f"{result.stdout[-2000:]}\n{result.stderr[-2000:]}"
         )
 
-    still_missing = [pkg for pkg in packages if not _resolves(pipeline_dir, pkg)]
-    if still_missing:
-        raise RuntimeError(f"npm install ran but {still_missing} still don't resolve")
+    # Verify by actually importing each package, not just re-checking that its
+    # directory exists. `_resolves` above is deliberately cheap (a directory
+    # exists check) so the common already-installed path never has to spawn
+    # node -- but that same cheapness is blind to a package whose top-level
+    # directory landed fine while ITS OWN internal require of something else
+    # failed (measured live: `@resvg/resvg-js` installed, but its
+    # platform-specific `@resvg/resvg-js-linux-x64-gnu` optional dependency
+    # didn't, so requiring it threw MODULE_NOT_FOUND at import time -- a
+    # directory-exists check on `@resvg/resvg-js` itself saw nothing wrong).
+    # An actual import exercises that whole chain, the same way the real
+    # pipeline script's own `import` will moments later.
+    still_broken = [pkg for pkg in packages
+                    if not _imports(node_exe, env, pipeline_dir, pkg)]
+    if still_broken:
+        raise RuntimeError(f"npm install ran but {still_broken} still don't import")
 
 
 def _resolves(pipeline_dir: Path, spec: str) -> bool:
@@ -109,10 +121,29 @@ def _resolves(pipeline_dir: Path, spec: str) -> bool:
     standalone project's node_modules a few directories up) vs on the hosted
     runtime (no ancestor has them, so they land in pipeline_dir/node_modules,
     which -- being the first directory Node itself checks -- is exactly where
-    the real subprocess run will find them too)."""
+    the real subprocess run will find them too).
+
+    Cheap on purpose (no node spawned) so the common already-satisfied case
+    -- true on every call locally -- stays free. Only tells you the package's
+    own directory is present, not that requiring it actually works; see
+    `_imports` for the real check, run once after a fresh install."""
     if spec.startswith("@"):
         name = "@" + spec[1:].split("@")[0]
     else:
         name = spec.split("@")[0]
     return any((d / "node_modules" / name).is_dir()
                for d in (pipeline_dir, *pipeline_dir.parents))
+
+
+def _imports(node_exe: str, env: dict, pipeline_dir: Path, spec: str) -> bool:
+    """True when `node` can actually import the package `spec` names, run
+    with cwd=pipeline_dir so Node's own module resolution walks up from
+    exactly where the real pipeline script's import will."""
+    name = ("@" + spec[1:].split("@")[0]) if spec.startswith("@") else spec.split("@")[0]
+    result = subprocess.run(
+        [node_exe, "--input-type=module", "-e",
+         f"import({name!r}).then(() => process.exit(0), (e) => {{ "
+         f"console.error(String(e && e.message || e)); process.exit(1); }})"],
+        cwd=str(pipeline_dir), env=env, capture_output=True, text=True,
+    )
+    return result.returncode == 0

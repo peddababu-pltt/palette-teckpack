@@ -12,8 +12,22 @@ import is actually missing.
 no network needed for pip itself) and installs the missing packages into a
 directory cached alongside this file, shared across every pipeline script's
 subprocess invocations within the same container.
+
+That shared venv is exactly what its name says -- shared. An earlier publish
+of this same plugin, or an entirely different plugin on the same host, can
+have already made e.g. `scipy` importable at whatever version IT happened to
+pin, and a plain importability check treats that as satisfied forever. This
+pipeline's own behavior (region segmentation, boundary synthesis, connected-
+component labeling) leans on exact numeric/algorithmic behavior of scipy/
+numpy/scikit-image, which drifts across their own versions -- so "importable"
+is not the same guarantee as "pinned version," and only the latter is what
+was actually tested locally. `ensure()` therefore checks the installed
+version against each package's `==` pin, not just whether the name imports,
+and reinstalls into `_VENDOR_DIR` (first on sys.path, so it always wins over
+whatever the shared venv already has) on any mismatch.
 """
 import importlib
+import importlib.metadata
 import subprocess
 import sys
 from pathlib import Path
@@ -26,15 +40,18 @@ if str(_VENDOR_DIR) not in sys.path:
 
 
 def ensure(modules: list[str], packages: list[str]) -> None:
-    """Make each name in `modules` importable, pip-installing `packages` if not.
+    """Make each `modules[i]` importable at exactly `packages[i]`'s pinned
+    version (the two lists are 1:1 by position, e.g. modules=["scipy"]
+    packages=["scipy==1.18.0"]), pip-installing into _VENDOR_DIR if not.
 
     Every caller passes its own (modules, packages) pair, so this can't cache
     a single "already bootstrapped" flag across calls for different package
     sets — each call must actually attempt its own install when its modules
-    aren't importable yet. `pip install --target` already skips anything it
-    finds already satisfied via sys.path, so repeat calls stay cheap.
+    aren't at the pinned version yet. `pip install --target` already skips
+    anything it finds already satisfied via sys.path, so repeat calls stay
+    cheap once _VENDOR_DIR itself has the right version installed.
     """
-    if all(_importable(name) for name in modules):
+    if all(_satisfied(mod, spec) for mod, spec in zip(modules, packages)):
         return
 
     _VENDOR_DIR.mkdir(exist_ok=True)
@@ -55,17 +72,26 @@ def ensure(modules: list[str], packages: list[str]) -> None:
         )
 
     importlib.invalidate_caches()
-    still_missing = [name for name in modules if not _importable(name)]
+    still_missing = [mod for mod, spec in zip(modules, packages)
+                      if not _satisfied(mod, spec)]
     if still_missing:
         raise RuntimeError(
-            f"runtime dependency bootstrap ran but {still_missing} still can't "
-            f"be imported (vendor dir: {_VENDOR_DIR})"
+            f"runtime dependency bootstrap ran but {still_missing} still don't "
+            f"match their pinned version (vendor dir: {_VENDOR_DIR})"
         )
 
 
-def _importable(name: str) -> bool:
+def _satisfied(module_name: str, pinned_spec: str) -> bool:
+    """True when `module_name` imports AND, if `pinned_spec` carries an `==`
+    pin, its installed package version matches that pin exactly."""
     try:
-        importlib.import_module(name)
-        return True
+        importlib.import_module(module_name)
     except ImportError:
+        return False
+    if "==" not in pinned_spec:
+        return True
+    pip_name, _, wanted = pinned_spec.partition("==")
+    try:
+        return importlib.metadata.version(pip_name) == wanted
+    except importlib.metadata.PackageNotFoundError:
         return False

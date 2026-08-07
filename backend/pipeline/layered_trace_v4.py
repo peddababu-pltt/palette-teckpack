@@ -41,7 +41,27 @@ import vtracer
 from svgpathtools import parse_path
 from _svg_render import svg2png
 
-POTRACE_BIN = shutil.which("potrace")
+def _resolve_potrace():
+    """Prefer a system potrace (dev machines with it on PATH). The Palette
+    hosted runtime has no apt/Docker hook to install one -- pyproject.toml
+    only ships pip packages -- so without a fallback, every hosted run
+    silently drops to trace_vtracer(), which fuses thin gaps (rib lines,
+    hood double-lines, pleat ladders) into solid black and can silently
+    return zero paths on some canvases. bin/ vendors a static Debian
+    potrace_1.16-2+b3 (amd64) + its libpotrace.so.0 as a same-quality
+    fallback; LD_LIBRARY_PATH points run_potrace's subprocess at the
+    vendored .so only when the vendored binary is the one actually used."""
+    found = shutil.which("potrace")
+    if found:
+        return found, None
+    bin_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin")
+    bundled = os.path.join(bin_dir, "potrace")
+    if os.path.isfile(bundled) and os.access(bundled, os.X_OK):
+        return bundled, bin_dir
+    return None, None
+
+
+POTRACE_BIN, POTRACE_LIB_DIR = _resolve_potrace()
 # buttons / stitch-dashes: small, compact, isolated marks. vtracer's spline
 # fit + speckle filter blur or drop these; potrace (turdsize=0, no curve
 # smoothing) traces tiny bitonal detail faithfully. Anything bigger than
@@ -645,10 +665,14 @@ def run_potrace(img, smooth=False, ss=1):
     else:
         args += ["-t", f"{TURD * ss * ss:.3f}",
                  "-O", f"{OPT_TOL * ss:.3f}", "-a", f"{ALPHA_MAX:.3f}"]
+    env = None
+    if POTRACE_LIB_DIR:
+        env = os.environ.copy()
+        env["LD_LIBRARY_PATH"] = POTRACE_LIB_DIR + os.pathsep + env.get("LD_LIBRARY_PATH", "")
     with tempfile.TemporaryDirectory() as td:
         pin, pout = os.path.join(td, "i.bmp"), os.path.join(td, "o.svg")
         img.convert("1", dither=Image.NONE).save(pin)
-        subprocess.run(args + ["-o", pout, pin], check=True, capture_output=True)
+        subprocess.run(args + ["-o", pout, pin], check=True, capture_output=True, env=env)
         svg = open(pout).read()
     out = []
     for m in re.finditer(r'<path[^>]*>', svg):
@@ -1949,10 +1973,27 @@ def main(in_png, labels_npy, groups_json, out_svg):
         # component still extracts as a closed shape.
         bpaths = []
         if nm in ring_full:
+            # Dilate cap by the ring's own thickness, not a fixed 1px: ring_full
+            # is an erosion-band outline_px wide, so a 1px check for "does the
+            # part's own ink already cover this" left a sliver up to
+            # (outline_px - 1) wide uncovered along EVERY already-inked edge,
+            # not just genuinely open ones -- a thin duplicate line hugging the
+            # real seam the whole way round (measured: visible beside a
+            # sleeve's own seam next to a badge, not just at the gap the badge
+            # actually left open).
             missing = ring_full[nm] & ~ndimage.binary_dilation(
-                cap, dil, iterations=1)
+                cap, dil, iterations=max(1, outline_px))
             if missing.sum() >= MIN_SYNTH_AREA:
-                canvas_b, bscale = thin_canvas(ring_full[nm], dil, thin)
+                # Trace only the MISSING arc, not the whole ring_full silhouette.
+                # Tracing the full ring stacked a second, independently-eroded
+                # copy of the outline on top of every side the part's own ink
+                # already draws -- invisible while this path stayed fill="none"
+                # everywhere, but the per-part crop now paints it (see
+                # _visible_boundary in EXPORT_PARTS below), and the two
+                # near-but-not-pixel-identical copies of the same edge
+                # rendered as a doubled, visibly thickened line on sides that
+                # were already fine. Only the genuinely open span needs this.
+                canvas_b, bscale = thin_canvas(missing, dil, thin)
                 bpaths = scale_paths(trace(canvas_b, ss_of(bscale)), bscale)
                 print(f"  [{nm}] complete-boundary copy "
                       f"({int(missing.sum())}px not in the inked layer)")
@@ -2169,14 +2210,15 @@ def main(in_png, labels_npy, groups_json, out_svg):
         for nm, g in groups.items():
             if nm.startswith(("stitch_", "button_")):
                 continue
-            # Stitch dashes render gray (STITCH_FILL) and construction-only --
-            # useful in the full composed drawing, but a part viewed on its own
-            # is meant to read as a clean cut piece: solid black outline, no
-            # gray topstitch ticks laid over it. Buttons/hardware stay (they
-            # are already solid black, not gray, and are part of the piece's
-            # own silhouette detail).
+            # Stitch-dash layers carry real construction detail -- quilting
+            # channels and panel topstitch are drawn as gray dashes too, not
+            # just decorative topstitching, so excluding every "stitch_" mark
+            # here once stripped the quilting off a part along with it. Keep
+            # them; a genuine seam boundary between two DIFFERENT parts is
+            # handled separately by the solid closing line below, not by
+            # hiding this piece's own surface detail.
             extra_g = "".join(groups[m] for m in owned_marks.get(nm, [])
-                               if m in groups and not m.startswith("stitch_"))
+                               if m in groups)
             svg2png(svg_bytes=(head + _visible_boundary(g) + extra_g + "</svg>").encode(),
                     write_to=os.path.join(pdir, nm + ".png"),
                     output_width=min(W, 1600))
