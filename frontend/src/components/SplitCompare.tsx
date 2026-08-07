@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { usePluginTranslations } from "@palettelab/sdk"
+import { imgCrossOrigin } from "../api"
 import { STRINGS } from "../strings"
 
 // A wipe, not two shrinking panes: both images fill the SAME box at the same
@@ -48,7 +49,7 @@ export default function SplitCompare({
     return (
       <div className="tp-split tp-split-single">
         <div className="tp-split-layer">
-          <img src={leftUrl} alt={finalLeftLabel} />
+          <img src={leftUrl} crossOrigin={imgCrossOrigin()} alt={finalLeftLabel} />
         </div>
         <span className="tp-tag">{finalLeftLabel}</span>
       </div>
@@ -72,10 +73,10 @@ export default function SplitCompare({
       }}
     >
       <div className="tp-split-layer" data-side="realistic">
-        <img ref={rightImgRef} src={rightUrl} alt={finalRightLabel} onLoad={checkAlignment} />
+        <img ref={rightImgRef} src={rightUrl} crossOrigin={imgCrossOrigin()} alt={finalRightLabel} onLoad={checkAlignment} />
       </div>
       <div className="tp-split-layer tp-split-clip" data-side="sketch">
-        <img ref={leftImgRef} src={leftUrl} alt={finalLeftLabel} onLoad={checkAlignment} />
+        <img ref={leftImgRef} src={leftUrl} crossOrigin={imgCrossOrigin()} alt={finalLeftLabel} onLoad={checkAlignment} />
       </div>
       <span className="tp-tag">{finalLeftLabel}</span>
       <span className="tp-tag tp-tag-right">{finalRightLabel}</span>

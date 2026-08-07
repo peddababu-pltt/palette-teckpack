@@ -4,19 +4,20 @@ warp_pattern.py — garment photo → flat technical sketch (front + back view)
 usage: python warp_pattern.py input.jpg [output.png] [--seed 42]
 """
 
-import io
-import os
-import sys
-import json
-import base64
-import random
 import argparse
+import base64
+import io
+import json
 import mimetypes
-import requests
-import anthropic
+import os
+import random
+import sys
 from pathlib import Path
-from PIL import Image
+
+import anthropic
+import requests
 from dotenv import load_dotenv
+from PIL import Image
 
 load_dotenv()
 
@@ -45,7 +46,8 @@ FLAT_SKETCH_PROMPT = (
     "constant width along its ENTIRE length, all the way around the garment — never tapering from "
     "thick to thin, never fading to gray or low-contrast partway through, never breaking into a "
     "thinner or fainter line at corners, curves, or seam junctions, and never drawn as a bold/heavy "
-    "marker-thick line either — a heavy outline is as much a defect as an inconsistent one. Every segment of the outline, "
+    "marker-thick line either — a heavy outline is as much a defect as an inconsistent one. "
+    "Every segment of the outline, "
     "front and back, must look like it was drawn with the same pen in a single continuous pass — "
     "that outline is what gets cut/traced, so any variation in its width or darkness along the way "
     "is a defect, not a style choice. "
@@ -66,6 +68,13 @@ FLAT_SKETCH_PROMPT = (
     "The output must contain the garment ONLY: no humans, no mannequins, no body silhouette. "
     "Include all construction details visible in the input: seams, stitching, darts, "
     "collar, cuffs, plackets, pockets, closures, hems. "
+    "FUR/SHEARLING/FAUX-FUR TRIM: if the input shows a fur, shearling, or faux-fur collar, cuff, or "
+    "hood trim, draw its edge as a gentle, open, evenly-spaced scalloped or wavy border — like a "
+    "cloud outline — in the SAME hairline stroke weight as every other line in the drawing. Do NOT "
+    "draw fur as a dense jagged zigzag, a spiky scribble, or repeated sharp spikes packed tight enough "
+    "that they visually merge into a heavier or darker-looking band than the rest of the outline; that "
+    "reads as a thick black smear, not a construction detail. A few evenly spaced individual tufts or "
+    "waves suggesting texture is enough — never cover the whole trim edge in dense spiking. "
     "Detect and draw EVERY garment part as its own clearly separated, closed outline — body panels, "
     "collar, yoke, sleeves, cuffs, plackets, pockets, zips/closures — each one a distinct enclosed "
     "shape with a visible boundary line, so parts can be told apart individually, not merged into one "
@@ -479,8 +488,10 @@ if __name__ == "__main__":
     p.add_argument("input")
     p.add_argument("output", nargs="?", default="flat_sketch.png")
     p.add_argument("--seed", type=int, default=None, help="fixed seed for reproducibility")
-    p.add_argument("--upscale-only", action="store_true", help="upscale an existing image file instead of generating a sketch from a photo")
-    p.add_argument("--references", default="", help="comma-separated local paths to construction reference images, optional")
+    p.add_argument("--upscale-only", action="store_true",
+                   help="upscale an existing image file instead of generating a sketch from a photo")
+    p.add_argument("--references", default="",
+                   help="comma-separated local paths to construction reference images, optional")
     a = p.parse_args()
     if a.upscale_only:
         upscale_file(a.input, a.output)

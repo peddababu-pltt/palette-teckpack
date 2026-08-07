@@ -1,6 +1,6 @@
 import { usePluginTranslations } from "@palettelab/sdk"
 import type { Job } from "../api"
-import { downloadUrl, resolveUrl, withCacheBust } from "../api"
+import { downloadUrl, imgCrossOrigin, resolveUrl, withCacheBust } from "../api"
 import { STRINGS } from "../strings"
 
 const dlIcon = (
@@ -141,6 +141,7 @@ export default function GalleryCard({
           <img
             className="tp-thumb"
             src={thumbUrl}
+            crossOrigin={imgCrossOrigin()}
             alt={`${label} — ${label}`}
             draggable
             title={t("galleryCard.dragHint")}

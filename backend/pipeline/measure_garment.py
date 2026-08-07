@@ -25,12 +25,11 @@ import sys
 from dataclasses import dataclass, field
 
 import anthropic
-from dotenv import load_dotenv
-from PIL import Image
-
 from block_rules import BLOCK_RULES, GARMENT_TAXONOMY, get_block_for_subcategory
 from body_measurment import SIZES
+from dotenv import load_dotenv
 from measurment_resolver import resolve_pom
+from PIL import Image
 
 load_dotenv()
 

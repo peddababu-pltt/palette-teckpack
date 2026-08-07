@@ -101,8 +101,15 @@ export default function App(_props: PluginComponentProps) {
   const reloadJobs = useCallback(async () => {
     const fresh = await listJobs(pluginId)
     setJobs(fresh)
+    // A page reload wipes the engine's in-memory live-stage tracking, so any
+    // parts/pattern trace that was still running (or never got past a failed
+    // start) at the moment of reload would otherwise show a static "queued"
+    // placeholder forever -- nothing else re-attaches to it. autoTrace() is
+    // a no-op for jobs that are already live or already have their output,
+    // so this is safe to run on every reload, not just the first one.
+    fresh.forEach((job) => engine.autoTrace(job))
     return fresh
-  }, [pluginId])
+  }, [pluginId, engine])
 
   useEffect(() => {
     if (baseReady) void reloadJobs()

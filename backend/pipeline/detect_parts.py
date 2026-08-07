@@ -8,8 +8,14 @@ Sends the sketch (with a coordinate grid burned in so the model can read
 pixel positions accurately) and asks for part polygons in the exact schema
 layered_trace.py consumes.
 """
-import sys, os, json, base64, io
+import base64
+import io
+import json
+import os
+import sys
+
 import anthropic
+
 try:                                   # load .env if python-dotenv installed
     from dotenv import load_dotenv
     load_dotenv()                      # looks in current dir and parents
@@ -122,11 +128,13 @@ def grid_overlay(im: Image.Image) -> Image.Image:
     for x in range(0, W, 100):
         blue = x % 500 == 0
         d.line([(x, 0), (x, H)], fill=(0, 0, 255) if blue else (255, 120, 120), width=2)
-        if blue: d.text((x + 4, 4), str(x), fill=(0, 0, 255))
+        if blue:
+            d.text((x + 4, 4), str(x), fill=(0, 0, 255))
     for y in range(0, H, 100):
         blue = y % 500 == 0
         d.line([(0, y), (W, y)], fill=(0, 0, 255) if blue else (255, 120, 120), width=2)
-        if blue: d.text((4, y + 4), str(y), fill=(0, 0, 255))
+        if blue:
+            d.text((4, y + 4), str(y), fill=(0, 0, 255))
     return im
 
 def load_rgb(path):
@@ -197,7 +205,8 @@ def main(in_png, out_json):
     if max(W, H) > 1568:
         scale = 1568 / max(W, H)
         g = g.resize((int(W * scale), int(H * scale)))
-    buf = io.BytesIO(); g.save(buf, format="PNG")
+    buf = io.BytesIO()
+    g.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode()
 
     client = anthropic.Anthropic()
@@ -250,8 +259,10 @@ def main(in_png, out_json):
         for v in cfg["views"].values():
             v["bbox"] = rs(v["bbox"])
             for p in v["parts"].values():
-                if "box" in p: p["box"] = rs(p["box"])
-                if "poly" in p: p["poly"] = [rs(pt) for pt in p["poly"]]
+                if "box" in p:
+                    p["box"] = rs(p["box"])
+                if "poly" in p:
+                    p["poly"] = [rs(pt) for pt in p["poly"]]
 
     json.dump(cfg, open(out_json, "w"), indent=2)
     print(f"wrote {out_json}: " + ", ".join(

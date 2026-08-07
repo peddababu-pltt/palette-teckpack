@@ -281,6 +281,19 @@ function credentialsMode(): RequestCredentials {
   return /^https?:\/\/(127\.0\.0\.1|localhost)(:|\/|$)/.test(getBaseUrl()) ? "omit" : "include"
 }
 
+// A plain `<img src>`/`new Image()` never sends credentials cross-origin
+// unless told to — unlike `fetch`, there's no per-call opt-in, only the
+// element's `crossOrigin` attribute. Every gallery thumbnail, sketch, and
+// part image is served from a permission-gated route (only /health is
+// public), so on staging/production (cross-origin backend, real session
+// cookie) these need `crossOrigin="use-credentials"` or they 401 exactly
+// like an unauthenticated fetch would. Local dev's wildcard CORS can't
+// combine with credentialed image requests either, so this mirrors
+// credentialsMode() exactly.
+export function imgCrossOrigin(): "use-credentials" | undefined {
+  return credentialsMode() === "include" ? "use-credentials" : undefined
+}
+
 // NOTE: intentionally no preview-query suffix here — every call site below
 // appends more path (`/analyze`, `/jobs/generate`, ...) after `base()`, and a
 // query string has to be last. Those call sites wrap their full URL in
@@ -294,13 +307,52 @@ function jobsBase(pluginId: string) {
   return resolvedPrefix ? `${resolvedPrefix}/jobs` : `/api/v1/plugins/${pluginId}/jobs`
 }
 
+// A real hosted session (staging/production) is a short-lived cookie, and a
+// job can take minutes across several stages (analyze -> generate -> stage2
+// -> stage4/5 -> measure -> parts polling), so a request issued late in that
+// flow can easily 401 on an access token that was still fresh when the job
+// started. The SDK's own `apiFetch` handles exactly this by retrying once
+// through `POST /api/v1/auth/refresh` (see node_modules/@palettelab/sdk's
+// dist) -- this file can't use that helper directly (it hardcodes a JSON
+// content-type that breaks multipart, and `credentials: "include"` that
+// breaks pltt dev's wildcard-CORS simulator), so it mirrors just the
+// refresh-and-retry behavior here instead. Preview auth is a `preview_token`
+// query param, not a cookie session, so there's nothing to refresh there.
+function canRefreshSession(): boolean {
+  return credentialsMode() === "include" && !resolvedPrefix
+}
+
+let refreshInFlight: Promise<boolean> | null = null
+
+async function tryRefreshSession(): Promise<boolean> {
+  if (!refreshInFlight) {
+    refreshInFlight = fetch(`${getBaseUrl()}/api/v1/auth/refresh`, { method: "POST", credentials: "include" })
+      .then((res) => res.ok)
+      .catch(() => false)
+      .finally(() => {
+        refreshInFlight = null
+      })
+  }
+  return refreshInFlight
+}
+
+// Every real network call in this file should go through this instead of a
+// bare `fetch` so a mid-session cookie expiry gets one silent retry instead
+// of surfacing as a bare 401 to the user.
+async function fetchWithRefresh(url: string, init: RequestInit): Promise<Response> {
+  const res = await fetch(url, init)
+  if (res.status !== 401 || !canRefreshSession()) return res
+  const refreshed = await tryRefreshSession()
+  return refreshed ? fetch(url, init) : res
+}
+
 // The SDK's own `apiFetch` unconditionally sends `credentials: "include"`
 // (hardcoded inside the SDK, not overridable via init), which breaks under
 // pltt dev's local simulator (see `credentialsMode` above) — so every call
 // here goes through plain `fetch` with credentials toggled per-environment
 // instead.
 async function apiCall(path: string, init?: RequestInit): Promise<Response> {
-  return fetch(`${getBaseUrl()}${withPreviewQuery(path)}`, { ...init, credentials: credentialsMode() })
+  return fetchWithRefresh(`${getBaseUrl()}${withPreviewQuery(path)}`, { ...init, credentials: credentialsMode() })
 }
 
 // ---------------- REST calls ----------------
@@ -309,7 +361,7 @@ export async function analyzeImage(pluginId: string, file: File): Promise<Analyz
   const fd = new FormData()
   fd.append("image", file, file.name || "upload.png")
   try {
-    const res = await fetch(withPreviewQuery(`${base(pluginId)}/analyze`), {
+    const res = await fetchWithRefresh(withPreviewQuery(`${base(pluginId)}/analyze`), {
       method: "POST",
       body: fd,
       credentials: credentialsMode(),
@@ -352,7 +404,7 @@ export async function generateJob(
     if (params.season) fd.append("season", params.season)
   }
   try {
-    const res = await fetch(withPreviewQuery(`${base(pluginId)}/jobs/generate`), {
+    const res = await fetchWithRefresh(withPreviewQuery(`${base(pluginId)}/jobs/generate`), {
       method: "POST",
       body: fd,
       credentials: credentialsMode(),
@@ -416,7 +468,7 @@ export async function startMeasure(
   const fd = new FormData()
   fd.append("size", size)
   try {
-    const res = await fetch(withPreviewQuery(`${base(pluginId)}/jobs/${jobId}/measure`), {
+    const res = await fetchWithRefresh(withPreviewQuery(`${base(pluginId)}/jobs/${jobId}/measure`), {
       method: "POST",
       body: fd,
       credentials: credentialsMode(),
@@ -442,12 +494,23 @@ export async function getParts(pluginId: string, jobId: string, bust?: number): 
 // given its resolved absolute URL.
 export async function fetchJson<T>(absUrl: string): Promise<T | null> {
   try {
-    const res = await fetch(absUrl, { credentials: credentialsMode() })
+    const res = await fetchWithRefresh(absUrl, { credentials: credentialsMode() })
     if (!res.ok) return null
     return (await res.json()) as T
   } catch {
     return null
   }
+}
+
+// Fetch a backend-hosted binary file (pattern-pages.pdf) as raw bytes. Used
+// instead of handing pdf.js a bare URL: pdf.js does its own internal fetch
+// with no credentials/refresh awareness, so a cross-origin session cookie
+// (staging/production) never gets attached to it and every load 401s
+// regardless of the auth handling everywhere else in this file.
+export async function fetchBinary(absUrl: string): Promise<ArrayBuffer> {
+  const res = await fetchWithRefresh(absUrl, { credentials: credentialsMode() })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  return res.arrayBuffer()
 }
 
 // Fetch an arbitrary (possibly cross-origin) URL back as a File, used when a

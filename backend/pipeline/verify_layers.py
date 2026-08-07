@@ -11,17 +11,24 @@ iteration a human would do in Inkscape.
 Usage: python3 verify_layers.py work.png labels.npy groups.json layered.svg
 Exit code: 0 = groups.json unchanged (all good), 3 = corrected (re-trace!)
 """
-import sys, os, io, json, base64, re
+import base64
+import io
+import json
+import os
+import re
+import sys
+
 import anthropic
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-from PIL import Image, ImageDraw
-from name_regions import deterministic_repairs
 from _svg_render import svg2png
+from name_regions import deterministic_repairs
+from PIL import Image, ImageDraw
 
 
 def format_groups_for_prompt(parts: dict) -> dict:
@@ -206,7 +213,8 @@ def render_sheet(svg_path, out_png, width=1400):
         buf = io.BytesIO()
         svg2png(svg_bytes=one.encode(), write_to=buf, output_width=width)
         im = Image.open(io.BytesIO(buf.getvalue())).convert("RGBA")
-        bg = Image.new("RGB", im.size, "white"); bg.paste(im, (0, 0), im)
+        bg = Image.new("RGB", im.size, "white")
+        bg.paste(im, (0, 0), im)
         bb = Image.eval(bg.convert("L"), lambda p: 255 - p).getbbox()
         crop = bg.crop(bb) if bb else bg
         crop.thumbnail((280, 260))
@@ -228,7 +236,8 @@ def b64_img(path, max_dim=1568):
     sc = min(1.0, max_dim / max(im.size))
     if sc < 1.0:
         im = im.resize((int(im.width * sc), int(im.height * sc)))
-    buf = io.BytesIO(); im.save(buf, format="PNG")
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode()
 
 

@@ -1,4 +1,3 @@
-import sys
 #!/usr/bin/env python3
 """
 seg_parts.py — automatic part segmentation for flat sketches.
@@ -21,19 +20,27 @@ drawn seam lines, which is exactly what polygons were approximating.
 
 Usage: python3 seg_parts.py input.png outdir [min_area]
 """
-import sys, os, json
+import json
+import os
+import sys
+
 from _bootstrap_deps import ensure
+
 ensure(modules=["scipy", "skimage"], packages=["scipy==1.18.0", "scikit-image==0.26.0"])
-import numpy as np
-from scipy import ndimage
-from PIL import Image, ImageDraw, ImageFont
-from skimage.morphology import skeletonize
-from skimage.draw import line as draw_line
+import numpy as np  # noqa: E402
+from PIL import Image, ImageDraw, ImageFont  # noqa: E402
+from scipy import ndimage  # noqa: E402
+from skimage.draw import line as draw_line  # noqa: E402
+from skimage.morphology import skeletonize  # noqa: E402
+
+
 def _font(sz):
     for p in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
               "/System/Library/Fonts/Helvetica.ttc", "arialbd.ttf", "arial.ttf"):
-        try: return ImageFont.truetype(p, sz)
-        except Exception: pass
+        try:
+            return ImageFont.truetype(p, sz)
+        except Exception:
+            pass
     return ImageFont.load_default()
 
 INK_T = None   # auto (Otsu); override with env INK_T
@@ -67,7 +74,8 @@ def otsu_threshold(a):
     def otsu(vals):
         hist = np.bincount(vals, minlength=256).astype(np.float64)
         total = hist.sum()
-        if total == 0: return 128
+        if total == 0:
+            return 128
         csum = np.cumsum(hist)
         cmean = np.cumsum(hist * np.arange(256))
         gmean = cmean[-1] / total
@@ -301,15 +309,20 @@ def main(in_png, outdir, min_area=1500, _tile_escalations=0, _drop_thin=False):
         print(f"upscaled 2x -> {src.size}")
     # trim near-solid dark bars on the edges (common screenshot artifact)
     aa = np.array(src)
-    rows = (aa < 100).mean(axis=1); cols = (aa < 100).mean(axis=0)
+    rows = (aa < 100).mean(axis=1)
+    cols = (aa < 100).mean(axis=0)
     top = 0
-    while top < len(rows) and rows[top] > 0.9: top += 1
+    while top < len(rows) and rows[top] > 0.9:
+        top += 1
     bot = len(rows)
-    while bot > top and rows[bot - 1] > 0.9: bot -= 1
+    while bot > top and rows[bot - 1] > 0.9:
+        bot -= 1
     left = 0
-    while left < len(cols) and cols[left] > 0.9: left += 1
+    while left < len(cols) and cols[left] > 0.9:
+        left += 1
     right = len(cols)
-    while right > left and cols[right - 1] > 0.9: right -= 1
+    while right > left and cols[right - 1] > 0.9:
+        right -= 1
     if (top, left, bot, right) != (0, 0, len(rows), len(cols)):
         pad = np.full_like(aa, 255)
         pad[top:bot, left:right] = aa[top:bot, left:right]
@@ -387,7 +400,8 @@ def main(in_png, outdir, min_area=1500, _tile_escalations=0, _drop_thin=False):
         if n_ == 0:
             return 0, None, None
         bord = set(np.unique(np.concatenate(
-            [lab_[0], lab_[-1], lab_[:, 0], lab_[:, -1]]))); bord.discard(0)
+            [lab_[0], lab_[-1], lab_[:, 0], lab_[:, -1]])))
+        bord.discard(0)
         szs = ndimage.sum_labels(~barrier_, lab_, np.arange(1, n_ + 1))
         cnt = sum(1 for i in range(1, n_ + 1)
                   if i not in bord and szs[i - 1] >= min_area)
@@ -461,7 +475,8 @@ def main(in_png, outdir, min_area=1500, _tile_escalations=0, _drop_thin=False):
     objs = ndimage.find_objects(lab)
     merged_into = {}
     def root(i):
-        while i in merged_into: i = merged_into[i]
+        while i in merged_into:
+            i = merged_into[i]
         return i
 
     # ---- applied-detail rescue, BEFORE the greedy merge below ----
@@ -576,7 +591,8 @@ def main(in_png, outdir, min_area=1500, _tile_escalations=0, _drop_thin=False):
         if r in border_ids or sizes[r - 1] < min_area // 4:
             continue
         if r not in remap:
-            remap[r] = next_id; next_id += 1
+            remap[r] = next_id
+            next_id += 1
         final[lab == i] = remap[r]
 
     final = split_dangling_seams(seg_ink, final, min_area)

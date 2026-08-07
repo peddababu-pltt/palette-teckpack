@@ -8,18 +8,26 @@ Sends seg_out/preview.png (numbered regions) plus the region stats from
 seg_out/regions.json, gets back the name -> region-ids mapping that
 layered_trace_v4.py consumes.
 """
-import sys, os, json, base64, io, math
+import base64
+import io
+import json
+import math
+import os
+import sys
+
 from _bootstrap_deps import ensure
+
 ensure(modules=["scipy"], packages=["scipy==1.18.0"])
-import anthropic
+import anthropic  # noqa: E402
+
 try:                                   # load .env if python-dotenv installed
     from dotenv import load_dotenv
     load_dotenv()                      # looks in current dir and parents
 except ImportError:
     pass
-from PIL import Image
-import numpy as np
-from scipy import ndimage
+import numpy as np  # noqa: E402
+from PIL import Image  # noqa: E402
+from scipy import ndimage  # noqa: E402
 
 PROMPT = """This is a fashion flat sketch of a garment (could be ANY type:
 jacket, shirt, t-shirt, hoodie, pants, shorts, skirt, dress, saree blouse,
@@ -119,6 +127,13 @@ Group ALL region ids into named garment parts. Rules:
   is a different piece entirely (a side adjuster strap / tab), even where it
   touches the belt's end. Keep each of those as its own part; folding them
   into the belt stretches it into an L or U shape that is not a belt.
+  This side strap/tab MUST still get its OWN named part, e.g. "front_belt_tab"
+  (name always contains "belt") — never leave it unnamed, and never fold its
+  region into whatever body panel or sleeve it happens to overlap just
+  because it bends away from the belt's main axis. A belt's excess tail
+  hanging past its buckle is this same case: it is anchored AT the buckle
+  (touches or overlaps the buckle region), not merely resting near the belt's
+  end, and it still needs its own "*_belt_tab" part rather than disappearing.
 - Bilateral parts (sleeves, legs, pockets, side panels, straps) exist as
   TWO separate instances — left and right — even if both appear under one
   view. Each instance is its OWN part with "left_"/"right_" in the name
@@ -347,7 +362,8 @@ Respond with ONLY valid JSON, no markdown fences. Include a
 "shorts", "hoodie", "kurta"):
 {{
  "garment_type": "puffer jacket",
- "z_order": ["body","panel","leg","yoke","sleeve","hem","cuff","waistband","fly","zip","placket","pocket","collar","hood","strap","badge","label","button"],
+ "z_order": ["body","panel","leg","yoke","sleeve","hem","cuff","waistband","fly","zip",
+   "placket","pocket","collar","hood","strap","badge","label","button"],
  "parts": {{
    "front_body": {{"regions": [6,7]}},
    "front_left_sleeve": {{"regions": [10,11]}},
@@ -437,6 +453,15 @@ def repair_parts(parts: dict, all_ids: set, info: dict) -> dict:
     return {nm: p for nm, p in parts.items() if p["regions"] or p.get("grab_box")}
 
 
+def _boxes_near(a: tuple, b: tuple, tol: float) -> bool:
+    """True if bbox `a` touches or sits within `tol` px of bbox `b` -- used to
+    tell a belt's own tail (anchored at the buckle) from an unrelated strap
+    that merely happens to run across the belt's middle."""
+    gap_x = max(b[0] - a[2], a[0] - b[2], 0)
+    gap_y = max(b[1] - a[3], a[1] - b[3], 0)
+    return gap_x <= tol and gap_y <= tol
+
+
 def split_offaxis_belt_regions(parts: dict, info: dict) -> dict:
     """Release regions that run ACROSS a belt out into their own strap part.
 
@@ -463,12 +488,25 @@ def split_offaxis_belt_regions(parts: dict, info: dict) -> dict:
         # the belt's own cross-measure: the median thickness of its sections
         thick = sorted((b[3] - b[1]) if horizontal else (b[2] - b[0])
                        for b in boxes.values())[len(boxes) // 2]
+        # A belt's own hanging tail/tab past its buckle often bends to a
+        # different angle than the main strip (that's the whole point of a
+        # buckle), which reads exactly like a perpendicular loop to the
+        # across/long_across test below. A loop sits AWAY from the buckle,
+        # against the belt's middle; a tail is anchored AT the buckle. Only
+        # the latter gets an exemption, so mid-belt loops still release.
+        buckle_nm = nm.replace("_belt", "_belt_buckle")
+        buckle_box = None
+        if buckle_nm in parts and parts[buckle_nm].get("regions"):
+            bb = [info[str(r)]["bbox"] for r in parts[buckle_nm]["regions"]]
+            buckle_box = (min(b[0] for b in bb), min(b[1] for b in bb),
+                          max(b[2] for b in bb), max(b[3] for b in bb))
         keep, off = [], []
         for r, b in boxes.items():
             w, h = b[2] - b[0], b[3] - b[1]
             across = (h > OFFAXIS_RATIO * w) if horizontal else (w > OFFAXIS_RATIO * h)
             long_across = (h if horizontal else w) > OFFAXIS_SPAN * thick
-            (off if (across and long_across) else keep).append(r)
+            near_buckle = buckle_box is not None and _boxes_near(b, buckle_box, thick)
+            (off if (across and long_across and not near_buckle) else keep).append(r)
         if not keep or not off:
             continue
         parts[nm]["regions"] = keep
@@ -524,16 +562,13 @@ def merge_hem_allowance(parts: dict, info: dict) -> dict:
                  and parts[n].get("regions") and not parts[n].get("grab_box")]
     panels = {n: union_box(p) for n, p in parts.items()
               if p.get("regions") and "hem" not in n}
-    # Bottom edge of every panel that already has a hem part sitting on it,
-    # so the symmetry test below can ask "does a neighbour at this same hem
-    # go straight to the edge instead?"
-    hem_boxes = [union_box(parts[n]) for n in hem_names]
-
     for nm in hem_names:
         regs = parts[nm]["regions"]
         boxes = [info[str(r)]["bbox"] for r in regs]
-        hx0 = min(b[0] for b in boxes); hy0 = min(b[1] for b in boxes)
-        hx1 = max(b[2] for b in boxes); hy1 = max(b[3] for b in boxes)
+        hx0 = min(b[0] for b in boxes)
+        hy0 = min(b[1] for b in boxes)
+        hx1 = max(b[2] for b in boxes)
+        hy1 = max(b[3] for b in boxes)
         hw, hh = hx1 - hx0, hy1 - hy0
         if hh <= 0 or hw / hh < HEM_MIN_ASPECT:
             continue
@@ -542,8 +577,10 @@ def merge_hem_allowance(parts: dict, info: dict) -> dict:
             if onm == nm or not op.get("regions"):
                 continue
             obs = [info[str(r)]["bbox"] for r in op["regions"]]
-            ox0 = min(b[0] for b in obs); oy0 = min(b[1] for b in obs)
-            ox1 = max(b[2] for b in obs); oy1 = max(b[3] for b in obs)
+            ox0 = min(b[0] for b in obs)
+            oy0 = min(b[1] for b in obs)
+            ox1 = max(b[2] for b in obs)
+            oy1 = max(b[3] for b in obs)
             oh = oy1 - oy0
             if oh <= 0 or hh > HEM_MAX_FRAC * oh:
                 continue
@@ -740,8 +777,9 @@ def split_oversized_applied(parts: dict, info: dict, segdir: str) -> dict:
     garment, by name (front_left_pocket -> front_left_body_panel), which is the
     same piece a person reading the layer sheet would hand it back to.
     """
-    area_of = lambda p: sum(info[str(r)]["area"] for r in p.get("regions", [])
-                            if str(r) in info)
+    def area_of(p):
+        return sum(info[str(r)]["area"] for r in p.get("regions", [])
+                   if str(r) in info)
     panels = [area_of(p) for n, p in parts.items()
               if ("panel" in n or "body" in n) and p.get("regions")]
     if not panels:
@@ -1285,7 +1323,8 @@ def reunite_sleeve_columns(parts: dict, info: dict) -> dict:
     def area_of(regs):
         return sum(info[str(r)]["area"] for r in regs if str(r) in info)
 
-    ov = lambda a0, a1, b0, b1: max(0, min(a1, b1) - max(a0, b0))
+    def ov(a0, a1, b0, b1):
+        return max(0, min(a1, b1) - max(a0, b0))
     for view in ("front", "back", "side"):
         sleeves = [nm for nm in parts
                    if nm.startswith(view + "_") and "sleeve" in nm
@@ -1513,8 +1552,9 @@ def normalize_part_names(parts: dict, info: dict) -> dict:
     Where the translation collides with an existing part, the BIGGER one keeps
     the plain name (on 3038bc32f0a0 the collision was the real 103k-px front
     panel against a 25k-px lapel facing that had been called body_panel)."""
-    area = lambda p: sum(info[str(r)]["area"] for r in p.get("regions", [])
-                         if str(r) in info)
+    def area(p):
+        return sum(info[str(r)]["area"] for r in p.get("regions", [])
+                   if str(r) in info)
     for nm in list(parts):
         toks = nm.split("_")
         if not any(t in SYNONYMS for t in toks):
@@ -1657,7 +1697,8 @@ def evict_offcolumn_from_sleeve(parts: dict, info: dict, segdir: str) -> dict:
     lab_path = os.path.join(segdir, "labels.npy")
     lab = np.load(lab_path) if os.path.isfile(lab_path) else None
     st = np.ones((3, 3), bool)
-    ov = lambda a0, a1, b0, b1: max(0, min(a1, b1) - max(a0, b0))
+    def ov(a0, a1, b0, b1):
+        return max(0, min(a1, b1) - max(a0, b0))
     for view in ("front", "back", "side"):
         for nm in [n for n in parts
                    if n.startswith(view + "_") and "sleeve" in n
@@ -1929,7 +1970,8 @@ def collapse_subpanels(parts: dict, info: dict, segdir: str) -> dict:
                     if h:
                         touching[h] = touching.get(h, 0) + int(
                             (ring & (lab == r2)).sum())
-        adjacent = lambda h: not touching or touching.get(h, 0) > 0
+        def adjacent(h):
+            return not touching or touching.get(h, 0) > 0
         host = None
         cands = ["_".join(t for t in toks if t not in SUBPANEL_QUALIFIERS)]
         # ...then the piece this name says it is a section of, e.g.
@@ -2221,7 +2263,8 @@ def main(segdir, out_json):
     scale = min(1.0, 1568 / max(img.size))
     if scale < 1.0:
         img = img.resize((int(img.width * scale), int(img.height * scale)))
-    buf = io.BytesIO(); img.save(buf, format="PNG")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode()
 
     def extract_json(t):

@@ -746,6 +746,12 @@ async def stage4(job_id: str, ctx: PluginContext = Depends(get_plugin_context)) 
         return {"event": "stage_done", "stage": 4, "file": _file_url(job_id, "parts.svg")}
 
     slot = job_slot(job_id, "stage4")
+    # The frontend re-attaches to whatever's already running for a job after
+    # a page reload (its in-memory live-stage tracking doesn't survive one) --
+    # without this check, that re-attach would start a SECOND subprocess
+    # racing the first one over the same parts.svg output file.
+    if slot in JOB_PROCS:
+        return Response(content=json.dumps({"ok": True}), media_type="application/json")
     JOB_QUEUES[slot] = asyncio.Queue()
     asyncio.create_task(run_stage(
         slot, "stage 4",
@@ -771,6 +777,11 @@ async def stage5(job_id: str, ctx: PluginContext = Depends(get_plugin_context)) 
         cmd.append(str(paths["input"]))
 
     slot = job_slot(job_id, "stage5")
+    # See the matching check in stage4() above: without it, a post-reload
+    # re-attach would race a second subprocess against an already-running one
+    # over the same pattern.svg/pattern-pages.pdf output files.
+    if slot in JOB_PROCS:
+        return Response(content=json.dumps({"ok": True}), media_type="application/json")
     JOB_QUEUES[slot] = asyncio.Queue()
     asyncio.create_task(run_node_stage(
         slot, "stage 5", cmd,

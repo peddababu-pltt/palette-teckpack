@@ -15,7 +15,9 @@ inspect preview.png / groups.json and rerun step 3 alone after edits:
     python3 layered_trace_v4.py sketch.png sketch_seg/labels.npy \
             sketch_seg/groups.json out.svg
 """
-import sys, os, subprocess
+import os
+import subprocess
+import sys
 
 
 def run(*args):

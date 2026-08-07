@@ -15,7 +15,6 @@ import sys
 from pathlib import Path
 
 import requests
-
 from warp_pattern import (
     API_KEY,
     BASE_URL,
@@ -101,6 +100,23 @@ REGEN_PROMPT = (
     "(#000000) — line weight comes from stroke width alone, never from gray or a lighter tone — and "
     "holds constant width to both of its endpoints, with blunt full-strength ends, never tapering, "
     "fading, or trailing off. "
+
+    "FUR/SHEARLING/FAUX-FUR TRIM: if the input has a fur, shearling, or faux-fur collar, cuff, or hood "
+    "trim, reproduce its edge as a gentle, open, evenly-spaced scalloped or wavy border — like a cloud "
+    "outline — at the SAME hairline stroke weight as every other line. Do not thicken, densify, or "
+    "sharpen the input's fur texture into a dense jagged zigzag or tight spiking: if the input's fur "
+    "edge is already dense enough to read as a heavier or darker band than the rest of the outline, "
+    "clean it up to the same open, evenly-spaced scallop described above instead of reproducing that "
+    "density. A cleaned-up fur edge reads as a construction detail, not a thick black smear. "
+
+    "NEVER FILL A REGION SOLID BLACK. If the input has a contrast-colored or dark-colored trim, panel, "
+    "or material — a dark placket, a dark waistband or belt, a contrast collar underside, contrast "
+    "pocket welts or flap binding, a two-tone yoke or cuff strap — that contrast is drawn as an outline "
+    "only, exactly like every other panel, with its interior left blank white. Do not represent color, "
+    "shading, or material contrast by filling the shape solid black. A solid black placket, waistband, "
+    "collar facing, belt loop, cuff strap, or pull tab carried over from a dark area of the input is "
+    "exactly the defect to avoid — reproduce its outline and internal construction lines (stitching, "
+    "edge seams) at the normal line weight, never as a filled block. "
 
     "STITCHING: draw all stitching and topstitching in clean vector technical-dashed style. HALVE the "
     "stitch density relative to the input: walking along each stitch line from its start, KEEP the 1st "

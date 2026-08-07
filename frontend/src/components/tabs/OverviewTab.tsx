@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react"
 import { usePluginTranslations } from "@palettelab/sdk"
-import { downloadUrl, fetchJson, getParts, resolveUrl, type Job, type PatternDesign } from "../../api"
+import { downloadUrl, fetchJson, getParts, imgCrossOrigin, resolveUrl, type Job, type PatternDesign } from "../../api"
 import { STRINGS } from "../../strings"
 import { dlIcon } from "../icons"
 import SplitCompare from "../SplitCompare"
@@ -148,7 +148,7 @@ export default function OverviewTab({ job, pluginId }: { job: Job; pluginId: str
                       key={i}
                       onClick={() => setActiveIdx(i)}
                     >
-                      <img src={img} alt={v.label} />
+                      <img src={img} crossOrigin={imgCrossOrigin()} alt={v.label} />
                       <span>{v.label}</span>
                     </div>
                   )
@@ -162,7 +162,7 @@ export default function OverviewTab({ job, pluginId }: { job: Job; pluginId: str
               <div className="tp-thumb-row">
                 {refs.map((r, i) => (
                   <div className="tp-thumb-item" key={i}>
-                    <img src={r} alt="" />
+                    <img src={r} crossOrigin={imgCrossOrigin()} alt="" />
                   </div>
                 ))}
               </div>

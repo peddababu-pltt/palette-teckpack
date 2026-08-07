@@ -11,6 +11,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react"
 import * as pdfjsLib from "pdfjs-dist"
 import { usePluginTranslations } from "@palettelab/sdk"
 import { STRINGS } from "../strings"
+import { fetchBinary } from "../api"
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`
 
@@ -107,7 +108,9 @@ export default function PdfViewer({ url, downloads }: { url: string; downloads: 
     }
 
     async function load() {
-      doc = await pdfjsLib.getDocument({ url }).promise
+      const data = await fetchBinary(url)
+      if (destroyed) return
+      doc = await pdfjsLib.getDocument({ data: new Uint8Array(data) }).promise
       if (destroyed) return
       setPageCount(doc.numPages)
       const scroll = scrollRef.current

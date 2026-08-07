@@ -20,13 +20,19 @@ v2 strategy:
 Usage: python3 layered_trace_v2.py input.png parts.json output.svg
 parts.json schema identical to v1 (poly / box / remainder, z_order).
 """
-import sys, json, re, tempfile, os
+import json
+import os
+import re
+import sys
+import tempfile
+
 from _bootstrap_deps import ensure
+
 ensure(modules=["scipy", "vtracer"], packages=["scipy==1.18.0", "vtracer==0.6.15"])
-import numpy as np
-from scipy import ndimage
-from PIL import Image, ImageDraw
-import vtracer
+import numpy as np  # noqa: E402
+import vtracer  # noqa: E402
+from PIL import Image, ImageDraw  # noqa: E402
+from scipy import ndimage  # noqa: E402
 
 PATH_RE = re.compile(r'\bd="([^"]+)"')
 FILL_RE = re.compile(r'fill="([^"]+)"')
@@ -214,12 +220,13 @@ def main(in_png, parts_json, out_svg):
 
     labels, n = ndimage.label(ink, structure=np.ones((3, 3)))
     objs = ndimage.find_objects(labels)
-    areas = ndimage.sum_labels(ink, labels, index=np.arange(1, n + 1))
 
     cfg = json.load(open(parts_json))
     cfg = snap_parts_to_ink(cfg, ink)
     z = cfg.get("z_order", [])
-    zkey = lambda name: next((i for i, k in enumerate(z) if k in name), -1)
+
+    def zkey(name):
+        return next((i for i, k in enumerate(z) if k in name), -1)
 
     layers = []
     for view, vcfg in cfg["views"].items():

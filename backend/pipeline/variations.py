@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 variations.py — existing two-view flat sketch → design/color variations.
-usage: python variations.py sketch.png out_dir --mode sketch --variants 2 [--prompt "extra instructions"] [--seed 42]
-       python variations.py sketch.png out_dir --mode both [--colors "#RRGGBB,#RRGGBB,#RRGGBB"] [--prompt "..."] [--seed 42]
+usage: python variations.py sketch.png out_dir --mode sketch --variants 2
+           [--prompt "extra instructions"] [--seed 42]
+       python variations.py sketch.png out_dir --mode both
+           [--colors "#RRGGBB,#RRGGBB,#RRGGBB"] [--prompt "..."] [--seed 42]
 
 The original sketch itself is the "Default" output — the caller (app.py)
 already has it, so this script never regenerates it. Two modes:
@@ -24,8 +26,13 @@ import anthropic
 import requests
 from PIL import Image
 from warp_pattern import (
-    API_KEY, BASE_URL, FLAT_SKETCH_PROMPT, upload_image, iter_sse_events,
-    extract_outputs, download_output,
+    API_KEY,
+    BASE_URL,
+    FLAT_SKETCH_PROMPT,
+    download_output,
+    extract_outputs,
+    iter_sse_events,
+    upload_image,
 )
 
 # Exactly the two views, closed, front-left/back-right -- matching the flat's own
@@ -216,18 +223,37 @@ _WEARABILITY_RULES = (
 )
 
 
-_IDEA_PROMPT = """You are a production designer proposing simple, buildable alternate versions of this exact garment.
+_IDEA_PROMPT = """You are a production designer proposing simple, buildable alternate
+versions of this exact garment.
 
-Look at the garment in the reference image and propose {count} DISTINCT variations — each one a single, plain construction change to something you can actually see on THIS garment (its pockets, collar/neckline, closure, cuffs/hem, sleeves, panel seams).
+Look at the garment in the reference image and propose {count} DISTINCT variations —
+each one a single, plain construction change to something you can actually see on THIS
+garment (its pockets, collar/neckline, closure, cuffs/hem, sleeves, panel seams).
 
 Rules for each idea:
-- ONE named change per idea, in plain words (e.g. "swap the patch pockets for angled welt pockets", "replace the button placket with a full-length centre-front zip", "change the set-in sleeve to a raglan sleeve"). Never vague phrasing like "a different style", and never a list of three changes at once.
-- Keep it SIMPLE and ordinary — a normal garment a factory makes every day and a customer would wear. Not a runway concept, not an experiment. If an idea sounds complicated to sew, it is the wrong idea.
-- NO fabric prints or patterns. No houndstooth, plaid, check, stripe, camo or allover hatch fill. The drawing stays clean line art on plain white; a filled pattern hides the construction and makes the change unreadable. Colour-blocking is fine ONLY as a seam line — never as a filled panel.
-- Base it on garment parts that are ACTUALLY VISIBLE in this photo/sketch — don't invent a collar for a garment that has none.
-- Each of the {count} ideas must change a DIFFERENT element (pockets in one, closure in another, sleeve seam in another, hem/cuff in another).
-- The result must stay a REAL, WEARABLE garment. If you change the closure, you REPLACE the existing one — never add a second zip or placket alongside it, never route a closure diagonally across a body panel, never leave a zip ending in the middle of fabric. A person has to be able to open the garment, get into it, and close it again.
-- Do not propose anything that cannot be cut and sewn from flat panels: no seam that stops in open fabric, no detail floating off the garment, no opening too small to pass a head or arm through.
+- ONE named change per idea, in plain words (e.g. "swap the patch pockets for angled
+  welt pockets", "replace the button placket with a full-length centre-front zip",
+  "change the set-in sleeve to a raglan sleeve"). Never vague phrasing like "a
+  different style", and never a list of three changes at once.
+- Keep it SIMPLE and ordinary — a normal garment a factory makes every day and a
+  customer would wear. Not a runway concept, not an experiment. If an idea sounds
+  complicated to sew, it is the wrong idea.
+- NO fabric prints or patterns. No houndstooth, plaid, check, stripe, camo or allover
+  hatch fill. The drawing stays clean line art on plain white; a filled pattern hides
+  the construction and makes the change unreadable. Colour-blocking is fine ONLY as a
+  seam line — never as a filled panel.
+- Base it on garment parts that are ACTUALLY VISIBLE in this photo/sketch — don't
+  invent a collar for a garment that has none.
+- Each of the {count} ideas must change a DIFFERENT element (pockets in one, closure
+  in another, sleeve seam in another, hem/cuff in another).
+- The result must stay a REAL, WEARABLE garment. If you change the closure, you
+  REPLACE the existing one — never add a second zip or placket alongside it, never
+  route a closure diagonally across a body panel, never leave a zip ending in the
+  middle of fabric. A person has to be able to open the garment, get into it, and
+  close it again.
+- Do not propose anything that cannot be cut and sewn from flat panels: no seam that
+  stops in open fabric, no detail floating off the garment, no opening too small to
+  pass a head or arm through.
 
 Respond with ONLY a valid JSON array of {count} strings, no markdown fences, no explanation:
 ["<idea 1 as one instruction sentence>", "<idea 2>", ...]"""
@@ -279,31 +305,32 @@ _RECOMMEND_PROMPT = """You are a colorist and merchandiser recommending a realis
 treatment for this exact garment.
 
 Look at the garment in the reference image (its type, silhouette, and any fabric cues already \
-drawn) and recommend:
-1. A 3-color palette that actually suits THIS garment — not a generic default. Pick colors a \
-real buyer would put this garment into production in.
+drawn) and recommend a 3-color palette that actually suits THIS garment — not a generic default. \
+Pick colors a real buyer would put this garment into production in.
    - "primary": the main body fabric color (most of the garment).
    - "secondary": a contrast panel/lining color if the garment has a place for one, otherwise \
 a color close to primary.
    - "trim": zippers/buttons/snaps/piping/ribbing/drawstring/label color — should read as \
 metal, plastic, or a deliberate accent, not just a repeat of primary.
-2. The single best-fit season from this exact list: {seasons}. Base it on the garment's weight \
-and construction as drawn (e.g. a heavy hooded parka reads winter or rain, a sleeveless cotton \
-dress reads spring or summer) — not a random pick.
 
 Respond with ONLY a valid JSON object, no markdown fences, no explanation:
-{{"primary": "#RRGGBB", "secondary": "#RRGGBB", "trim": "#RRGGBB", "season": "<one of {seasons}>"}}"""
+{"primary": "#RRGGBB", "secondary": "#RRGGBB", "trim": "#RRGGBB"}"""
 
 
 def recommend_colors_and_season(sketch_path: str, extra_prompt: str) -> tuple[list[str], str]:
-    """Ask Claude to recommend a color palette + season from the actual garment,
-    used whenever the caller didn't supply one (the "AI Recommendation" tabs in
-    the UI send neither) instead of falling back to a flat generic prompt line
+    """Ask Claude to recommend a color palette from the actual garment, used
+    whenever the caller didn't supply one (the "AI Recommendation" tabs in the
+    UI send neither) instead of falling back to a flat generic prompt line
     that looks the same on every job regardless of garment. Returns ([], "") on
-    any failure so the caller's existing generic fallback still applies."""
+    any failure so the caller's existing generic fallback still applies.
+
+    Season is a random pick across SEASONS, not garment-conditioned: the caller
+    wants variety run to run on the same garment rather than the AI settling on
+    whichever season it judges "correct" every time."""
+    season = random.choice(list(SEASONS.keys()))
     try:
         b64 = _load_image_b64(sketch_path)
-        prompt = _RECOMMEND_PROMPT.format(seasons=", ".join(SEASONS.keys()))
+        prompt = _RECOMMEND_PROMPT
         if extra_prompt:
             prompt += f"\n\nAlso take into account these additional instructions from the user: {extra_prompt}"
 
@@ -325,15 +352,12 @@ def recommend_colors_and_season(sketch_path: str, extra_prompt: str) -> tuple[li
 
         colors = [result.get(k, "") for k in ("primary", "secondary", "trim")]
         colors = [c for c in colors if isinstance(c, str) and c.startswith("#")]
-        season = result.get("season", "")
-        season = season if season in SEASONS else ""
 
-        if colors or season:
-            print(f"AI recommended: colors={colors or 'none'} season={season or 'none'}")
+        print(f"recommended: colors={colors or 'none'} season={season} (random)")
         return colors, season
     except Exception as e:
-        print(f"AI color/season recommendation failed ({e}) — using generic fallback")
-        return [], ""
+        print(f"AI color recommendation failed ({e}) — using generic fallback, season stays random")
+        return [], season
 
 
 def generate_variant_ideas(sketch_path: str, count: int, extra_prompt: str) -> list[str]:

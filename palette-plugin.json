@@ -2,7 +2,7 @@
   "manifest_version": "1",
   "id": "techpack",
   "name": "Techpack Studio",
-  "version": "1.0.13",
+  "version": "1.0.18",
   "developer": "Your Team",
   "category": "Productivity",
   "tagline": "Photo to sewing-pattern techpack pipeline",
@@ -28,7 +28,8 @@
     "file_uploads": true,
     "external_network": [
       "api.anthropic.com",
-      "generativelanguage.googleapis.com"
+      "generativelanguage.googleapis.com",
+      "router-api.pltt.ai"
     ]
   },
   "frontend": {

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 
-from block_rules import get_block_rule, get_block_for_subcategory
+from block_rules import get_block_for_subcategory, get_block_rule
 from body_measurment import BODY_MEASUREMENTS, EASE_DEFAULTS
 
 logger = logging.getLogger(__name__)
@@ -309,7 +309,8 @@ def map_parts_to_pom(parts: list, block_types: list[str] | None = None) -> dict[
 
     for part in parts:
         name = (getattr(part, "name", None) or (part.get("name") if isinstance(part, dict) else "")).lower()
-        comp_type = (getattr(part, "component_type", None) or (part.get("component_type", "") if isinstance(part, dict) else "")).lower()
+        comp_type = (getattr(part, "component_type", None)
+                     or (part.get("component_type", "") if isinstance(part, dict) else "")).lower()
 
         poms: list[str] = []
 

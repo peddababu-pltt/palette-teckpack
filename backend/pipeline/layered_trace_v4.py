@@ -30,16 +30,25 @@ groups.json:
   }
 }
 """
-import sys, json, re, tempfile, os, subprocess, shutil
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
 from _bootstrap_deps import ensure
+
 ensure(modules=["scipy", "vtracer", "svgpathtools"],
        packages=["scipy==1.18.0", "vtracer==0.6.15", "svgpathtools==1.7.2"])
-import numpy as np
-from scipy import ndimage
-from PIL import Image, ImageDraw
-import vtracer
-from svgpathtools import parse_path
-from _svg_render import svg2png
+import numpy as np  # noqa: E402
+import vtracer  # noqa: E402
+from _svg_render import svg2png  # noqa: E402
+from PIL import Image, ImageDraw  # noqa: E402
+from scipy import ndimage  # noqa: E402
+from svgpathtools import parse_path  # noqa: E402
+
 
 def _resolve_potrace():
     """Prefer a system potrace (dev machines with it on PATH). The Palette
@@ -47,21 +56,24 @@ def _resolve_potrace():
     only ships pip packages -- so without a fallback, every hosted run
     silently drops to trace_vtracer(), which fuses thin gaps (rib lines,
     hood double-lines, pleat ladders) into solid black and can silently
-    return zero paths on some canvases. bin/ vendors a static Debian
-    potrace_1.16-2+b3 (amd64) + its libpotrace.so.0 as a same-quality
-    fallback; LD_LIBRARY_PATH points run_potrace's subprocess at the
-    vendored .so only when the vendored binary is the one actually used."""
+    return zero paths on some canvases. bin/potrace is built from potrace
+    1.16 source with `-all-static` (see bin/README.md) specifically so it
+    carries no glibc version dependency at all -- an earlier version of this
+    fallback dynamically linked against the host's libc.so.6, which broke on
+    any hosted runtime whose glibc predated whatever build host produced it
+    (surfaced as `potrace: ... GLIBC_2.38' not found`, not a load-bearing
+    trace failure)."""
     found = shutil.which("potrace")
     if found:
-        return found, None
+        return found
     bin_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin")
     bundled = os.path.join(bin_dir, "potrace")
     if os.path.isfile(bundled) and os.access(bundled, os.X_OK):
-        return bundled, bin_dir
-    return None, None
+        return bundled
+    return None
 
 
-POTRACE_BIN, POTRACE_LIB_DIR = _resolve_potrace()
+POTRACE_BIN = _resolve_potrace()
 # buttons / stitch-dashes: small, compact, isolated marks. vtracer's spline
 # fit + speckle filter blur or drop these; potrace (turdsize=0, no curve
 # smoothing) traces tiny bitonal detail faithfully. Anything bigger than
@@ -665,14 +677,17 @@ def run_potrace(img, smooth=False, ss=1):
     else:
         args += ["-t", f"{TURD * ss * ss:.3f}",
                  "-O", f"{OPT_TOL * ss:.3f}", "-a", f"{ALPHA_MAX:.3f}"]
-    env = None
-    if POTRACE_LIB_DIR:
-        env = os.environ.copy()
-        env["LD_LIBRARY_PATH"] = POTRACE_LIB_DIR + os.pathsep + env.get("LD_LIBRARY_PATH", "")
     with tempfile.TemporaryDirectory() as td:
         pin, pout = os.path.join(td, "i.bmp"), os.path.join(td, "o.svg")
         img.convert("1", dither=Image.NONE).save(pin)
-        subprocess.run(args + ["-o", pout, pin], check=True, capture_output=True, env=env)
+        try:
+            subprocess.run(args + ["-o", pout, pin], check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or b"").decode(errors="replace").strip()
+            raise RuntimeError(
+                f"potrace exited {e.returncode} on a {img.width}x{img.height} "
+                f"{img.mode} canvas: {stderr or '(no stderr)'}"
+            ) from e
         svg = open(pout).read()
     out = []
     for m in re.finditer(r'<path[^>]*>', svg):
@@ -973,7 +988,8 @@ def otsu_threshold(a):
     def otsu(vals):
         hist = np.bincount(vals, minlength=256).astype(np.float64)
         total = hist.sum()
-        if total == 0: return 128
+        if total == 0:
+            return 128
         csum = np.cumsum(hist)
         cmean = np.cumsum(hist * np.arange(256))
         gmean = cmean[-1] / total
@@ -1102,7 +1118,9 @@ def main(in_png, labels_npy, groups_json, out_svg):
     # way. A keyword the canonical list does not know falls back to the
     # model's own ordering, appended after the structural pieces.
     z = STRUCTURAL_Z + [k for k in cfg.get("z_order", []) if k not in STRUCTURAL_Z]
-    kw_key = lambda nm: next((i for i, k in enumerate(z) if k in nm), -1)
+
+    def kw_key(nm):
+        return next((i for i, k in enumerate(z) if k in nm), -1)
 
     # PART RELATIONSHIP GRAPH: measure containment between parts from the
     # label map itself. A part mostly inside another's expanded footprint
@@ -2072,7 +2090,8 @@ def main(in_png, labels_npy, groups_json, out_svg):
 
     # catch-all: ink no part captured -> "unassigned" layer (never lose lines)
     captured = np.zeros((H, W), bool)
-    for _, _, _ in []: pass
+    for _, _, _ in []:
+        pass
     for nm, p in cfg["parts"].items():
         reg = np.isin(labels, p["regions"])
         captured |= ndimage.binary_dilation(reg, dil, iterations=BAND)
