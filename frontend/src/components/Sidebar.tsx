@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { usePluginTranslations } from "@palettelab/sdk"
 import { analyzeImage, fetchAsFile, isAnalyzeUnavailable, type AnalyzeResponse, type AnalyzeResult } from "../api"
 import { STRINGS } from "../strings"
+import SketchCanvas from "./SketchCanvas"
 
 export interface GenerateSubmission {
   photo: File
@@ -11,27 +12,11 @@ export interface GenerateSubmission {
   outputMode: "sketch" | "both"
   colors?: string[]
   season?: string
-  sourceMode: "image" | "sketch"
+  fabric?: string
+  sourceMode: "image"
 }
 
 const DEFAULT_COLORS = ["#e8e0d8", "#c4b5a0", "#8b7355"]
-
-function computeGate(analysis: AnalyzeResponse | null, mode: "image" | "sketch", t: (key: string) => string): string {
-  if (!analysis || isAnalyzeUnavailable(analysis)) return ""
-  if (mode === "image") {
-    if (analysis.imageKind === "flat_sketch") {
-      return t("sidebar.flatSketchGate")
-    }
-    if (analysis.imageKind === "not_a_garment") {
-      return t("sidebar.notGarmentGate")
-    }
-  } else if (mode === "sketch") {
-    if (analysis.imageKind === "photo") {
-      return t("sidebar.photoGate")
-    }
-  }
-  return ""
-}
 
 export default function Sidebar({
   pluginId,
@@ -47,14 +32,15 @@ export default function Sidebar({
   onGenerate: (sub: GenerateSubmission) => void
 }) {
   const { t } = usePluginTranslations(STRINGS)
-  const [mode, setMode] = useState<"image" | "sketch">("image")
   const [stagedFile, setStagedFile] = useState<File | null>(null)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [analysis, setAnalysis] = useState<AnalyzeResponse | null>(null)
   const [analysisLoading, setAnalysisLoading] = useState(false)
   const analysisSeqRef = useRef(0)
   const [showUseAsSketch, setShowUseAsSketch] = useState(false)
-  const [dragOver, setDragOver] = useState<"image" | "sketch" | null>(null)
+  const [dragOver, setDragOver] = useState(false)
+  const [drawOpen, setDrawOpen] = useState(false)
+  const [drawnImageUrl, setDrawnImageUrl] = useState<string | null>(null)
 
   const [referenceFiles, setReferenceFiles] = useState<File[]>([])
   const refUrlsRef = useRef<string[]>([])
@@ -68,6 +54,9 @@ export default function Sidebar({
 
   const [seasonTab, setSeasonTab] = useState<"ai" | "options">("options")
   const [selectedSeason, setSelectedSeason] = useState<string | null>(null)
+
+  const [fabricTab, setFabricTab] = useState<"ai" | "options">("options")
+  const [selectedFabric, setSelectedFabric] = useState<string | null>(null)
 
   const [promptText, setPromptText] = useState("")
   const [outputType, setOutputType] = useState<"sketch" | "both">("sketch")
@@ -88,20 +77,16 @@ export default function Sidebar({
     }
   }, [analysis])
 
-  // Only Image mode + a closed overlay accepts a clipboard paste.
+  // A closed overlay accepts a clipboard paste.
   useEffect(() => {
     function onPaste(e: ClipboardEvent) {
-      if (mode !== "image" || overlayOpen) return
+      if (overlayOpen) return
       const file = e.clipboardData?.files?.[0]
       if (file && file.type.startsWith("image/")) void handleUpload(file)
     }
     document.addEventListener("paste", onPaste)
     return () => document.removeEventListener("paste", onPaste)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, overlayOpen])
-
-  const gateMessage = useMemo(() => computeGate(analysis, mode, t), [analysis, mode, t])
-  const uploadBlocked = !!gateMessage
+  }, [overlayOpen])
 
   const analysisNote = useMemo(() => {
     if (analysisLoading) return t("sidebar.analyzing")
@@ -158,16 +143,16 @@ export default function Sidebar({
     return line || ""
   }
 
-  function makeDropHandlers(zoneMode: "image" | "sketch") {
+  function makeDropHandlers() {
     return {
       onDragOver: (e: React.DragEvent) => {
         e.preventDefault()
-        setDragOver(zoneMode)
+        setDragOver(true)
       },
-      onDragLeave: () => setDragOver((d) => (d === zoneMode ? null : d)),
+      onDragLeave: () => setDragOver(false),
       onDrop: (e: React.DragEvent) => {
         e.preventDefault()
-        setDragOver(null)
+        setDragOver(false)
         const file = e.dataTransfer.files?.[0]
         if (file) {
           void handleUpload(file)
@@ -242,6 +227,21 @@ export default function Sidebar({
     return out
   }
 
+  // ---- fabric ----
+  const FABRIC_BY_SEASON: Record<string, string[]> = {
+    spring:  ["ramie", "gauze", "poplin"],
+    summer:  ["ramie", "poplin", "gauze"],
+    autumn:  ["hemp", "gauze", "hanji"],
+    winter:  ["hanbok-silk", "hanji", "hemp"],
+    rain:    ["hemp", "poplin", "gauze"],
+  }
+  const ALL_FABRICS = ["hanbok-silk", "ramie", "hemp", "gauze", "poplin", "hanji"]
+
+  function pickAiFabric(): string {
+    const pool = selectedSeason ? (FABRIC_BY_SEASON[selectedSeason] ?? ALL_FABRICS) : ALL_FABRICS
+    return pool[Math.floor(Math.random() * pool.length)]
+  }
+
   // ---- color / season ----
   function syncColorChecked(i: number, checked: boolean) {
     setColorChecked((prev) => prev.map((c, idx) => (idx === i ? checked : c)))
@@ -257,34 +257,42 @@ export default function Sidebar({
       window.alert(t("sidebar.uploadFirst"))
       return
     }
-    if (uploadBlocked) {
-      window.alert(gateMessage)
-      return
-    }
     const sub: GenerateSubmission = {
       photo: stagedFile,
       references: referenceFiles,
       prompt: promptText.trim(),
       measurements: measureTab === "manual" ? changedMeasurements() : null,
       outputMode: outputType,
-      sourceMode: mode,
+      sourceMode: "image",
     }
     if (outputType === "both") {
       if (colorTab === "picker") {
         sub.colors = colorChecked.map((checked, i) => (checked ? colorValues[i] : ""))
       }
       if (seasonTab === "options" && selectedSeason) sub.season = selectedSeason
+      if (fabricTab === "options" && selectedFabric) sub.fabric = selectedFabric
+      else if (fabricTab === "ai") sub.fabric = pickAiFabric()
     }
     onGenerate(sub)
   }
 
   async function onUseAsSketchClick() {
     if (!useAsSketchUrl) return
-    setMode("sketch")
     await stageDroppedUrl(useAsSketchUrl)
   }
 
+  function onDrawSelect(file: File) {
+    const url = URL.createObjectURL(file)
+    setDrawnImageUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev)
+      return url
+    })
+    void handleUpload(file)
+    setDrawOpen(false)
+  }
+
   return (
+    <>
     <div className="studio-sidebar">
       <div className="studio-sidebar-scroll">
         <div className="studio-step">
@@ -293,10 +301,16 @@ export default function Sidebar({
             <div className="toolbar-group" id="mode-toolbar">
               <button
                 type="button"
-                className={`toolbar-btn${mode === "image" ? " active" : ""}`}
-                title={t("sidebar.imageTabTitle")}
-                onClick={() => setMode("image")}
+                className="toolbar-btn"
+                title={t("sidebar.drawTabTitle")}
+                onClick={() => setDrawOpen(true)}
               >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M17 3a2.828 2.828 0 114 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
+                </svg>
+                {t("sidebar.draw")}
+              </button>
+              <button type="button" className="toolbar-btn active" title={t("sidebar.imageTabTitle")}>
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
                   <circle cx="8.5" cy="8.5" r="1.5" />
@@ -304,27 +318,16 @@ export default function Sidebar({
                 </svg>
                 {t("sidebar.image")}
               </button>
-              <button
-                type="button"
-                className={`toolbar-btn${mode === "sketch" ? " active" : ""}`}
-                title={t("sidebar.sketchTabTitle")}
-                onClick={() => setMode("sketch")}
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M17 3a2.828 2.828 0 114 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
-                </svg>
-                {t("sidebar.sketch")}
-              </button>
             </div>
           </div>
 
           <div id="upload-area">
-            <div id="image-upload" className={`upload-mode${mode !== "image" ? " hidden" : ""}`}>
+            <div id="image-upload" className="upload-mode">
               <label
                 id="image-dropzone"
-                className={`dropzone small s2-dropzone${dragOver === "image" ? " dragover" : ""}`}
+                className={`dropzone small s2-dropzone${dragOver ? " dragover" : ""}`}
                 htmlFor="image-file"
-                {...makeDropHandlers("image")}
+                {...makeDropHandlers()}
               >
                 <div className="dropzone-icon">
                   <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#bbb" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
@@ -339,24 +342,6 @@ export default function Sidebar({
               </label>
               <input type="file" id="image-file" className="hidden" accept="image/jpeg,image/png,image/webp" onChange={onFileInputChange} />
             </div>
-            <div id="sketch-upload" className={`upload-mode${mode !== "sketch" ? " hidden" : ""}`}>
-              <label
-                id="sketch-dropzone"
-                className={`dropzone small s2-dropzone${dragOver === "sketch" ? " dragover" : ""}`}
-                htmlFor="sketch-file"
-                {...makeDropHandlers("sketch")}
-              >
-                <div className="dropzone-icon">
-                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#bbb" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M17 3a2.828 2.828 0 114 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
-                  </svg>
-                </div>
-                <div className="dropzone-title">{t("sidebar.uploadSketch")}</div>
-                <div className="dropzone-hint">{t("sidebar.dropSketchHint")}</div>
-                <div className="dropzone-formats">{t("sidebar.sketchFormats")}</div>
-              </label>
-              <input type="file" id="sketch-file" className="hidden" accept="image/png,image/jpeg,image/webp" onChange={onFileInputChange} />
-            </div>
           </div>
 
           <div className={`upload-preview-wrap${!previewUrl ? " hidden" : ""}`}>
@@ -366,7 +351,6 @@ export default function Sidebar({
             </button>
           </div>
           <p className={`studio-note${!analysisNote ? " hidden" : ""}`}>{analysisNote}</p>
-          <p className={`upload-error${!gateMessage ? " hidden" : ""}`}>{gateMessage}</p>
           <button
             type="button"
             id="use-as-sketch"
@@ -559,7 +543,51 @@ export default function Sidebar({
         </div>
 
         <div className="studio-step">
-          <div className="studio-step-title">{t("sidebar.step5")}</div>
+          <p className="studio-note">
+            {t("sidebar.appliesToPrefix")}
+            <strong>{t("sidebar.sketchRealisticBold")}</strong>
+            {t("sidebar.outputSuffix")}
+          </p>
+          <div className="studio-step-head">
+            <span className="studio-step-title">{t("sidebar.step5")}</span>
+            <div className="toggle-group" id="fabric-tabs">
+              <button type="button" className={`toggle-btn${fabricTab === "ai" ? " active" : ""}`} onClick={() => setFabricTab("ai")}>
+                {t("sidebar.aiRecommendation")}
+              </button>
+              <button type="button" className={`toggle-btn${fabricTab === "options" ? " active" : ""}`} onClick={() => setFabricTab("options")}>
+                {t("sidebar.options")}
+              </button>
+            </div>
+          </div>
+          <div id="fabric-panel-ai" className={`tab-panel${fabricTab !== "ai" ? " hidden" : ""}`}>
+            <p className="studio-note">{t("sidebar.aiFabricNote")}</p>
+          </div>
+          <div id="fabric-panel-options" className={`tab-panel${fabricTab !== "options" ? " hidden" : ""}`}>
+            <div className="fabric-cards" id="fabric-cards">
+              {([
+                ["hanbok-silk", "🎋", t("sidebar.hanbokSilk")],
+                ["ramie",       "🌿", t("sidebar.ramie")],
+                ["hemp",        "🌾", t("sidebar.hemp")],
+                ["gauze",       "✨", t("sidebar.gauze")],
+                ["poplin",      "🧵", t("sidebar.poplin")],
+                ["hanji",       "📜", t("sidebar.hanji")],
+              ] as [string, string, string][]).map(([key, icon, label]) => (
+                <div
+                  className={`season-card${selectedFabric === key ? " active" : ""}`}
+                  data-fabric={key}
+                  key={key}
+                  onClick={() => setSelectedFabric((prev) => (prev === key ? null : key))}
+                >
+                  <div className={`season-icon fabric-icon ${key}`}>{icon}</div>
+                  <span>{label}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div className="studio-step">
+          <div className="studio-step-title">{t("sidebar.step6")}</div>
           <textarea
             id="extra-prompt"
             rows={3}
@@ -578,7 +606,7 @@ export default function Sidebar({
             <option value="both">{t("sidebar.sketchPlusRealistic")}</option>
           </select>
         </div>
-        <button type="button" id="generate-btn" disabled={uploadBlocked || generating} onClick={handleGenerateClick}>
+        <button type="button" id="generate-btn" disabled={generating} onClick={handleGenerateClick}>
           {t("sidebar.generateTechPack")}
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
             <path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M18.4 5.6l-2.8 2.8M8.4 15.6l-2.8 2.8" />
@@ -586,5 +614,13 @@ export default function Sidebar({
         </button>
       </div>
     </div>
+    {drawOpen && (
+      <SketchCanvas
+        initialImageUrl={drawnImageUrl}
+        onSelect={onDrawSelect}
+        onClose={() => setDrawOpen(false)}
+      />
+    )}
+    </>
   )
 }

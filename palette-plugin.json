@@ -2,7 +2,7 @@
   "manifest_version": "1",
   "id": "techpack",
   "name": "Techpack Studio",
-  "version": "1.0.18",
+  "version": "1.0.19",
   "developer": "Your Team",
   "category": "Productivity",
   "tagline": "Photo to sewing-pattern techpack pipeline",

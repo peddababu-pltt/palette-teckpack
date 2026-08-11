@@ -128,6 +128,7 @@ export default function App(_props: PluginComponentProps) {
         variants: sub.outputMode === "sketch" ? 2 : undefined,
         colors: sub.colors,
         season: sub.season,
+        fabric: sub.fabric,
       })
       if ("error" in res) {
         setGenerating(false)

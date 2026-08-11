@@ -383,6 +383,7 @@ export interface GenerateParams {
   variants?: number
   colors?: string[]
   season?: string
+  fabric?: string
 }
 
 export async function generateJob(
@@ -402,6 +403,7 @@ export async function generateJob(
   } else {
     if (params.colors) params.colors.forEach((c) => fd.append("colors", c))
     if (params.season) fd.append("season", params.season)
+    if (params.fabric) fd.append("fabric", params.fabric)
   }
   try {
     const res = await fetchWithRefresh(withPreviewQuery(`${base(pluginId)}/jobs/generate`), {
