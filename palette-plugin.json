@@ -2,7 +2,7 @@
   "manifest_version": "1",
   "id": "techpack",
   "name": "Techpack Studio",
-  "version": "1.0.21",
+  "version": "1.0.25",
   "developer": "Your Team",
   "category": "Productivity",
   "tagline": "Photo to sewing-pattern techpack pipeline",
@@ -44,6 +44,7 @@
     "resources:write"
   ],
   "public_routes": [
-    "/health"
+    "/health",
+    "/assets/pdf.worker.min.mjs"
   ]
 }
