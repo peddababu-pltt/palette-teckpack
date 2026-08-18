@@ -4,16 +4,12 @@
 // jumps the left column to that page.
 //
 // Renders with pdfjs-dist instead of the vendored pdf.js the standalone app
-// used — this bundler has no loader for binary/worker assets and no
-// static-file-serving mechanism for the sandboxed frontend, so the worker is
-// pointed at a CDN build matching the installed npm version instead.
+// used — worker is served from the plugin backend to avoid CDN CSP blocks.
 import { useEffect, useRef, useState, type ReactNode } from "react"
 import * as pdfjsLib from "pdfjs-dist"
 import { usePluginTranslations } from "@palettelab/sdk"
 import { STRINGS } from "../strings"
 import { fetchBinary } from "../api"
-
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`
 
 type PageEntry = { canvas: HTMLCanvasElement; wrap: HTMLDivElement; fit: number }
 
@@ -108,6 +104,10 @@ export default function PdfViewer({ url, downloads }: { url: string; downloads: 
     }
 
     async function load() {
+      // Derive worker URL from the pdf URL so it works in local dev, staging,
+      // and preview environments without needing a separate pluginId prop.
+      // url = "http://host/<prefix>/jobs/<id>/file/pattern-pages.pdf"
+      pdfjsLib.GlobalWorkerOptions.workerSrc = url.replace(/\/jobs\/.*$/, "/assets/pdf.worker.min.mjs")
       const data = await fetchBinary(url)
       if (destroyed) return
       doc = await pdfjsLib.getDocument({ data: new Uint8Array(data) }).promise

@@ -77,16 +77,22 @@ export default function Sidebar({
     }
   }, [analysis])
 
-  // A closed overlay accepts a clipboard paste.
+  // Clipboard paste: routes to main sketch when no sketch yet, or to reference
+  // images (up to 5) when the sketch is already set.
   useEffect(() => {
     function onPaste(e: ClipboardEvent) {
       if (overlayOpen) return
       const file = e.clipboardData?.files?.[0]
-      if (file && file.type.startsWith("image/")) void handleUpload(file)
+      if (!file || !file.type.startsWith("image/")) return
+      if (stagedFile && referenceFiles.length < 5) {
+        setReferenceFiles((prev) => (prev.length < 5 ? [...prev, file] : prev))
+      } else {
+        void handleUpload(file)
+      }
     }
     document.addEventListener("paste", onPaste)
     return () => document.removeEventListener("paste", onPaste)
-  }, [overlayOpen])
+  }, [overlayOpen, stagedFile, referenceFiles])
 
   const analysisNote = useMemo(() => {
     if (analysisLoading) return t("sidebar.analyzing")
@@ -338,6 +344,7 @@ export default function Sidebar({
                 </div>
                 <div className="dropzone-title">{t("sidebar.uploadGarmentImage")}</div>
                 <div className="dropzone-hint">{t("sidebar.dropImageHint")}</div>
+                <div className="dropzone-shortcut">{t("sidebar.pasteShortcut")}</div>
                 <div className="dropzone-formats">{t("sidebar.imageFormats")}</div>
               </label>
               <input type="file" id="image-file" className="hidden" accept="image/jpeg,image/png,image/webp" onChange={onFileInputChange} />
@@ -387,6 +394,7 @@ export default function Sidebar({
               <line x1="5" y1="12" x2="19" y2="12" />
             </svg>
             <span>{t("sidebar.clickToUpload")}</span>
+            <div className="dropzone-shortcut">{t("sidebar.pasteShortcut")}</div>
           </label>
           <input type="file" id="ref-file-input" accept="image/*" multiple className="hidden" onChange={onRefFilesChange} />
         </div>

@@ -53,6 +53,15 @@ Then identify every garment view (front/back/side) and every construction part
 in each view: body panels, sleeves, collar, yoke, zipper/placket, pockets,
 waistband, cuffs, hem/rib bands, fly, hood, belt loops, etc.
 
+DASHED LINES ARE STITCHING — NOT BOUNDARIES. Before tracing any polygon or box,
+identify whether each line is solid or dashed:
+- Solid continuous line → garment boundary or seam edge → use as polygon boundary
+- Dashed / dotted line → topstitching or seam allowance indicator → IGNORE completely
+  when drawing polygon coordinates; never use a dashed line as a part boundary edge.
+A dashed line running along a waistband, hem, or pocket edge is stitching decoration,
+not the structural outline. Trace the solid outline only; the dashed line inside or
+parallel to it is invisible to this stage.
+
 For each part give a tight polygon (or box) in ACTUAL pixel coordinates.
 - Sleeves: polygon following the armhole seam so the sleeve is separated from the body.
 - Small applied parts (pockets, zip, cuffs): a bounding box with ~15px margin is fine.
@@ -104,6 +113,20 @@ put every patterned area inside whichever piece it decorates. A quilted front is
 still one left panel and one right panel, not forty diamonds.
 The pieces you are looking for are the ones a cutter cuts: body panels, yoke,
 sleeves, cuffs, collar, waistband/hem band, placket, zip, buttons, pockets.
+
+HEM BAND — only emit a hem part when there is a DISTINCT SEPARATE FABRIC BAND at
+the very bottom of the garment, clearly bounded by its OWN solid outline lines on
+all four sides. Horizontal quilting seams, topstitching lines, or panel seams
+running across the lower body are NOT a hem band — they are construction details
+inside the body panel. If the garment simply ends with a curved hem edge and no
+separate band, there is no hem part. Do not emit a hem or hem_band part unless a
+physically separate banded piece is unambiguously drawn.
+
+BADGE / PATCH / LABEL — only emit a badge, patch, or label part when a small
+rectangle or square is clearly drawn as a distinct applied object with its own
+complete closed outline, sitting ON TOP of the garment surface. A quilting seam
+intersection, a panel corner, a button, or any line crossing is NOT a badge.
+If you are not certain a separate applied patch is drawn, do not emit it.
 
 Respond with ONLY valid JSON, no markdown fences, in this exact schema:
 {{

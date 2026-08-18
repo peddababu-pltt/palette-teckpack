@@ -336,6 +336,12 @@ async def health() -> Response:
     return Response(content=json.dumps({"ok": True}), media_type="application/json")
 
 
+@router.get("/assets/pdf.worker.min.mjs")
+async def pdfjs_worker() -> Response:
+    worker_path = Path(__file__).parent.parent.parent / "node_modules" / "pdfjs-dist" / "build" / "pdf.worker.min.mjs"
+    return FileResponse(str(worker_path), media_type="application/javascript")
+
+
 @router.post("/run", dependencies=[require_permission("resources:write")])
 async def run(photo: UploadFile = File(...), ctx: PluginContext = Depends(get_plugin_context)) -> Response:
     if not photo.filename:

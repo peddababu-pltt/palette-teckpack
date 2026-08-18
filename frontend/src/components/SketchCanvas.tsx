@@ -170,7 +170,7 @@ export default function SketchCanvas({
     lastPointRef.current = point
     ctx.lineCap = "round"
     ctx.lineJoin = "round"
-    ctx.lineWidth = strokeWidth
+    ctx.lineWidth = tool === "eraser" ? strokeWidth * 6 : strokeWidth
     ctx.globalAlpha = opacity / 100
     ctx.strokeStyle = tool === "eraser" ? "#FFFFFF" : color
     ctx.beginPath()
@@ -262,6 +262,13 @@ export default function SketchCanvas({
             width={CANVAS_WIDTH}
             height={CANVAS_HEIGHT}
             className={`sketch-canvas${tool === "pan" ? " pan" : ""}`}
+            style={
+              tool === "eraser"
+                ? { cursor: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='36' height='36' viewBox='0 0 36 36'%3E%3Ccircle cx='18' cy='18' r='15' fill='none' stroke='%23555' stroke-width='1.5'/%3E%3C/svg%3E") 18 18, cell` }
+                : tool === "pen"
+                ? { cursor: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 24 24'%3E%3Cpath d='M17 3a2.828 2.828 0 114 4L7.5 20.5 2 22l1.5-5.5L17 3z' fill='none' stroke='%23333' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") 2 18, crosshair` }
+                : undefined
+            }
             onPointerDown={onPointerDown}
             onPointerMove={onPointerMove}
             onPointerUp={onPointerUp}
@@ -299,7 +306,7 @@ export default function SketchCanvas({
           onClick={() => setTool("eraser")}
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M20 20H9L4 15a1.5 1.5 0 010-2l8-8a2 2 0 013 0l6 6a2 2 0 010 3l-5 5" />
+            <circle cx="12" cy="12" r="8" />
           </svg>
         </button>
         <button
