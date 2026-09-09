@@ -167,7 +167,9 @@ _DESIGN_VARIANT_FRAMING = (
 # tracer. Variants are construction changes drawn in plain line work only.
 _VARIANT_RECIPES = [
     "Replace the pockets with two simple angled FLAP pockets — a plain rectangular "
-    "flap with one button on each (if the reference has no pockets, add these). "
+    "flap with one button on each. If the reference has NO pockets, do not add any: "
+    "leave the front pocket-free and make the same kind of plain change to the "
+    "nearest detail it does have instead. "
     "Leave everything else alone.",
     "Replace the front closure with a full-length exposed centre-front ZIPPER (two "
     "parallel rail lines with tick-mark teeth and a pull tab), and remove the chest "
@@ -183,7 +185,8 @@ _VARIANT_RECIPES = [
     "collar; if it is collarless, give it a noticeably different neckline shape. "
     "Leave everything else alone.",
     "Change the hem and cuffs to plain ribbed bands (or, if they are already ribbed, "
-    "to a flat hem with a simple stitched turn-up). Leave everything else alone.",
+    "to a plain flat turned-up hem, drawn with solid lines and no topstitch dashes). "
+    "Leave everything else alone.",
 ]
 
 
@@ -244,6 +247,10 @@ Rules for each idea:
   seam line — never as a filled panel.
 - Base it on garment parts that are ACTUALLY VISIBLE in this photo/sketch — don't
   invent a collar for a garment that has none.
+- POCKETS ONLY IF IT HAS POCKETS. Never propose adding a pocket to a garment that
+  does not already have one. Changing a pocket it HAS (patch -> welt, welt -> flap,
+  moving or removing one) is fine; putting a pocket on a pocket-free garment is not
+  a variation of this garment, it is a different garment.
 - Each of the {count} ideas must change a DIFFERENT element (pockets in one, closure
   in another, sleeve seam in another, hem/cuff in another).
 - The result must stay a REAL, WEARABLE garment. If you change the closure, you
@@ -418,7 +425,11 @@ def build_design_variant_prompt(recipe: str, extra_prompt: str, has_references: 
         f"THE ONE CHANGE TO MAKE: {recipe} "
         "Change ONLY that. If this garment type doesn't have the exact element named "
         "(e.g. no collar, no cuffs, no sleeves), substitute the nearest equivalent "
-        "feature and apply the change there instead — don't skip it, adapt it. The "
+        "feature and apply the change there instead — don't skip it, adapt it. "
+        "ONE EXCEPTION, AND IT IS ABSOLUTE: never ADD a pocket. If the reference "
+        "garment has no pocket, the variant has no pocket — substituting means "
+        "changing some other detail it actually has, not adding pockets to a "
+        "pocket-free front. Changing a pocket the reference HAS is fine. The "
         "changed element must be clearly visible when the two drawings are compared "
         "side by side, but keep it a plain, ordinary, factory-buildable detail — not "
         "an elaborate or experimental one. Every other construction detail, and the "

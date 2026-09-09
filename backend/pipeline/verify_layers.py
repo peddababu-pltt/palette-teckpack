@@ -111,10 +111,23 @@ Check each tile in IMAGE 2 against IMAGE 1:
 - POCKET regions (small closed welt/flap shape with a button/snap)
   must never be filed under "sleeve" — they belong on the body panel
   they sit on top of.
+- SHAWL / LAPEL COLLAR SWALLOWED BY A BODY PANEL: size is not a test
+  for a collar. A shawl, lapel or notch collar is a LARGE draped shape
+  that frames the neck opening and sweeps down both sides of the chest
+  to the V where the two sides meet — on a puffer it can be the single
+  biggest region in the front view. Look at each body_panel tile: if it
+  shows that whole collar shape sitting on top of the panel, the
+  collar's region was filed under the panel and must move to the collar
+  part. Measured on a shawl-collar puffer, the collar region was 133k px
+  against the panel's 44k, and it was named front_left_body_panel purely
+  because it looked too big to be a collar. Conversely a collar tile
+  that shows only a thin inner neckband, while the big draped shape
+  lives on a panel tile, is the same defect seen from the other side.
 - COLLAR vs YOKE vs PLACKET, specifically: these sit close together
   near the neckline/center-front and are the most commonly wrongly
-  merged parts. Collar = curved band hugging the neck. Yoke = roughly
-  horizontal shoulder-width panel BELOW the collar's attachment seam.
+  merged parts. Collar = the band or draped shape at the neckline (see
+  the shawl/lapel note above — it is not always a narrow band). Yoke =
+  roughly horizontal shoulder-width panel BELOW the collar's seam.
   Placket = narrow vertical button strip down the center front,
   starting below the collar. If a "collar" tile shows a horizontal
   shoulder-width panel, that's yoke content misfiled into collar. If a
@@ -323,6 +336,32 @@ def main(work_png, labels_npy, groups_json, svg_path):
         gb = p.get("grab_box")
         if isinstance(gb, dict):
             p["grab_box"] = [gb["x0"], gb["y0"], gb["x1"], gb["y1"]]
+    # A verify round may only lengthen a strip, never fatten it. The prompt
+    # above asks for exactly one grab_box edit -- widen y0/y1 (x0/x1 for a
+    # horizontal strip) when the box stops short of the zip's real run -- but
+    # the model routinely rewrites the short axis too, and nothing downstream
+    # pulls it back: the box is read from this file on the next trace and
+    # written out again by the next round, so one bad edit compounds. Measured
+    # across reruns of one bomber the front zip went [700,103,740,1307] ->
+    # [694,97,746,1313] -> [700,97,841,1313], the last of them 141px wide
+    # against a 40px zip. A grab_box is EXCLUSIVE, so those extra 100px took
+    # the right body panel's own center-front edge into the zip's layer and
+    # left the panel traced open down its whole zip side. Keep the model's
+    # long-axis edit, keep the previous short axis.
+    for nm, p in ans["parts"].items():
+        gb, old_gb = p.get("grab_box"), cfg["parts"].get(nm, {}).get("grab_box")
+        if not (gb and old_gb) or len(gb) != 4 or len(old_gb) != 4:
+            continue
+        if p.get("grab_poly") or cfg["parts"][nm].get("grab_poly"):
+            continue          # a polygon's bounds are derived, not authored
+        x0, y0, x1, y1 = (int(round(v)) for v in gb)
+        ox0, oy0, ox1, oy1 = (int(round(v)) for v in old_gb)
+        vertical = (oy1 - oy0) >= (ox1 - ox0)
+        fixed = [ox0, y0, ox1, y1] if vertical else [x0, oy0, x1, oy1]
+        if fixed != [x0, y0, x1, y1]:
+            print(f"  {nm}: grab_box {gb} widens the strip itself -- keeping "
+                  f"the run, restoring its width: {fixed}")
+            p["grab_box"] = fixed
     ans["parts"] = deterministic_repairs(ans["parts"], all_ids, info, segdir)
     ans.setdefault("z_order", cfg.get("z_order", []))
 

@@ -32,6 +32,22 @@ export default function Sidebar({
   onGenerate: (sub: GenerateSubmission) => void
 }) {
   const { t } = usePluginTranslations(STRINGS)
+  // Persisted so the rail doesn't snap back open on every reload -- collapsing
+  // it is a workspace preference, not per-session state.
+  const [collapsed, setCollapsed] = useState(() => {
+    try {
+      return window.localStorage.getItem("tp.rail.collapsed") === "1"
+    } catch {
+      return false
+    }
+  })
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("tp.rail.collapsed", collapsed ? "1" : "0")
+    } catch {
+      /* private mode -- the preference just doesn't persist */
+    }
+  }, [collapsed])
   const [stagedFile, setStagedFile] = useState<File | null>(null)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [analysis, setAnalysis] = useState<AnalyzeResponse | null>(null)
@@ -299,7 +315,40 @@ export default function Sidebar({
 
   return (
     <>
-    <div className="studio-sidebar">
+    <div className={`studio-sidebar${collapsed ? " is-collapsed" : ""}`}>
+      <div className="rail-head">
+        <div className="app-brand rail-brand">
+          <svg
+            className="app-brand-mark"
+            width="26"
+            height="26"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M12 2.5 2.5 7 12 11.5 21.5 7 12 2.5z" />
+            <path d="M2.5 12 12 16.5 21.5 12" />
+            <path d="M2.5 17 12 21.5 21.5 17" />
+          </svg>
+          <span className="rail-brand-name">{t("app.brand")}</span>
+        </div>
+        <button
+          type="button"
+          className="rail-collapse"
+          title={collapsed ? t("sidebar.expand") : t("sidebar.collapse")}
+          aria-label={collapsed ? t("sidebar.expand") : t("sidebar.collapse")}
+          aria-expanded={!collapsed}
+          onClick={() => setCollapsed((v) => !v)}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M11 6 5 12l6 6M18 6l-6 6 6 6" />
+          </svg>
+        </button>
+      </div>
       <div className="studio-sidebar-scroll">
         <div className="studio-step">
           <div className="studio-step-head">
@@ -336,7 +385,7 @@ export default function Sidebar({
                 {...makeDropHandlers()}
               >
                 <div className="dropzone-icon">
-                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#bbb" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                     <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
                     <circle cx="8.5" cy="8.5" r="1.5" />
                     <polyline points="21 15 16 10 5 21" />

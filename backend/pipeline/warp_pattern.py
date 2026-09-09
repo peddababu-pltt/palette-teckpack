@@ -27,6 +27,28 @@ UPSCALE_URL = os.getenv("LLM_ROUTER_UPSCALE_URL", "https://router-api.pltt.ai/im
 
 FLAT_SKETCH_PROMPT = (
     "Redraw THIS EXACT garment as a fashion flat technical sketch. "
+
+    # Stated first: as a clause further down it lost every time to "match the
+    # photo feature for feature", and stage 1 kept emitting a dashed outline
+    # offset just outside each welt pocket for regen to inherit.
+    "RULE ZERO — NO TOPSTITCH LINE OF ANY KIND ON POCKETS, HEM, NECKLINE OR YOKE LINE. Each of these "
+    "four parts is drawn with EXACTLY ONE single solid line and NOTHING beside it. Do not draw, in "
+    "either of its two forms: (a) a DASHED line tracing the part a short distance from its edge; "
+    "(b) a SECOND SOLID line — a thin outline hugging the main edge, a doubled or double-struck "
+    "outline, a narrow parallel band, an offset contour — alongside the part's real edge. Both are "
+    "topstitch representations and both are FORBIDDEN here. A pocket edge is ONE line, not two lines "
+    "close together. A hem is ONE line. A neckline is ONE line. A yoke seam is ONE line. Draw it that "
+    "way even when the photo clearly shows topstitching there. This overrides the feature-for-feature "
+    "matching rule below for these four parts only; topstitch dashes elsewhere on the garment "
+    "(princess seam, fly, quilting/baffle lines across a panel) are unaffected. "
+    "THE BOTTOM EDGE, SPECIFICALLY. Unless the garment truly has a rib-knit band there — a real band "
+    "carrying visible vertical rib ticks, like the cuffs do — the body simply ENDS at its bottom "
+    "edge, drawn as ONE line. Do NOT draw a second line running parallel a short distance above that "
+    "edge. A narrow featureless strip along the bottom, formed by the bottom edge plus a line just "
+    "above it, is the exact defect to avoid: downstream it is read as a hem band this garment does "
+    "not have, and a phantom hem piece gets cut from it. An elasticated, drawcord or plain bottom "
+    "edge is ONE line and nothing more. "
+
     "Do NOT change the design: keep the exact same silhouette, neckline, collar, "
     "sleeve length, pockets, buttons, zips, and proportions as the input image. "
     "MATCH THE PHOTO FEATURE FOR FEATURE. Draw every feature the photo shows and NOT ONE MORE. Count "
@@ -154,6 +176,18 @@ FLAT_SKETCH_PROMPT = (
     "like every other panel on the garment. Color and material differences are not drawn at all in this "
     "flat sketch; only construction lines are. A solid black waistband, collar facing, belt loop, or "
     "pull tab copied from a dark-colored photo is exactly the defect to avoid. "
+    "NO STITCH DASHES ON THESE PARTS. Pockets, hem, neckline and yoke line are drawn with SOLID "
+    "outlines only — never with dashed topstitch marks, and never with a dashed line running "
+    "parallel to them, even if the input photo clearly shows topstitching there. Specifically: "
+    "  pockets — all edges, flap, opening, sides, bottom; "
+    "  hem — EVERY hem, with no exception: body hem, sleeve hem, a rib knit hem band (solid edges "
+    "on both sides of the band), a plain turned-up hem, and any hem on a lower-body garment "
+    "(pants, shorts, skirt); "
+    "  neckline — the neck opening edge, neckline seam, neckband/binding edges, and any neck "
+    "facing line, on both front and back views; "
+    "  yoke line — the front yoke seam and the back yoke seam, across their full width. "
+    "Draw each of these as a single clean solid line. Topstitch dashes elsewhere on the garment "
+    "(e.g. along a princess seam or a fly) are still allowed and unaffected by this rule. "
     "To be unambiguous: outline, seams, darts, pleat/fold/gather lines, topstitch dashes, buttons, "
     "snaps, zip rails and pull, badges, patches, and labels — every single mark anywhere in this "
     "drawing, front and back, with no exception besides the zip teeth rule above — is drawn in the "

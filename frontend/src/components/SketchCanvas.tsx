@@ -2,7 +2,27 @@ import { useEffect, useRef, useState } from "react"
 import { usePluginTranslations } from "@palettelab/sdk"
 import { STRINGS } from "../strings"
 
-type Tool = "pen" | "eraser" | "pan" | "select"
+type Tool = "pencil" | "marker" | "brush" | "eraser" | "pan" | "select"
+
+// Each drawing tool is the same stroke engine with a different character:
+// how wide it runs for a given stroke size, how opaque it lays down, and
+// whether overlaps darken. A pencil is what it always was -- the slider width,
+// exactly the opacity asked for, crisp. A marker is broad, flat-ended and
+// translucent, and multiplies so a second pass over the same spot reads
+// darker, the way ink pooling does. A brush is round and pressure-ish: it
+// thins out as the stroke speeds up (see BRUSH_SPEED_PX).
+const TOOL_WIDTH: Record<string, number> = { pencil: 1, marker: 3, brush: 2, eraser: 6 }
+const MARKER_ALPHA = 0.5      // ...of whatever the opacity slider says
+const BRUSH_MIN_SCALE = 0.45  // a fast brush stroke narrows to this much
+const BRUSH_SPEED_PX = 40     // px per event that counts as "fast"
+// How far the drawn point chases the pointer, per event. A mouse or a finger
+// arrives as a jittery polyline and drawing it literally is what made the
+// pencil feel hard and scratchy -- every hand tremor became a visible corner.
+// Pulling the drawn point only part of the way toward each raw one low-passes
+// that out, so a slow curve comes out as a curve. 1 = follow exactly (which is
+// what the eraser wants: a rubber that lags behind the ring you are aiming
+// with is worse than a slightly rough edge).
+const SMOOTHING = 0.55
 
 const MAX_HISTORY = 30
 const CANVAS_WIDTH = 900
@@ -46,7 +66,7 @@ export default function SketchCanvas({
 }) {
   const { t } = usePluginTranslations(STRINGS)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
-  const [tool, setTool] = useState<Tool>("pen")
+  const [tool, setTool] = useState<Tool>("pencil")
   const [color, setColor] = useState("#111111")
   const [strokeWidth, setStrokeWidth] = useState(3)
   const [opacity, setOpacity] = useState(100)
@@ -57,6 +77,10 @@ export default function SketchCanvas({
   const [redoStack, setRedoStack] = useState<string[]>([])
   const drawingRef = useRef(false)
   const lastPointRef = useRef<{ x: number; y: number } | null>(null)
+  // Midpoint of the previous segment: each new segment is drawn as a quadratic
+  // through it with the raw point as the control, so a dragged stroke comes out
+  // as a curve instead of the chain of straight chords a plain lineTo gives.
+  const lastMidRef = useRef<{ x: number; y: number } | null>(null)
   const [marquee, setMarquee] = useState<{ x: number; y: number; w: number; h: number } | null>(null)
   const marqueeStartRef = useRef<{ x: number; y: number } | null>(null)
 
@@ -144,14 +168,39 @@ export default function SketchCanvas({
     ctx.fillRect(0, 0, canvas.width, canvas.height)
   }
 
-  function pointFromEvent(e: React.PointerEvent<HTMLCanvasElement>) {
+  function pointFromCoords(clientX: number, clientY: number) {
     const canvas = canvasRef.current
     if (!canvas) return { x: 0, y: 0 }
     const rect = canvas.getBoundingClientRect()
     return {
-      x: ((e.clientX - rect.left) / rect.width) * canvas.width,
-      y: ((e.clientY - rect.top) / rect.height) * canvas.height,
+      x: ((clientX - rect.left) / rect.width) * canvas.width,
+      y: ((clientY - rect.top) / rect.height) * canvas.height,
     }
+  }
+
+  function pointFromEvent(e: React.PointerEvent<HTMLCanvasElement>) {
+    return pointFromCoords(e.clientX, e.clientY)
+  }
+
+  const baseWidth = strokeWidth * (TOOL_WIDTH[tool] ?? 1)
+
+  // Everything about the tool except the per-segment width, which the brush
+  // varies as it goes.
+  function configure(ctx: CanvasRenderingContext2D) {
+    ctx.lineJoin = "round"
+    ctx.lineCap = tool === "marker" ? "square" : "round"
+    // The eraser is ALWAYS opaque. It used to take the opacity slider like a
+    // pen does, so at 40% it laid 40%-white over the drawing and one pass left
+    // most of the stroke behind -- erasing "worked" only by clicking the same
+    // spot over and over. An eraser has no opacity; it either takes the pixel
+    // or it does not.
+    ctx.globalAlpha =
+      tool === "eraser" ? 1 : (opacity / 100) * (tool === "marker" ? MARKER_ALPHA : 1)
+    // multiply lets marker strokes pool where they cross, which is the whole
+    // look of one. Every other tool paints over.
+    ctx.globalCompositeOperation = tool === "marker" ? "multiply" : "source-over"
+    ctx.strokeStyle = tool === "eraser" ? "#FFFFFF" : color
+    ctx.lineWidth = baseWidth
   }
 
   function onPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
@@ -165,18 +214,45 @@ export default function SketchCanvas({
       setMarquee({ x: point.x, y: point.y, w: 0, h: 0 })
       return
     }
+    // Capture the pointer for the whole stroke. Without it the drag belongs to
+    // the canvas only while the cursor is over it, so running off the edge --
+    // or just moving faster than the hit-testing keeps up with -- dropped the
+    // rest of the stroke, and the eraser appeared to need short repeated
+    // clicks to do anything.
+    canvas.setPointerCapture?.(e.pointerId)
     pushUndo()
     drawingRef.current = true
     lastPointRef.current = point
-    ctx.lineCap = "round"
-    ctx.lineJoin = "round"
-    ctx.lineWidth = tool === "eraser" ? strokeWidth * 6 : strokeWidth
-    ctx.globalAlpha = opacity / 100
-    ctx.strokeStyle = tool === "eraser" ? "#FFFFFF" : color
+    lastMidRef.current = point
+    configure(ctx)
+    // A tap with no drag still marks the paper: a dot of the tool's own width.
     ctx.beginPath()
-    ctx.moveTo(point.x, point.y)
-    ctx.lineTo(point.x, point.y)
+    ctx.arc(point.x, point.y, Math.max(0.5, baseWidth / 2), 0, Math.PI * 2)
+    ctx.fillStyle = tool === "eraser" ? "#FFFFFF" : color
+    ctx.fill()
+  }
+
+  function paintTo(ctx: CanvasRenderingContext2D, raw: { x: number; y: number }) {
+    const last = lastPointRef.current
+    const lastMid = lastMidRef.current
+    if (!last || !lastMid) return
+    const chase = tool === "eraser" ? 1 : SMOOTHING
+    const point = {
+      x: last.x + (raw.x - last.x) * chase,
+      y: last.y + (raw.y - last.y) * chase,
+    }
+    const mid = { x: (last.x + point.x) / 2, y: (last.y + point.y) / 2 }
+    if (tool === "brush") {
+      const dist = Math.hypot(point.x - last.x, point.y - last.y)
+      const scale = Math.max(BRUSH_MIN_SCALE, 1 - dist / BRUSH_SPEED_PX)
+      ctx.lineWidth = baseWidth * scale
+    }
+    ctx.beginPath()
+    ctx.moveTo(lastMid.x, lastMid.y)
+    ctx.quadraticCurveTo(last.x, last.y, mid.x, mid.y)
     ctx.stroke()
+    lastPointRef.current = point
+    lastMidRef.current = mid
   }
 
   function onPointerMove(e: React.PointerEvent<HTMLCanvasElement>) {
@@ -194,15 +270,35 @@ export default function SketchCanvas({
     if (!drawingRef.current || tool === "pan") return
     const canvas = canvasRef.current
     const ctx = canvas?.getContext("2d")
-    if (!canvas || !ctx || !lastPointRef.current) return
-    ctx.beginPath()
-    ctx.moveTo(lastPointRef.current.x, lastPointRef.current.y)
-    ctx.lineTo(point.x, point.y)
-    ctx.stroke()
-    lastPointRef.current = point
+    if (!canvas || !ctx) return
+    configure(ctx)
+    // The browser batches pointer moves to one per frame and hands the ones it
+    // skipped over here. Painting only the last of them is what made a quick
+    // sweep come out as long straight chords -- and, with the eraser, as a
+    // scatter of gaps between them.
+    const coalesced = e.nativeEvent.getCoalescedEvents?.() ?? []
+    if (coalesced.length > 1) {
+      for (const ev of coalesced) paintTo(ctx, pointFromCoords(ev.clientX, ev.clientY))
+      return
+    }
+    paintTo(ctx, point)
   }
 
-  function onPointerUp() {
+  function onPointerUp(e?: React.PointerEvent<HTMLCanvasElement>) {
+    // Smoothing lags the drawn point behind the pointer, so a stroke would end
+    // a few px short of where you lifted. Close the gap before finishing.
+    if (drawingRef.current && e && tool !== "eraser") {
+      const ctx = canvasRef.current?.getContext("2d")
+      const last = lastPointRef.current
+      const end = pointFromEvent(e)
+      if (ctx && last && lastMidRef.current && Math.hypot(end.x - last.x, end.y - last.y) > 0.5) {
+        configure(ctx)
+        ctx.beginPath()
+        ctx.moveTo(lastMidRef.current.x, lastMidRef.current.y)
+        ctx.quadraticCurveTo(last.x, last.y, end.x, end.y)
+        ctx.stroke()
+      }
+    }
     if (tool === "select" && marquee) {
       const canvas = canvasRef.current
       const ctx = canvas?.getContext("2d")
@@ -216,8 +312,20 @@ export default function SketchCanvas({
       setMarquee(null)
       return
     }
+    const canvas = canvasRef.current
+    if (canvas && e && canvas.hasPointerCapture?.(e.pointerId)) {
+      canvas.releasePointerCapture(e.pointerId)
+    }
+    // Leave the context the way the next stroke expects to find it -- the
+    // marker's multiply and its half alpha are per-tool, not global state.
+    const ctx = canvas?.getContext("2d")
+    if (ctx) {
+      ctx.globalCompositeOperation = "source-over"
+      ctx.globalAlpha = 1
+    }
     drawingRef.current = false
     lastPointRef.current = null
+    lastMidRef.current = null
   }
 
   function handleSelectSketch() {
@@ -234,6 +342,20 @@ export default function SketchCanvas({
   const rect = canvasEl?.getBoundingClientRect()
   const scaleX = rect ? rect.width / CANVAS_WIDTH : 1
   const scaleY = rect ? rect.height / CANVAS_HEIGHT : 1
+
+  // The ring under the pointer is the eraser's actual footprint, in SCREEN px
+  // (the canvas is 900px wide but drawn smaller, so its own units are not what
+  // the cursor is measured in). It used to be a fixed 30px circle whatever the
+  // stroke size said, so what you rubbed out never matched what you aimed at.
+  // Capped at 128 because past that a cursor image is silently ignored and you
+  // get no ring at all.
+  const eraserPx = Math.min(128, Math.max(6, strokeWidth * TOOL_WIDTH.eraser * scaleX))
+  const eraserBox = Math.ceil(eraserPx) + 4
+  const eraserCursor =
+    `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='${eraserBox}' height='${eraserBox}'` +
+    ` viewBox='0 0 ${eraserBox} ${eraserBox}'%3E%3Ccircle cx='${eraserBox / 2}' cy='${eraserBox / 2}'` +
+    ` r='${eraserPx / 2}' fill='none' stroke='%23555' stroke-width='1.5'/%3E%3C/svg%3E")` +
+    ` ${Math.round(eraserBox / 2)} ${Math.round(eraserBox / 2)}, cell`
 
   return (
     <div className="sketch-canvas-overlay">
@@ -264,15 +386,15 @@ export default function SketchCanvas({
             className={`sketch-canvas${tool === "pan" ? " pan" : ""}`}
             style={
               tool === "eraser"
-                ? { cursor: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='36' height='36' viewBox='0 0 36 36'%3E%3Ccircle cx='18' cy='18' r='15' fill='none' stroke='%23555' stroke-width='1.5'/%3E%3C/svg%3E") 18 18, cell` }
-                : tool === "pen"
+                ? { cursor: eraserCursor }
+                : tool === "pencil"
                 ? { cursor: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 24 24'%3E%3Cpath d='M17 3a2.828 2.828 0 114 4L7.5 20.5 2 22l1.5-5.5L17 3z' fill='none' stroke='%23333' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") 2 18, crosshair` }
                 : undefined
             }
             onPointerDown={onPointerDown}
             onPointerMove={onPointerMove}
             onPointerUp={onPointerUp}
-            onPointerLeave={onPointerUp}
+            onPointerCancel={onPointerUp}
           />
           {marquee && (
             <div
@@ -291,12 +413,34 @@ export default function SketchCanvas({
       <div className="sketch-canvas-toolbar">
         <button
           type="button"
-          className={`sc-tool-btn${tool === "pen" ? " active" : ""}`}
-          title={t("sketchCanvas.pen")}
-          onClick={() => setTool("pen")}
+          className={`sc-tool-btn${tool === "pencil" ? " active" : ""}`}
+          title={t("sketchCanvas.pencil")}
+          onClick={() => setTool("pencil")}
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <path d="M17 3a2.828 2.828 0 114 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          className={`sc-tool-btn${tool === "marker" ? " active" : ""}`}
+          title={t("sketchCanvas.marker")}
+          onClick={() => setTool("marker")}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M15 3l6 6-9.5 9.5H6l-1.5-4.5L15 3z" />
+            <path d="M4 21h9" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          className={`sc-tool-btn${tool === "brush" ? " active" : ""}`}
+          title={t("sketchCanvas.brush")}
+          onClick={() => setTool("brush")}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M9.5 14.5 20 4a2 2 0 00-3-3L6.5 11.5" />
+            <path d="M6.5 11.5a3.5 3.5 0 013 3.5c0 2-1.5 3-3.5 3H3c1.5-1 1.5-2 1.5-3.5a3 3 0 012-3z" />
           </svg>
         </button>
         <button
@@ -371,7 +515,10 @@ export default function SketchCanvas({
           <div className="sc-popover sc-size-popover">
             <div className="sc-popover-row">
               <span>{t("sketchCanvas.strokeWidth")}</span>
-              <span>{strokeWidth}px</span>
+              {/* What the slider means depends on the tool -- a marker runs 3x
+                  the pencil and the eraser 6x -- so show the width that will
+                  actually be laid down, not the slider's own number. */}
+              <span>{Math.round(baseWidth)}px</span>
             </div>
             <input
               type="range"
@@ -380,17 +527,24 @@ export default function SketchCanvas({
               value={strokeWidth}
               onChange={(e) => setStrokeWidth(Number(e.target.value))}
             />
-            <div className="sc-popover-row">
-              <span>{t("sketchCanvas.opacity")}</span>
-              <span>{opacity}%</span>
-            </div>
-            <input
-              type="range"
-              min={1}
-              max={100}
-              value={opacity}
-              onChange={(e) => setOpacity(Number(e.target.value))}
-            />
+            {/* No opacity row for the eraser: it is always fully opaque (see
+                configure), so a slider here would be a control that does
+                nothing -- which is exactly what made erasing look broken. */}
+            {tool !== "eraser" && (
+              <>
+                <div className="sc-popover-row">
+                  <span>{t("sketchCanvas.opacity")}</span>
+                  <span>{opacity}%</span>
+                </div>
+                <input
+                  type="range"
+                  min={1}
+                  max={100}
+                  value={opacity}
+                  onChange={(e) => setOpacity(Number(e.target.value))}
+                />
+              </>
+            )}
           </div>
         )}
         <button

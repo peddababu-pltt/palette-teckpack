@@ -94,20 +94,36 @@ Group ALL region ids into named garment parts. Rules:
   the sections above the cuff seam. Do this for EVERY sleeve, front and
   back: if one sleeve's cuff is split out and its pair's is not, the two
   sleeves come out different lengths.
-- A HEM ALLOWANCE IS ITS OWN PART, the same way a cuff is its own part and
-  never the sleeve's last band. Along the bottom of a skirt/body/sleeve the
-  sketch usually shows a topstitch line running parallel to, and a little
-  above, the piece's real bottom edge. The thin strip between that stitch
-  line and the edge is the turned-up hem -- split it out into its own part
+- A HEM ALLOWANCE IS ITS OWN PART -- BUT ONLY WHEN THE SKETCH ACTUALLY DRAWS
+  ONE. First decide whether this garment has a hem strip at all.
+  A thin region along the bottom edge is NOT sufficient evidence. A stray
+  topstitch line drawn just above the bottom edge produces exactly such a
+  strip, and naming it cuts a phantom piece from a garment that has none.
+  Apply this test to any candidate bottom strip: does it carry visible
+  vertical RIB TICKS the way a rib cuff does, or any interior marking of its
+  own? If YES, it is a real band -- name it. If NO -- it is featureless, just
+  two lines with blank white between them -- it is a topstitch artifact:
+  DO NOT name a hem part, and fold those regions into the body panel above so
+  the panel runs to the garment's true bottom edge.
+  Likewise if the bottom of the panel is a single plain edge with no second
+  line above it, THIS GARMENT HAS NO HEM PART: do not emit one, do not carve a
+  strip out of the panel to make one, and do not add one for symmetry with
+  another view. Most garments here have no separate hem part, and inventing
+  one is a defect -- it prints a duplicate band across a bottom edge that has
+  none.
+  When a real hem strip IS present, split it out into its own part
   (e.g. "front_left_hem": {{"regions": [21]}}) and leave the panel above
-  holding only the sections above that stitch line, so the panel is cut to
-  the stitch line, not the garment's outer edge.
-  Do this for EVERY panel along that hem, not just some: if the left and
-  right panels split their strip out into "front_left_hem" /
-  "front_right_hem" and the center one keeps its strip fused into
-  "front_center_panel", the center panel runs ~30px longer than its
-  neighbours and the seams between them step. Symmetry is the check: name a
-  hem part for every panel along that same hem line, or none.
+  holding only the sections above that line, so the panel is cut to that
+  line, not the garment's outer edge.
+  Then apply it consistently: if the left and right panels split their strip
+  out into "front_left_hem" / "front_right_hem" and the center one keeps its
+  strip fused into "front_center_panel", the center panel runs ~30px longer
+  than its neighbours and the seams between them step. Symmetry is the check
+  on a hem that exists, never a reason to invent one: name a hem part for
+  every panel along that same hem line, or -- the common case -- none at all.
+  A ribbed hem BAND (visible rib ticks, a real band with two edges) is a
+  different thing and is named as usual; this rule is about the thin
+  turned-up allowance strip.
 - A BELT / STRAP / TIE crossed by loops, keepers or a buckle is still ONE
   piece. Each loop laid over it chops its interior into a separate region,
   so one belt arrives as a ROW of regions sitting side by side along the
@@ -182,6 +198,18 @@ Group ALL region ids into named garment parts. Rules:
   separate parts:
   - COLLAR: the band that wraps the neckline itself (collar stand +
     leaf, or hood trim). Shape: a curved strip hugging the neck.
+    SIZE IS NOT A TEST. A SHAWL, LAPEL OR NOTCH collar is a LARGE draped
+    shape, not a narrow strip: it frames the neck opening and sweeps down
+    both sides of the chest to the V where the two sides meet, and on a
+    puffer it can be the single biggest region in the front view. That
+    whole shape is COLLAR. Do not reject a region as "too big to be a
+    collar" and file it under a body panel -- measured on a shawl-collar
+    puffer, the collar region ran 133k px against the body panel's 44k,
+    and calling it front_left_body_panel put the entire collar inside the
+    panel's extracted piece. What decides is POSITION AND ROLE: a shape
+    that wraps the neck opening and turns back on itself down the chest
+    is the collar at any size. The body panel is what lies OUTBOARD and
+    BELOW it, behind the collar's own attachment edge.
   - YOKE: the panel just below/behind the collar's attachment seam,
     spanning shoulder to shoulder (classic case: back yoke). Shape: a
     roughly horizontal panel at shoulder width. It is BELOW the collar
@@ -807,6 +835,7 @@ def split_oversized_applied(parts: dict, info: dict, segdir: str) -> dict:
     owner = {r: nm for nm, p in parts.items() for r in p.get("regions", [])}
     st = np.ones((3, 3), bool)
 
+    moved_to = {}                 # applied part -> [(region, host it went to)]
     for nm, big in suspects.items():
         for r in big:
             m = lab == r
@@ -857,6 +886,50 @@ def split_oversized_applied(parts: dict, info: dict, segdir: str) -> dict:
             owner[r] = best
             print(f"  oversized region {r} ({info[str(r)]['area']}px) moved "
                   f"{nm} -> {best} (shares {best_len}px of border)")
+            moved_to.setdefault(nm, []).append((r, best))
+
+    # A pocket handed a whole panel usually means the pair was SWAPPED: the
+    # panel went to the pocket and the pocket's own welt went to the panel.
+    # Measured on job feab02973734, both front pockets came back this way --
+    # front_left_pocket [25] was the 146k-px lower body panel, while the 7.3k
+    # welt (33) sat in front_left_body_panel. Moving the panel back is only
+    # half the repair; without the other half the pocket is deleted below as a
+    # ghost and the welt renders inside the panel layer, so the garment has no
+    # pocket piece at all. Take back the patch-shaped region the host is now
+    # holding INSIDE the footprint just released -- that is the welt.
+    for nm, moves in moved_to.items():
+        if parts.get(nm, {}).get("regions"):
+            continue                      # something patch-shaped stayed put
+        for r, host in moves:
+            if str(r) not in info or not parts.get(host, {}).get("regions"):
+                continue
+            rb = info[str(r)]["bbox"]
+            hbs = [info[str(h)]["bbox"] for h in parts[host]["regions"]
+                   if str(h) in info]
+            if not hbs:
+                continue
+            hh = max(b[3] for b in hbs) - min(b[1] for b in hbs)
+            hw = max(b[2] for b in hbs) - min(b[0] for b in hbs)
+            cands = []
+            for c in parts[host]["regions"]:
+                if str(c) not in info or c == r:
+                    continue
+                b = info[str(c)]["bbox"]
+                inside = (b[0] >= rb[0] and b[1] >= rb[1]
+                          and b[2] <= rb[2] and b[3] <= rb[3])
+                w, h = b[2] - b[0], b[3] - b[1]
+                if inside and h <= APPLIED_H_FRAC * hh and w <= APPLIED_W_FRAC * hw:
+                    cands.append((info[str(c)]["area"], c))
+            if not cands:
+                continue
+            _, take = min(cands)
+            parts[host]["regions"] = [x for x in parts[host]["regions"]
+                                      if x != take]
+            parts[nm]["regions"] = [take]
+            owner[take] = nm
+            print(f"  ...and region {take} ({info[str(take)]['area']}px) inside "
+                  f"it moved back {host} -> {nm}: the two were swapped")
+            break
 
     # An applied part stripped of everything is a naming ghost, not a piece.
     for nm in list(parts):
@@ -2158,6 +2231,104 @@ def merge_seam_line_parts(parts: dict, info: dict, segdir: str) -> dict:
             if p.get("regions") or p.get("grab_box")}
 
 
+RIB_TICK_MIN_SHARE = 0.005  # notch-ink this far below a rib band's is blank
+RIB_CLOSE_RADIUS = 6        # tick width to bridge when closing the band
+MERGE_BLANK_HEM = os.environ.get("MERGE_BLANK_HEM", "1") != "0"
+
+
+def merge_blank_hem_bands(parts: dict, info: dict, segdir: str) -> dict:
+    """Fold a BLANK bottom-edge strip back into the panel above it.
+
+    merge_hem_allowance repairs only the asymmetric case, on the reasoning
+    that bbox geometry cannot separate a genuine rib hem band from a stray
+    topstitch line -- both are one wide, thin region. That is true of the
+    footprint, but not of what is drawn INSIDE it: a rib band carries vertical
+    rib ticks, and a topstitch strip is blank white.
+
+    The ticks are short marks biting in from the band's edges, so they notch
+    the white region rather than splitting it. Closing the region with a disk
+    wider than one tick fills those notches, and the ink recovered that way is
+    the rib signal. Measured on the puffer (v3): the blank hem strips scored
+    0.0000-0.0003 while the rib cuffs on the same sketch scored 0.039-0.042,
+    a 100x gap, so the cut sits far from both sides.
+
+    This is the backstop for a defect the generator will not stop producing:
+    stage 1 draws a topstitch line above the body's bottom edge, that seals a
+    strip, and the strip is named a hem -- so a phantom hem piece gets cut
+    from a garment with no hem band. Prompting all three stages against it
+    still left it in 3/3 regen attempts.
+
+    Note this also folds in a genuine turned-up hem ALLOWANCE, which is blank
+    by nature. That is the intent here -- the allowance is not wanted as its
+    own piece. MERGE_BLANK_HEM=0 restores the old behaviour.
+    """
+    if not MERGE_BLANK_HEM:
+        return parts
+    hems = [nm for nm in parts if "hem" in nm and parts[nm].get("regions")
+            and not parts[nm].get("grab_box")]
+    if not hems:
+        return parts
+    lab_path = os.path.join(segdir, "labels.npy")
+    ink_path = os.path.join(segdir, "ink.npy")
+    if not (os.path.isfile(lab_path) and os.path.isfile(ink_path)):
+        return parts
+    lab = np.load(lab_path)
+    ink = np.load(ink_path)
+    if ink.shape != lab.shape:
+        return parts
+
+    r = RIB_CLOSE_RADIUS
+    yy, xx = np.ogrid[-r:r + 1, -r:r + 1]
+    disk = xx * xx + yy * yy <= r * r
+
+    # Score first, decide per VIEW second. Backtested over 13 jobs, the score
+    # can straddle the cut within one hem line -- 23fcf01d read .0143/.0093 on
+    # its left and centre hems but .0037 on the right, and 97f18fad .0111 vs
+    # .0001 -- because a curved strip picks up a few px of the panel line.
+    # Merging only the low sibling would cut that panel short and step the
+    # seams against its neighbours, the very fault merge_hem_allowance exists
+    # to fix. So a view's hems merge only when EVERY one of them reads blank.
+    share = {}
+    for nm in hems:
+        m = np.isin(lab, parts[nm]["regions"])
+        if not m.any():
+            continue
+        notch = ndimage.binary_closing(m, disk) & ~m
+        share[nm] = float((notch & ink).sum()) / float(m.sum())
+
+    blank_views = set()
+    for view in {nm.split("_", 1)[0] for nm in share}:
+        sibs = [s for nm, s in share.items() if nm.split("_", 1)[0] == view]
+        if sibs and max(sibs) < RIB_TICK_MIN_SHARE:
+            blank_views.add(view)
+
+    for nm in hems:
+        if nm not in share or nm.split("_", 1)[0] not in blank_views:
+            continue          # real rib band, or a sibling says it is one
+        m = np.isin(lab, parts[nm]["regions"])
+        border = ndimage.binary_dilation(m, np.ones((3, 3), bool),
+                                         iterations=BORDER_DILATE) & ~m
+        owner = {r2: onm for onm, p in parts.items()
+                 for r2 in p.get("regions", []) if onm != nm}
+        host, best = None, 0
+        for r2 in np.unique(lab[border]):
+            r2 = int(r2)
+            if r2 == 0 or r2 not in owner:
+                continue
+            shared = int((border & (lab == r2)).sum())
+            if shared > best:
+                host, best = owner[r2], shared
+        if not host:
+            continue
+        parts[host]["regions"] = sorted(set(parts[host]["regions"])
+                                        | set(parts[nm]["regions"]))
+        print(f"  {nm} is a blank strip (rib share {share[nm]:.4f}), not a "
+              f"hem band -> merged into {host}")
+        parts[nm]["regions"] = []
+    return {nm: p for nm, p in parts.items()
+            if p.get("regions") or p.get("grab_box")}
+
+
 def deterministic_repairs(parts: dict, all_ids: set, info: dict,
                           segdir: str) -> dict:
     """Every post-naming repair, in the order they have to run.
@@ -2177,6 +2348,14 @@ def deterministic_repairs(parts: dict, all_ids: set, info: dict,
     parts = separate_collar_placket(parts, info)
     parts = reunite_sleeve_columns(parts, info)
     parts = evict_offcolumn_from_sleeve(parts, info, segdir)
+    # Before the per-region release below: a pocket that came back holding a
+    # WHOLE panel is a swap, not a mis-grouping, and strip_panels_from_applied
+    # cannot fix it -- releasing that one region would leave the pocket with
+    # nothing, which it reads (correctly, for its own case) as "this really is
+    # an applied piece" and keeps whole. This pass was written for the swap and
+    # then never called from anywhere; wired in, it is what puts the panel and
+    # the welt back on the right parts.
+    parts = split_oversized_applied(parts, info, segdir)
     parts = strip_panels_from_applied(parts, info, segdir)
     parts = collapse_subpanels(parts, info, segdir)
     # after collapse_subpanels, so the qualified sections are already home and
@@ -2190,6 +2369,9 @@ def deterministic_repairs(parts: dict, all_ids: set, info: dict,
     # what gives the view a waistband for the rib pass to measure against.
     parts = demote_hem_cuffs(parts, info)
     parts = return_hem_rib_to_waistband(parts, info)
+    # last of the hem passes: the ones above decide what a hem part IS, this
+    # one decides whether the strip is a band at all or just a topstitch line.
+    parts = merge_blank_hem_bands(parts, info, segdir)
     parts = merge_seam_line_parts(parts, info, segdir)
     parts = normalize_part_names(parts, info)
     return check_grab_boxes(parts, segdir)

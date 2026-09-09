@@ -24,6 +24,14 @@ export const STRINGS = {
       light: "Light",
       unknownUser: "unknown user",
     },
+    topBar: {
+      searchPlaceholder: "Search techpacks, sources and notes...",
+      searchAria: "Search techpacks, sources and notes",
+      searchShortcut: "\u2318 K",
+      themeAria: "Toggle dark mode",
+      languageAria: "Change language",
+      accountAria: "Account menu",
+    },
     gallery: {
       dashboard: "Dashboard",
       techpackCountOne: "{{count}} techpack",
@@ -36,6 +44,10 @@ export const STRINGS = {
       generatingAria: "Generating",
       cancelRun: "Cancel this run",
       emptyState: "Nothing yet — upload a garment image or a flat sketch on the left.",
+      scopeAria: "How many techpacks to show",
+      scopeRecent: "Recent",
+      scopeAll: "All ({{count}})",
+      hiddenNote: "{{count}} more hidden — switch to All to see them",
     },
     galleryCard: {
       techpackFallback: "techpack",
@@ -66,7 +78,9 @@ export const STRINGS = {
     sketchCanvas: {
       selectSketch: "Select Sketch",
       close: "Close",
-      pen: "Pen",
+      pencil: "Pencil",
+      marker: "Marker",
+      brush: "Brush",
       eraser: "Eraser",
       color: "Color",
       strokeWidth: "Stroke Size",
@@ -78,6 +92,8 @@ export const STRINGS = {
       clear: "Clear canvas",
     },
     sidebar: {
+      collapse: "Collapse sidebar",
+      expand: "Expand sidebar",
       step1: "1. Sketch",
       draw: "Draw",
       drawTabTitle: "Draw a sketch on a blank canvas",
@@ -271,6 +287,14 @@ export const STRINGS = {
       light: "라이트",
       unknownUser: "알 수 없는 사용자",
     },
+    topBar: {
+      searchPlaceholder: "테크팩, 소스, 메모 검색...",
+      searchAria: "테크팩, 소스, 메모 검색",
+      searchShortcut: "\u2318 K",
+      themeAria: "다크 모드 전환",
+      languageAria: "언어 변경",
+      accountAria: "계정 메뉴",
+    },
     gallery: {
       dashboard: "대시보드",
       techpackCountOne: "테크팩 {{count}}개",
@@ -283,6 +307,10 @@ export const STRINGS = {
       generatingAria: "생성 중",
       cancelRun: "이 작업 취소",
       emptyState: "아직 없습니다 — 왼쪽에서 의류 이미지나 플랫 스케치를 업로드하세요.",
+      scopeAria: "표시할 테크팩 수",
+      scopeRecent: "최근",
+      scopeAll: "전체 ({{count}})",
+      hiddenNote: "{{count}}개 더 숨겨짐 — 전체로 바꾸면 모두 표시됩니다",
     },
     galleryCard: {
       techpackFallback: "테크팩",
@@ -313,7 +341,9 @@ export const STRINGS = {
     sketchCanvas: {
       selectSketch: "스케치 선택",
       close: "닫기",
-      pen: "펜",
+      pencil: "연필",
+      marker: "마커",
+      brush: "브러시",
       eraser: "지우개",
       color: "색상",
       strokeWidth: "선 굵기",
@@ -325,6 +355,8 @@ export const STRINGS = {
       clear: "캔버스 지우기",
     },
     sidebar: {
+      collapse: "사이드바 접기",
+      expand: "사이드바 펼치기",
       step1: "1. 스케치",
       draw: "그리기",
       drawTabTitle: "빈 캔버스에 스케치 그리기",

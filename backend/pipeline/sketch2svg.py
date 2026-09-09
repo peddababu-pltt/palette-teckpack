@@ -113,33 +113,48 @@ A diagonal line crossing the full body panel = quilting surface pattern, not a s
 ABSOLUTE PROHIBITION — the following garment parts must NEVER have stitch dashes
 added to them under any circumstances, even if a line near them looks like stitching:
 
-  hem, waistband, pockets, collar, yoke, cuffs, belt loops, zips, buttons,
-  fly, placket, rib bands, tabs, welt, pocket flap
+  hem, neckline, pockets, yoke, waistband, collar, cuffs, belt loops, zips,
+  buttons, fly, placket, rib bands, tabs, welt, pocket flap
 
 Zero exceptions. Treat every dashed or dotted line near these parts as noise — do not emit it.
 
   A dash line running along the hem edge          = IGNORE IT, do not emit it.
-  A dash line along the waistband                 = IGNORE IT, do not emit it.
+  A dash line along the neckline or neck opening  = IGNORE IT, do not emit it.
+  A dash line along pocket edges or openings      = IGNORE IT, do not emit it.
   A dash line along the yoke seam                 = IGNORE IT, do not emit it.
+  A dash line along the waistband                 = IGNORE IT, do not emit it.
   A dash line inside or outside the collar        = IGNORE IT, do not emit it.
   A dash line along the collar stand or neckband  = IGNORE IT, do not emit it.
   A dash line along or inside cuffs               = IGNORE IT, do not emit it.
-  A dash line along pocket edges or openings      = IGNORE IT, do not emit it.
   A dash line beside or along a zipper            = IGNORE IT, do not emit it.
   A dash line along belt loops                    = IGNORE IT, do not emit it.
   A dash line along placket, fly, or rib bands    = IGNORE IT, do not emit it.
 
 These parts get solid outlines only — NEVER dashed paths under any reading of the sketch.
 
+DOUBLED EDGES — the same prohibition, in its other form. A topstitch line is often
+drawn in the source as a SECOND SOLID line hugging the part's real edge, rather than
+as dashes: a doubled or double-struck outline, a thin contour just inside or outside
+the main edge, or a narrow parallel band. On the parts listed above — pockets and hem
+most often — that second line is topstitching too, and it must NOT become its own path.
+Emit ONE path for the part's edge and drop the parallel companion line. A pocket is one
+closed outline, not two nested outlines a hairline apart. Do not emit the companion line
+into the stitching layer either; delete it.
+
 The ONLY stitching paths allowed are ones where the source sketch contains an
 unmistakable, unambiguous, intentional dash pattern on a plain interior body seam
 that is NOT associated with any of the parts listed above.
 
-Each stitching feature must be its own named path:
-  <path id="stitch-waistband-front" ... />
-  <path id="stitch-left-pocket" ... />
-  <path id="stitch-right-pocket" ... />
-  <path id="stitch-front-fly" ... />
+Each stitching feature must be its own named path, named after the interior body
+seam it belongs to. These are examples of ALLOWED ids:
+  <path id="stitch-princess-seam-front-left" ... />
+  <path id="stitch-side-seam-right" ... />
+  <path id="stitch-center-back-seam" ... />
+
+NEVER emit a stitching path named after a prohibited part. There is no valid
+stitch-hem, stitch-neckline, stitch-yoke, stitch-left-pocket, stitch-right-pocket,
+stitch-waistband, stitch-collar, stitch-cuff, stitch-placket or stitch-fly path —
+if you are about to name a path that way, the correct action is to not emit it.
 
 # 5. GAP / BROKEN EDGE RECONSTRUCTION
 

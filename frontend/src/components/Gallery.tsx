@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { usePluginTranslations } from "@palettelab/sdk"
 import { resolveUrl, type Job } from "../api"
 import { STRINGS } from "../strings"
@@ -8,6 +8,7 @@ export default function Gallery({
   jobs,
   generating,
   genPercent,
+  search,
   onCancelGenerate,
   onOpenCard,
   onDeleteJob,
@@ -15,14 +16,34 @@ export default function Gallery({
   jobs: Job[]
   generating: boolean
   genPercent: number
+  search: string
   onCancelGenerate: () => void
   onOpenCard: (job: Job, tab: "overview" | "parts" | "pattern" | "spec") => void
   onDeleteJob: (job: Job) => void
 }) {
   const { t } = usePluginTranslations(STRINGS)
-  const [search, setSearch] = useState("")
   const [view, setView] = useState<"grid" | "list">("grid")
   const [openMenuJobId, setOpenMenuJobId] = useState<string | null>(null)
+  const [scope, setScope] = useState<"recent" | "all">("recent")
+  const [cols, setCols] = useState(1)
+  const gridRef = useRef<HTMLDivElement>(null)
+
+  // The grid is `repeat(auto-fill, minmax(230px, 1fr))`, so how many cards
+  // make a row is a runtime fact, not a constant -- read it off the resolved
+  // track list rather than guessing from the window width, which would have
+  // to re-derive the sidebar, the padding and the gap to get the same answer.
+  useEffect(() => {
+    const el = gridRef.current
+    if (!el) return
+    const measure = () => {
+      const tracks = getComputedStyle(el).gridTemplateColumns.trim()
+      setCols(tracks && tracks !== "none" ? tracks.split(/\s+/).length : 1)
+    }
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [view])
 
   useEffect(() => {
     // The toggle button's onClick calls stopPropagation, but that doesn't
@@ -51,32 +72,49 @@ export default function Gallery({
       .filter((e) => !q || e.label.toLowerCase().includes(q))
   }, [jobs, search, t])
 
+  // "Recent" is three rows; "All" is the whole grid. Past three rows the grid
+  // runs several screens tall and the upload column on the left -- the thing
+  // you came here to use -- scrolls away above it, so recent is the default.
+  // The skeleton card for a run in progress takes one of the slots, so it is
+  // never the card that gets cut.
+  const ROWS_SHOWN = 3
+  const limit = Math.max(1, cols * ROWS_SHOWN - (generating ? 1 : 0))
+  const hidden = Math.max(0, entries.length - limit)
+  const shown = scope === "all" || !hidden ? entries : entries.slice(0, limit)
+
   return (
     <div className="studio-main">
       <div className="studio-main-head">
-        <div>
-          <h2>{t("gallery.dashboard")}</h2>
-          <span className="studio-note" id="gallery-count">
-            {entries.length
-              ? t(entries.length === 1 ? "gallery.techpackCountOne" : "gallery.techpackCountMany", { count: entries.length })
-              : ""}
+        <div className="dash-title">
+          <span className="dash-title-mark" aria-hidden="true">
+            <span className="dash-title-badge">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="3" y="4" width="18" height="16" rx="3" />
+                <circle cx="8.5" cy="9.5" r="1.4" />
+                <path d="m4.5 17.5 4.5-4.5 3.5 3.5 3-2.5 4 4" />
+              </svg>
+            </span>
           </span>
+          <div className="dash-title-text">
+            <h2>{t("gallery.dashboard")}</h2>
+            <span className="studio-note" id="gallery-count">
+              {entries.length
+                ? t(entries.length === 1 ? "gallery.techpackCountOne" : "gallery.techpackCountMany", { count: entries.length })
+                : ""}
+            </span>
+          </div>
         </div>
         <div className="dash-tools">
-          <div className="search-field">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-              <circle cx="11" cy="11" r="7" />
-              <line x1="20" y1="20" x2="16.65" y2="16.65" />
-            </svg>
-            <input
-              type="search"
-              id="gallery-search"
-              placeholder={t("gallery.searchPlaceholder")}
-              aria-label={t("gallery.searchAria")}
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-            />
-          </div>
+          <select
+            className="tp-units-select dash-scope"
+            id="gallery-scope"
+            aria-label={t("gallery.scopeAria")}
+            value={scope}
+            onChange={(e) => setScope(e.target.value as "recent" | "all")}
+          >
+            <option value="recent">{t("gallery.scopeRecent")}</option>
+            <option value="all">{t("gallery.scopeAll", { count: entries.length })}</option>
+          </select>
           <div className="toolbar-group" id="view-toolbar" role="group" aria-label={t("gallery.cardLayoutAria")}>
             <button
               type="button"
@@ -114,7 +152,7 @@ export default function Gallery({
         </div>
       </div>
       <div className="studio-main-scroll">
-        <div id="gallery" className={`tp-gallery${view === "list" ? " is-list" : ""}`}>
+        <div ref={gridRef} id="gallery" className={`tp-gallery${view === "list" ? " is-list" : ""}`}>
           {generating && (
             <div className="tp-card tp-card-skeleton" aria-label={t("gallery.generatingAria")} aria-busy="true">
               <div className="tp-card-media">
@@ -134,7 +172,7 @@ export default function Gallery({
               </div>
             </div>
           )}
-          {entries.map((e) => (
+          {shown.map((e) => (
             <GalleryCard
               key={e.job.job_id}
               job={e.job}
@@ -147,6 +185,11 @@ export default function Gallery({
             />
           ))}
         </div>
+        {hidden > 0 && scope === "recent" && (
+          <div className="tp-gallery-more">
+            <span className="studio-note">{t("gallery.hiddenNote", { count: hidden })}</span>
+          </div>
+        )}
         <p className="studio-note" id="gallery-empty" style={{ display: entries.length > 0 || generating ? "none" : "block" }}>
           {t("gallery.emptyState")}
         </p>

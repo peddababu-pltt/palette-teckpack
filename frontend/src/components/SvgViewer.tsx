@@ -150,6 +150,31 @@ export function PartsCanvas({ parts, visible }: { parts: PartInfo[]; visible: bo
   const imagesRef = useRef<HTMLImageElement[]>([])
   const sizedRef = useRef(false)
 
+  // Sizing the canvas BUFFER to the source image's full native resolution
+  // (often 2x+ the CSS width the modal actually gives it) and letting the
+  // browser's own element-to-page compositor scale it down for display is
+  // what fused every dashed stitch line into the solid seam beside it: a
+  // 2-3px source gap survives fine at 1:1, but the compositor's downscale
+  // (not controlled by ctx.imageSmoothingQuality, which only affects
+  // drawImage calls INSIDE the canvas) shrinks it below one screen pixel.
+  // Sizing the buffer to the actual display width up front, and doing the
+  // one real downscale ourselves via drawImage with imageSmoothingQuality
+  // = "high", keeps that gap render-able instead of lossy-recompressed.
+  function sizeToDisplay(canvas: HTMLCanvasElement, naturalW: number, naturalH: number) {
+    const containerW = canvas.parentElement?.clientWidth || naturalW
+    const dpr = window.devicePixelRatio || 1
+    // never upscale past native — that would just blur the other way
+    const scale = Math.min(1, containerW / naturalW)
+    const w = Math.max(1, Math.round(naturalW * scale * dpr))
+    const h = Math.max(1, Math.round(naturalH * scale * dpr))
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w
+      canvas.height = h
+      return true
+    }
+    return false
+  }
+
   useEffect(() => {
     sizedRef.current = false
     imagesRef.current = parts.map((p) => {
@@ -157,8 +182,7 @@ export function PartsCanvas({ parts, visible }: { parts: PartInfo[]; visible: bo
       img.onload = () => {
         const canvas = canvasRef.current
         if (canvas && !sizedRef.current) {
-          canvas.width = img.naturalWidth
-          canvas.height = img.naturalHeight
+          sizeToDisplay(canvas, img.naturalWidth, img.naturalHeight)
           sizedRef.current = true
         }
         draw()
@@ -169,11 +193,29 @@ export function PartsCanvas({ parts, visible }: { parts: PartInfo[]; visible: bo
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [parts])
 
+  // The modal/container width can change after the initial size (window
+  // resize) — re-fit the buffer to it so the same fusion can't creep back
+  // in at a different viewport size.
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const ro = new ResizeObserver(() => {
+      const img = imagesRef.current[0]
+      if (!img || !img.naturalWidth) return
+      if (sizeToDisplay(canvas, img.naturalWidth, img.naturalHeight)) draw()
+    })
+    if (canvas.parentElement) ro.observe(canvas.parentElement)
+    return () => ro.disconnect()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [parts])
+
   function draw() {
     const canvas = canvasRef.current
     if (!canvas || !sizedRef.current) return
     const ctx = canvas.getContext("2d")
     if (!ctx) return
+    ctx.imageSmoothingEnabled = true
+    ctx.imageSmoothingQuality = "high"
     ctx.clearRect(0, 0, canvas.width, canvas.height)
     parts.forEach((_, i) => {
       const img = imagesRef.current[i]

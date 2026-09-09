@@ -142,6 +142,10 @@ RAIL_MARGIN = 16       # how far outside a grab_box that part's own ink still
                        # counts as its own (a zip's tape rails) -- see main()
 CROSS_TOL = 40         # ink a boxed part may carry beyond that strip before it
                        # is judged a line merely passing through, not its own
+CROSS_WALL = 4         # how far past a grab_box's wall a crossing line has to
+                       # keep going for the pixel-level grab to disown it, and
+                       # the slack allowed on "spans the strip" (see
+                       # box_crossers)
 SYNTH_BRIDGE = 6       # px of gap between closure fragments that gets bridged
                        # so a filled gap draws as one solid line
 STITCH_CLEARANCE = 0   # px of clear white to force between a stitch dash run
@@ -157,7 +161,7 @@ DASH_KEEPOUT = int(os.environ.get("DASH_KEEPOUT", "2"))
                        # a center-back seam the sketch draws as dashes alone
                        # then renders as a solid line with dashes on top of it.
                        # Faithfulness to the sketch wins: default stays 2.
-THIN = 0.25      # shave this many px off EACH SIDE of the captured ink before
+THIN = 0.45      # shave this many px off EACH SIDE of the captured ink before
                  # tracing -> thinner black outline in the SVG. Fractional on
                  # purpose: sketch strokes here are only ~2-3px wide, so a full
                  # 1px-per-side erosion eats them down to fragments that
@@ -174,6 +178,18 @@ THIN = 0.25      # shave this many px off EACH SIDE of the captured ink before
                  # all, 0.5 still traces the back body open, and 0.25 comes out
                  # clean on every check_layers test -- including the 9.7%
                  # uncovered ink the doubled-line build used to report.
+                 #
+                 # Raised 0.25 -> 0.45 on request: the SVG outline read as too
+                 # heavy. Note the quantisation -- thin is applied as
+                 # round(thin * ss) erosions at ss=4, so the real steps are
+                 # 0.25 / 0.5 / 0.75 and any value in 0.38-0.62 lands on the
+                 # same 0.5px cut (0.45 and 0.60 produce byte-identical SVGs).
+                 # 0.45 is therefore the 0.5px cut the note above warns about,
+                 # and it does cost something: on the puffer it thins the line
+                 # visibly and cleans up the doubled pocket edge, but breaks
+                 # some internal baffle seams and takes front_left_body_panel
+                 # from 14 traced paths to 29. THIN=0.25 restores the previous
+                 # weight if broken seams matter more than line weight.
                  # Env THIN overrides; ignored when THICKEN > 0; THIN=0 gives
                  # the old full-weight lines.
 TRIM_SS = 4   # grab_box trim (zip teeth, guard stitching) is thresholded and
@@ -255,6 +271,18 @@ RING_KEEPOUT = -1 if RING_KEEPOUT_OFF else int(os.environ.get("RING_KEEPOUT", "-
 AUTO_ZIP_POLY = os.environ.get("AUTO_ZIP_POLY", "1") != "0"
                    # 0 disables deriving a rotated strip for slanted zips and
                    # goes back to trusting the naming model's axis-aligned box.
+GROUP_MARKS = os.environ.get("GROUP_MARKS", "1") != "0"
+                   # Emit ONE stitch/button layer per owning part instead of
+                   # one per individual mark. GROUP_MARKS=0 restores the
+                   # per-mark layers (stitch_1, stitch_2, ...).
+
+NO_STITCH_ON_PARTS = os.environ.get("NO_STITCH_ON_PARTS", "1") != "0"
+                   # Drop traced stitch dashes whose owning part is a pocket,
+                   # hem, neckline/collar or yoke -- those parts are solid-line
+                   # only in this house style, and the upstream prompts already
+                   # try to suppress the dashes. This is the backstop for when
+                   # a dash survives into the raster. 0 traces them as before.
+
 DASH_BRIDGE_MAX = 14   # ceiling on the measured pitch, so one freak component
                        # cannot erase a ring far from any stitching
 RING_ON_INK = os.environ.get("RING_ON_INK", "0") != "0"
@@ -278,7 +306,7 @@ RING_ON_INK = os.environ.get("RING_ON_INK", "0") != "0"
                    # ink would leave that side with neither line nor ring.
                    # Extraction closure does not depend on this either way --
                    # ring_full[] already carries each part's complete perimeter
-                   # as invisible geometry (see BOUNDARY_FILL).
+                   # as the part's own closed outline (see BOUNDARY_FILL).
 RING_INK_PAD = int(os.environ.get("RING_INK_PAD", "0"))
                    # extra px, ON TOP of the stroke half-width, that the part's
                    # own captured ink is grown by before the visible ring is
@@ -468,6 +496,65 @@ def grab_mask(p, H, W):
     return m
 
 
+def box_crossers(m, p, ink, H, W):
+    """Fragments of `m` that are a line merely PASSING THROUGH the grab box.
+
+    A collar's own top edge runs horizontally straight across a front zip's
+    box; so does a waistband seam at the other end. The whole-component test
+    that opens the exclusive grab cannot catch either one: on a vector flat
+    the entire front view is a single ink component (measured on the bomber:
+    114250px, one label), so every crossing line fails the 60% test and drops
+    through to the pixel-level second-chance grab, which takes exactly the
+    slice of it that lies inside the box. The CROSS_TOL crosser cut later in
+    main() cannot catch it either -- by then the line has been severed at the
+    walls and the fragment carries nothing outside the strip at all.
+    Measured on job 78587156b28e: the front zip took 166px of the collar's
+    top edge, so the collar traced with a gap in its top line and the zip
+    layer drew a stray arc across its head, above the slider.
+
+    Judge it here, while the ink either side of the wall is still there to
+    look at. A passing line is SHORT along the strip's run, spans it wall to
+    wall, and keeps going past BOTH walls. The strip's own content is the
+    opposite: teeth and tape rails run the length of it, and an end stop --
+    short and full-width, the one shape that could be confused for a crossing
+    -- has nothing outside the walls at its own rows.
+    """
+    out = np.zeros((H, W), bool)
+    gb = p.get("grab_box")
+    if not gb or not m.any():
+        return out
+    x0, y0, x1, y1 = (int(round(v)) for v in gb)
+    vertical = (y1 - y0) >= (x1 - x0)
+    short = (x1 - x0) if vertical else (y1 - y0)
+    if short <= 0:
+        return out
+    # Half the strip's width: a crossing stroke is a couple of px thick, the
+    # zip's own ladder runs hundreds. Anything in between is left alone.
+    max_run = max(8, short // 2)
+    lab, n = ndimage.label(m, structure=np.ones((3, 3)))
+    if not n:
+        return out
+    for i, sl in enumerate(ndimage.find_objects(lab), start=1):
+        ys, xs = sl
+        run = (ys.stop - ys.start) if vertical else (xs.stop - xs.start)
+        span = (xs.stop - xs.start) if vertical else (ys.stop - ys.start)
+        if run > max_run or span < short - 2 * CROSS_WALL:
+            continue
+        if vertical:
+            lo = ink[max(0, ys.start - CROSS_WALL):ys.stop + CROSS_WALL,
+                     max(0, x0 - CROSS_WALL):max(1, x0)]
+            hi = ink[max(0, ys.start - CROSS_WALL):ys.stop + CROSS_WALL,
+                     min(W - 1, x1):min(W, x1 + CROSS_WALL)]
+        else:
+            lo = ink[max(0, y0 - CROSS_WALL):max(1, y0),
+                     max(0, xs.start - CROSS_WALL):xs.stop + CROSS_WALL]
+            hi = ink[min(H - 1, y1):min(H, y1 + CROSS_WALL),
+                     max(0, xs.start - CROSS_WALL):xs.stop + CROSS_WALL]
+        if lo.any() and hi.any():
+            out |= lab == i
+    return out
+
+
 def grab_halo(p, H, W, margin):
     """`margin` px of slack around a part's grab region.
 
@@ -487,6 +574,77 @@ def grab_halo(p, H, W, margin):
     m[max(0, y0 - margin):min(H, y1 + margin),
       max(0, x0 - margin):min(W, x1 + margin)] = True
     return m
+
+
+def snap_box_to_strip(gb, ink, keep=0.45):
+    """Slide a grab_box's SHORT sides onto the strip's own ink.
+
+    The box is authored by the naming model off a preview image and lands
+    where it lands. Measured on job feab02973734: the front zip's box ran
+    x682-732 against a zip whose rails, teeth and second rail occupy
+    x667-693 -- so the box held the right-hand rail plus 40px of bare body
+    panel, and the teeth fell OUTSIDE it. Everything outside the box goes to
+    the panel it sits on, which traces at native resolution where the ~1px
+    tooth gaps land inside a single pixel and fuse: the zip rendered as a
+    solid black bar from the slider down.
+
+    Extension along the strip's run (below) cannot fix that -- it profiles
+    the box's own columns, which here are mostly blank panel. So find the
+    strip first: over a search window a box-width to either side, walk out
+    from the busiest lane while the ink keeps up, tolerating the few quiet
+    columns between a tape rail and its teeth. On the same zip the profile
+    reads rails at x667-671 and x689-693 (~1000px each), teeth between them
+    (430-930), 3px lulls at x672-673 and x686-688 down at 60-160, and bare
+    panel out at 60-130.
+
+    Never widens the box: a strip is narrow, and a rectangle that has to
+    grow sideways to find ink is one that was pointed at the wrong thing.
+    """
+    x0, y0, x1, y1 = (int(round(v)) for v in gb)
+    H, W = ink.shape
+    x0, x1 = max(0, min(x0, W - 1)), max(1, min(x1, W))
+    y0, y1 = max(0, min(y0, H - 1)), max(1, min(y1, H))
+    if x1 <= x0 or y1 <= y0:
+        return [x0, y0, x1, y1]
+    vertical = (y1 - y0) >= (x1 - x0)
+    width = (x1 - x0) if vertical else (y1 - y0)
+    run = (y1 - y0) if vertical else (x1 - x0)
+    # Strips only. A boxed part can also be a small piece of hardware -- a
+    # slider, a stopper, a snap -- and "the busiest lane" means nothing on a
+    # 44x59 blob: snapping one took its box down to 5px and its layer from
+    # 706 traced paths to 7.
+    if width <= 0 or run < 4 * width:
+        return [x0, y0, x1, y1]
+    if vertical:
+        s0, s1 = max(0, x0 - width), min(W, x1 + width)
+        prof = ink[y0:y1, s0:s1].sum(axis=0)
+    else:
+        s0, s1 = max(0, y0 - width), min(H, y1 + width)
+        prof = ink[s0:s1, x0:x1].sum(axis=1)
+    if not prof.size or not prof.any():
+        return [x0, y0, x1, y1]
+    cut = prof.max() * keep
+    # The quiet run between a tape rail and the teeth scales with the strip:
+    # 3px on a 44px zip, 7px on an 81px one. A fixed tolerance either cut the
+    # wide zip down to its single densest rail (measured: an 81px box snapped
+    # to 4px, 1216 traced paths down to 17) or dragged a neighbouring seam in
+    # on the narrow one.
+    gap_tol = max(6, width // 6)
+    peak = int(np.argmax(prof))
+    lo, gap = peak, 0
+    while lo > 0 and gap < gap_tol:
+        gap = 0 if prof[lo - 1] >= cut else gap + 1
+        lo -= 1
+    lo += gap
+    hi, gap = peak, 0
+    while hi + 1 < prof.size and gap < gap_tol:
+        gap = 0 if prof[hi + 1] >= cut else gap + 1
+        hi += 1
+    hi -= gap
+    if hi - lo + 1 < 4 or hi - lo + 1 > width:
+        return [x0, y0, x1, y1]
+    return ([s0 + lo, y0, s0 + hi + 1, y1] if vertical
+            else [x0, s0 + lo, x1, s0 + hi + 1])
 
 
 def extend_box_along_strip(gb, ink, gap_tol=20):
@@ -1004,6 +1162,60 @@ def otsu_threshold(a):
         t = otsu(flat[flat < t])
     return int(np.clip(t, 100, 245))
 
+
+ZIP_FUSE_MAX = float(os.environ.get("ZIP_FUSE_MAX", "0.50"))
+                 # a zip strip whose ink is more than this share in ONE
+                 # connected blob has fused into a bar rather than a ladder
+ZIP_T_FLOOR = int(os.environ.get("ZIP_T_FLOOR", "80"))
+                 # do not chase the cut below this: past it the teeth break
+                 # up into a scatter of dots (see the grab_box comment)
+
+
+def _fused_share(mask):
+    """Fraction of a mask's ink sitting in its single largest component."""
+    if not mask.any():
+        return 0.0
+    lab, n = ndimage.label(mask)
+    if n <= 1:
+        return 1.0
+    sizes = ndimage.sum(mask, lab, range(1, n + 1))
+    return float(sizes.max()) / float(mask.sum())
+
+
+def zip_trim_threshold(up):
+    """Pick the cut that keeps a zip reading as separate teeth, not a bar.
+
+    The grab_box comment above assumes a local Otsu over a zip's own
+    footprint lands near the clip floor (~100), well under the global ink
+    cut that would swallow the tape. On the moto jacket it does the
+    opposite: Otsu returns 168 against a global cut of 159, and the whole
+    tape fills in -- 87% of the strip's ink ends up in ONE blob and the zip
+    renders as a solid black bar with no teeth.
+
+    Otsu is picking the tape/garment split, not the tooth/gap split, so ask
+    the question the defect actually poses: is this still a ladder? Walk the
+    cut down from Otsu and stop at the first one whose largest component
+    holds a minority of the ink. Measured on that zip: T=168 -> 87% in one
+    blob (fused), T=96 -> 43% over ~68 components (teeth resolve).
+    """
+    t0 = otsu_threshold(up)
+    otsu_share = _fused_share(up < t0)
+    if otsu_share <= ZIP_FUSE_MAX:
+        return t0
+    best_t, best_share = t0, otsu_share
+    for t in range(t0 - 8, ZIP_T_FLOOR - 1, -8):
+        share = _fused_share(up < t)
+        if share <= ZIP_FUSE_MAX:
+            print(f"  zip trim: otsu {t0} fused ({otsu_share:.0%} in one "
+                  f"blob) -> using {t} ({share:.0%})")
+            return t
+        if share < best_share:
+            best_t, best_share = t, share
+    print(f"  zip trim: otsu {t0} fused ({otsu_share:.0%}); no unfused cut "
+          f"down to {ZIP_T_FLOOR}, using best {best_t} ({best_share:.0%})")
+    return best_t
+
+
 def load_gray(path):
     im = Image.open(path)
     if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
@@ -1110,6 +1322,14 @@ def main(in_png, labels_npy, groups_json, out_svg):
         # Only rectangles get extended: the growth walks along the box's long
         # axis, which for a polygon would push the bounds off the strip.
         if p.get("grab_box") and not p.get("grab_poly"):
+            # Snap across the strip BEFORE extending along it: the extension
+            # profiles the box's own columns, so a box parked off the strip
+            # walks blank panel and reports nothing to grow into.
+            was = list(p["grab_box"])
+            p["grab_box"] = snap_box_to_strip(p["grab_box"], ink)
+            if p["grab_box"] != was:
+                print(f"  [{nm}] box {was} sits off the strip -- snapped "
+                      f"across to {p['grab_box']}")
             p["grab_box"] = extend_box_along_strip(p["grab_box"], ink)
     # Build the drawing in garment order: every structural piece first, each
     # closed on all sides, then the applied detail drawn ON TOP of those
@@ -1249,6 +1469,7 @@ def main(in_png, labels_npy, groups_json, out_svg):
     # exclusive grab_box strokes first
     grabbed = {}                      # part -> bool mask
     grabbed_union = np.zeros((H, W), bool)
+    crossed_union = np.zeros((H, W), bool)   # lines passing THROUGH a box
     slab, sn = ndimage.label(ink, structure=np.ones((3, 3)))
     sobjs = ndimage.find_objects(slab)
     for nm, p in cfg["parts"].items():
@@ -1306,6 +1527,17 @@ def main(in_png, labels_npy, groups_json, out_svg):
         neighbour_edge = ndimage.binary_dilation(
             owned_region & ~own_reg, dil, iterations=BOX_EDGE_KEEP)
         extra = ink & box & ~owned_region & ~grabbed_union & ~neighbour_edge
+        # ...and a line that only CROSSES the box is not the box's either.
+        # neighbour_edge above covers a line running ALONGSIDE the strip (a
+        # panel's center-front edge). This covers the perpendicular case: the
+        # collar's top edge, a waistband seam, a chest seam -- each one drawn
+        # by the piece it belongs to and merely passing over the zip.
+        cross = box_crossers(extra, p, ink, H, W)
+        if cross.any():
+            print(f"  [{nm}] dropped {int(cross.sum())}px of lines crossing "
+                  f"its box (they belong to the piece that draws them)")
+            extra &= ~cross
+            crossed_union |= cross
         if extra.any():
             grabbed[nm] |= extra
             grabbed_union |= extra
@@ -1369,6 +1601,13 @@ def main(in_png, labels_npy, groups_json, out_svg):
     for p in cfg["parts"].values():
         if p.get("grab_box"):
             box_interior |= grab_mask(p, H, W)
+    # ...except where a line merely crosses the box. Exclusivity has to be
+    # dropped in the same two places the grab is (see box_crossers): the box
+    # refusing to TAKE the collar's top edge only helps if the collar is also
+    # allowed to KEEP it. Left in, the arc belonged to nobody and the collar
+    # still traced with a gap in its top line, since BOX_EDGE_KEEP reaches
+    # only 3px past the collar's own region and the edge sits further out.
+    box_interior &= ~crossed_union
 
     # A stitch line is never a boundary line, and an outline synthesized for a
     # piece may land in the same place as a dash run -- overlapping there is
@@ -1535,10 +1774,10 @@ def main(in_png, labels_npy, groups_json, out_svg):
         # through whichever one is left unguarded (measured: guarding only the
         # grab dropped the bomber's right-hand tape line from the drawing
         # entirely -- the zip no longer took it and this cut still deleted it).
+        others_box = box_interior.copy()
+        if others_box.any() and p.get("grab_box"):
+            others_box &= ~grab_mask(p, H, W)
         if box_interior.any():
-            others_box = box_interior.copy()
-            if p.get("grab_box"):
-                others_box &= ~grab_mask(p, H, W)
             if others_box.any():
                 own_edge = ndimage.binary_dilation(reg, dil,
                                                    iterations=BOX_EDGE_KEEP)
@@ -1646,7 +1885,17 @@ def main(in_png, labels_npy, groups_json, out_svg):
                 # and leave the piece open there.
                 near_ink = near_ink | ndimage.binary_dilation(
                     fine_all, dil, iterations=DASH_KEEPOUT)
-            synth = contour & ~near_ink
+            # ...and never inside SOMEONE ELSE'S grab box. A boxed strip is a
+            # piece of its own even with no seg region behind it (a zip is all
+            # box, `"regions": []`), so a panel whose center-front edge the zip
+            # now owns reads as open along the whole placket and synthesizes a
+            # closure straight down it -- and since the strip is not a region,
+            # the under-another-piece test below judges that closure to be out
+            # in the open and inks it solid. Measured on the bomber: 2873px of
+            # invented cutline printed down the middle of the zip, doubling the
+            # tape rail. The panel's own perimeter is still complete in
+            # ring_full, which is geometry, not ink.
+            synth = contour & ~near_ink & ~others_box
             if synth.any():
                 sl_, sn_ = ndimage.label(synth, structure=np.ones((3, 3)))
                 sizes_ = ndimage.sum_labels(synth, sl_, np.arange(1, sn_ + 1))
@@ -1732,8 +1981,8 @@ def main(in_png, labels_npy, groups_json, out_svg):
             # outline so it can be extracted on its own without reconstructing
             # the edges its neighbours happen to draw -- overlapping a
             # neighbour's boundary is fine, missing one's own is not. This copy
-            # is geometry only (BOUNDARY_FILL, "none" by default), so it never
-            # doubles a line in the composed drawing.
+            # is drawn as the part's own outline (BOUNDARY_FILL), and it lies
+            # on the drawn line it belongs to, so it does not double it.
             ring_full[nm] = ring.copy()
             # From here on `ring` is the VISIBLE ring, and it is a hairline: it
             # only ever appears on sides the sketch left undrawn (see the
@@ -1742,6 +1991,12 @@ def main(in_png, labels_npy, groups_json, out_svg):
             if RING_PX != max(1, outline_px):
                 ring = sealed & ~ndimage.binary_erosion(
                     sealed, dil, iterations=max(1, RING_PX))
+            # The VISIBLE ring stops at someone else's grab box, same as the
+            # closure above and for the same reason: inside that box the strip
+            # is the piece that draws the line, and a hairline laid along its
+            # tape rail reads as a doubled placket edge. ring_full above keeps
+            # this part's own perimeter complete for extraction.
+            ring &= ~others_box
             # Per PIXEL, drop the ring where STITCHING runs. A dashed seam is
             # a drawn line already; ringing it lays a hairline through the
             # gaps that links dash to dash, and the run reads as a dashed
@@ -1899,7 +2154,7 @@ def main(in_png, labels_npy, groups_json, out_svg):
                         a[gy0:gy1, gx0:gx1]).resize(
                         ((gx1 - gx0) * zs, (gy1 - gy0) * zs), Image.LANCZOS))
                     trim_thr = int(os.environ.get("TRIM_T", 0)) or \
-                        otsu_threshold(up)
+                        zip_trim_threshold(up)
                     strict = np.zeros((H * zs, W * zs), bool)
                     strict[gy0 * zs:gy1 * zs, gx0 * zs:gx1 * zs] = up < trim_thr
                     cap_up = np.repeat(np.repeat(cap, zs, axis=0), zs, axis=1)
@@ -2062,31 +2317,72 @@ def main(in_png, labels_npy, groups_json, out_svg):
     # the only thing that separates a tooth from the topstitch beside it.
     HARDWARE_OWNER_KEYWORDS = ("zip", "placket", "fly", "button", "snap",
                                "eyelet", "buckle", "rivet", "grommet")
+    NO_STITCH_OWNER_KEYWORDS = ("pocket", "welt", "hem", "neck", "collar", "yoke")
     dark_marks = set()
 
     mark_owner = {}
+    grouped = {}
     for mask, prefix in ((buttons_mask, "button"), (stitches_mask, "stitch")):
         if not mask.any():
             continue
         canvas = np.full((H, W), 255, np.uint8)
         canvas[mask] = 0
         paths = trace_potrace(Image.fromarray(canvas))
+        dropped = 0
         for i, path in enumerate(paths, start=1):
-            name = f"{prefix}_{i}"
-            if name in existing_names:
-                name = f"{prefix}_{i}_2"
-            existing_names.add(name)
-            layers.append(((10**6, 10**6, i), name, [path], []))
             d, _tr = path
             xmin, xmax, ymin, ymax = parse_path(d).bbox()
             cy = min(max(int((ymin + ymax) / 2), 0), H - 1)
             cx = min(max(int((xmin + xmax) / 2), 0), W - 1)
             owner = mark_owner_of(cx, cy)
+
+            # Pockets, hem, neckline and yoke line carry no topstitching in
+            # this house style, so a dash run sitting on one is dropped rather
+            # than traced. Buttons are never dropped -- a snap on a pocket flap
+            # is real hardware, not stitching.
+            if (prefix == "stitch" and NO_STITCH_ON_PARTS and owner
+                    and any(k in owner for k in NO_STITCH_OWNER_KEYWORDS)):
+                dropped += 1
+                continue
+
+            if GROUP_MARKS:
+                grouped.setdefault((prefix, owner or "unassigned"),
+                                   []).append(path)
+                continue
+
+            name = f"{prefix}_{i}"
+            if name in existing_names:
+                name = f"{prefix}_{i}_2"
+            existing_names.add(name)
+            layers.append(((10**6, 10**6, i), name, [path], []))
             if owner:
                 mark_owner[name] = owner
                 if any(k in owner for k in HARDWARE_OWNER_KEYWORDS):
                     dark_marks.add(name)
-        print(f"  [{prefix}_*] {len(paths)} individual layers")
+        kept = len(paths) - dropped
+        note = f" ({dropped} dropped on pocket/hem/neckline/yoke)" if dropped else ""
+        if not GROUP_MARKS:
+            print(f"  [{prefix}_*] {kept} individual layers{note}")
+
+    # One layer per part's marks, not one per mark. Traced individually the
+    # dashes swamp the layer list -- on the moto jacket 298 stitch_N plus 7
+    # button_N layers against 22 actual garment parts, so the parts were
+    # unfindable in the SVG's own layer panel. Every mark already knows the
+    # part it sits on (mark_owner_of), which is the natural grouping and the
+    # same one the per-part PNG export already composites by.
+    for (prefix, owner), paths in sorted(grouped.items()):
+        name = f"{prefix}_{owner}"
+        if name in existing_names:
+            name = f"{name}_2"
+        existing_names.add(name)
+        layers.append(((10**6, 10**6, 0), name, paths, []))
+        if owner != "unassigned":
+            mark_owner[name] = owner
+            if any(k in owner for k in HARDWARE_OWNER_KEYWORDS):
+                dark_marks.add(name)
+    if GROUP_MARKS and grouped:
+        print(f"  [marks] {sum(len(v) for v in grouped.values())} marks in "
+              f"{len(grouped)} per-part layers")
 
     # catch-all: ink no part captured -> "unassigned" layer (never lose lines)
     captured = np.zeros((H, W), bool)
@@ -2148,10 +2444,17 @@ def main(in_png, labels_npy, groups_json, out_svg):
             out.append(f'    <path d="{" ".join(parts_g)}" '
                        f'fill="{os.environ.get("GUIDE_FILL", "#000000")}" '
                        f'fill-rule="evenodd"/>')
-        # The component's own complete closed perimeter, unfilled: geometry for
-        # extraction, invisible in the composed drawing (BOUNDARY_FILL=#000000
-        # to see it, BOUNDARY_FILL=off to leave it out of the file).
-        bfill = os.environ.get("BOUNDARY_FILL", "none")
+        # The component's own complete closed perimeter, inked BLACK: every
+        # part reads as a separate piece with its own outline, which is what a
+        # techpack is for -- a piece whose edge the neighbour happens to draw
+        # used to come out open on that side, showing as a white gap between
+        # two parts. It costs almost nothing in the composed drawing because
+        # the perimeter lies on the drawn line it belongs to: measured on the
+        # quilted bomber, 210171px of ink against 209054 with it off, and 31px
+        # of that landing anywhere the sketch does not already have ink.
+        # BOUNDARY_FILL=none makes it invisible geometry again (the old
+        # default), BOUNDARY_FILL=off leaves it out of the file entirely.
+        bfill = os.environ.get("BOUNDARY_FILL", "#000000")
         if boundary_paths.get(name) and bfill != "off":
             parts_b = [bake(d, tr) for d, tr in boundary_paths[name]]
             out.append(f'    <path class="component-boundary" '

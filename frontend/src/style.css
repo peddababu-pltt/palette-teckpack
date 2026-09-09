@@ -2,7 +2,7 @@
    Palette Techpack — workspace UI
    ----------------------------------------------------------------------------
    Design brief: the product of this tool is BLACK LINE ART. Every UI decision
-   below defers to that. The shell is monochrome zinc with a single emerald
+   below defers to that. The shell is monochrome zinc with a single gold
    accent, so nothing on screen competes with the drawing; colour is spent only
    where it carries meaning (done / error / focus).
 
@@ -40,21 +40,82 @@
   --surface-2:     var(--zinc-100);
   --canvas:        #FFFFFF;   /* artwork only -- never themed */
   --canvas-border: var(--zinc-200);
+  /* A card overlay is a plate laid ON TOP of the page, so it needs a ground of
+     its own. On white, the panel, the drawing plate, the spec table and every
+     button in the footer were all the same white and the dialog read as one
+     undivided sheet -- the drawing had no edge. A neutral grey one step under
+     --surface gives everything white inside the dialog its edge back without
+     tinting the artwork, which stays on --canvas in both themes. */
+  --dialog-bg:     #ECECEF;
   --fg:            var(--zinc-900);
   --fg-muted:      var(--zinc-500);
   --fg-subtle:     var(--zinc-400);
   --border:        var(--zinc-200);
   --border-strong: var(--zinc-300);
 
-  /* Emerald is the brand: it fills the active segment of every toggle, the
+  /* Antique gold is the brand: it fills the active segment of every toggle, the
      Generate CTA and the step badges. Zinc stays the neutral shell so the black
-     line art is never competing with UI colour. */
-  --primary:       #0E8A5F;
-  --primary-hover: #0B6E4C;
+     line art is never competing with UI colour.
+
+     The gold ramp runs light -> dark; only the two darkest steps are ever used
+     behind white text. Gold at its "pretty" brightness (#D4A94A) carries white
+     at ~2.4:1, so --primary takes gold-700 instead and the bright steps are
+     reserved for dark mode, hovers and tints. */
+  --gold-100: #FBF3E0;
+  --gold-300: #E3C77A;
+  --gold-500: #D4A94A;
+  --gold-600: #B8862B;
+  --gold-700: #8F6A1C;   /* 4.9:1 on white */
+  --gold-800: #6F5213;
+
+  --primary:       var(--gold-700);
+  --primary-hover: var(--gold-800);
   --on-primary:    #FFFFFF;
-  --accent:        #059669;   /* done / success / go */
-  --accent-weak:   #ECFDF5;
-  --accent-text:   #047857;
+  --accent:        var(--gold-700);   /* done / success / go */
+  --accent-weak:   var(--gold-100);
+  --accent-text:   var(--gold-800);
+
+  /* Dark rail: the left form column is a fixed brand surface in BOTH themes,
+     so it carries its own neutral ramp instead of following --bg. Only the
+     rail reads these; everything else stays on the zinc ramp above. */
+  --rail-bg:           #100E0B;
+  --rail-surface:      #1A1713;
+  --rail-surface-2:    #23201A;
+  --rail-fg:           #F5EFE3;
+  --rail-muted:        #A79C88;
+  --rail-subtle:       #7C7364;
+  --rail-border:       rgba(245, 239, 227, .10);
+  --rail-border-strong:rgba(245, 239, 227, .20);
+
+  /* Dropzones are cream plates, not shell-coloured panels -- they read as the
+     one place you put something in, on the dark rail and on a light page. */
+  --dropzone-bg:       #FAF3E3;
+  --dropzone-bg-hover: #F5EAD1;
+  --dropzone-fg:       var(--gold-800);
+  --dropzone-hint:     #8C8578;
+  --dropzone-border:   #E2D3AE;
+
+  /* The avatar chip is the one gold-on-dark spot in an otherwise light bar, so
+     it needs its own pair rather than borrowing a shell surface -- on a dark
+     page --zinc-900 would sink into the background. */
+  --avatar-bg:         var(--zinc-900);
+  --avatar-fg:         var(--gold-500);
+
+  /* The filled gold surface used by the primary CTA, the active segment and the
+     size badge. It carries WHITE text, so the stops stay on the darker half of
+     the ramp -- the bright step (#D4A94A) only reaches ~2.4:1 with white. */
+  --gold-grad:   linear-gradient(145deg, var(--gold-600) 0%, var(--gold-500) 42%, var(--gold-700) 100%);
+  --gold-grad-h: linear-gradient(145deg, var(--gold-500) 0%, var(--gold-300) 42%, var(--gold-600) 100%);
+  --on-gold:     #FFFFFF;
+
+  /* The dashboard column's ground. It is a warm light GREY, not ivory-white:
+     the cards are near-white, so the field has to sit a step below them or the
+     two merge and the grid reads as one flat sheet. The wash is white rather
+     than grey for the same reason -- it lifts the field, it doesn't dirty it. */
+  --paper:      #F2F1EE;
+  --plate-shade: rgba(9, 9, 11, .085);       /* the two streaks */
+  --glass-bg:   #FFFFFF;
+  --glass-edge: var(--zinc-200);
   --danger:        #DC2626;
   --danger-weak:   #FEF2F2;
   --info-weak:     #EFF6FF;
@@ -64,7 +125,7 @@
   --shadow-md: 0 4px 12px rgba(9, 9, 11, .08);
   --shadow-lg: 0 16px 48px rgba(9, 9, 11, .18);
 
-  --sidebar-w: 380px;
+  --sidebar-w: 350px;
 
   --dur: 180ms;
   --ease: cubic-bezier(.4, 0, .2, 1);
@@ -75,19 +136,29 @@
     --bg:            var(--zinc-950);
     --surface:       var(--zinc-900);
     --surface-2:     var(--zinc-800);
+    --dialog-bg:     #111113;   /* a step under --surface, same job as in light */
     --fg:            var(--zinc-100);
     --fg-muted:      var(--zinc-400);
     --fg-subtle:     var(--zinc-500);
     --border:        var(--zinc-800);
     --border-strong: var(--zinc-700);
-    /* Lifted, not inverted -- the brand stays green in dark mode, just bright
-       enough to keep white label text above 4.5:1. */
-    --primary:       #10996B;
-    --primary-hover: #14B37E;
-    --on-primary:    #FFFFFF;
-    --accent:        #10B981;
-    --accent-weak:   rgba(16, 185, 129, .12);
-    --accent-text:   #34D399;
+    /* Lifted, not inverted -- the brand stays gold in dark mode, just bright
+       enough to read against a near-black shell. Bright gold cannot carry white
+       text, so on a dark shell the CTA flips to a dark label on bright gold
+       (7.7:1). --accent stays a step darker because a few fills hardcode white
+       on it. */
+    --primary:       var(--gold-500);
+    --primary-hover: var(--gold-300);
+    --on-primary:    #17130A;
+    --accent:        #A8811F;
+    --accent-weak:   rgba(212, 169, 74, .14);
+    --accent-text:   var(--gold-300);
+    --avatar-bg:     rgba(212, 169, 74, .18);
+    --avatar-fg:     var(--gold-300);
+    --paper:         var(--zinc-950);
+    --plate-shade:   rgba(255, 255, 255, .075);
+    --glass-bg:      #1E1E22;
+    --glass-edge:    rgba(255, 255, 255, .12);
     --danger:        #F87171;
     --danger-weak:   rgba(248, 113, 113, .12);
     --info-weak:     rgba(59, 130, 246, .14);
@@ -104,17 +175,24 @@
   --bg:            var(--zinc-950);
   --surface:       var(--zinc-900);
   --surface-2:     var(--zinc-800);
+  --dialog-bg:     #111113;   /* a step under --surface, same job as in light */
   --fg:            var(--zinc-100);
   --fg-muted:      var(--zinc-400);
   --fg-subtle:     var(--zinc-500);
   --border:        var(--zinc-800);
   --border-strong: var(--zinc-700);
-  --primary:       #10996B;
-  --primary-hover: #14B37E;
-  --on-primary:    #FFFFFF;
-  --accent:        #10B981;
-  --accent-weak:   rgba(16, 185, 129, .12);
-  --accent-text:   #34D399;
+  --primary:       var(--gold-500);
+  --primary-hover: var(--gold-300);
+  --on-primary:    #17130A;
+  --accent:        #A8811F;
+  --accent-weak:   rgba(212, 169, 74, .14);
+  --accent-text:   var(--gold-300);
+  --avatar-bg:     rgba(212, 169, 74, .18);
+  --avatar-fg:     var(--gold-300);
+  --paper:         var(--zinc-950);
+  --plate-shade:   rgba(255, 255, 255, .075);
+  --glass-bg:      #1E1E22;
+  --glass-edge:    rgba(255, 255, 255, .12);
   --danger:        #F87171;
   --danger-weak:   rgba(248, 113, 113, .12);
   --info-weak:     rgba(59, 130, 246, .14);
@@ -702,7 +780,19 @@ img.result, object.result {
 }
 .toggle-btn:last-child, .toolbar-btn:last-child { border-right: none; }
 .toggle-btn:hover, .toolbar-btn:hover { background: var(--surface-2); color: var(--fg); }
+/* Held down, before the selection lands: gold, so the press is visibly the
+   thing that turns the segment gold rather than a grey flash that happens to
+   be followed by one. Applies to the segment already selected too -- pressing
+   Upload while Upload is active still answers. */
+.toggle-btn:active, .toolbar-btn:active {
+  background: var(--accent-weak);
+  color: var(--accent-text);
+}
 .toggle-btn.active, .toolbar-btn.active { background: var(--primary); color: var(--on-primary); }
+.toggle-btn.active:active, .toolbar-btn.active:active {
+  background: var(--primary-hover);
+  color: var(--on-primary);
+}
 .toggle-btn.active:hover, .toolbar-btn.active:hover {
   background: var(--zinc-700); color: var(--on-primary);
 }
@@ -924,7 +1014,7 @@ img.result, object.result {
 }
 .tp-overlay.hidden { display: none; }
 .tp-overlay-panel {
-  background: var(--surface);
+  background: var(--dialog-bg);
   border: 1px solid var(--border);
   border-radius: var(--r-xl);
   max-width: 720px; width: 100%;
@@ -1704,8 +1794,19 @@ img.result, object.result {
 }
 /* A spec that already exists opens instantly; one that doesn't costs a run.
    Worth telling apart before the click. */
-.tp-card-foot-btn.is-ready { border-color: var(--accent); color: var(--accent-text); }
-.tp-card-foot-btn.is-ready:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+/* Spec is the filled cream action in the mock; Pattern stays a neutral outline.
+   `is-ready` marks the Spec button once the spec exists -- it is the only button
+   that ever carries it. */
+.tp-card-foot-btn.is-ready {
+  background: var(--gold-100);
+  border-color: transparent;
+  color: var(--gold-800);
+}
+.tp-card-foot-btn.is-ready:hover {
+  background: var(--dropzone-bg-hover);
+  border-color: transparent;
+  color: var(--gold-800);
+}
 
 /* --- card overflow menu -------------------------------------------------- */
 /* Anchored beside the action stack rather than under it, so its position does
@@ -1759,6 +1860,68 @@ img.result, object.result {
   vertical-align: middle;
 }
 .toggle-btn.active .ov-tab-dot { background: var(--on-primary); }
+
+/* --- card overlay: one ground, one button ------------------------------- */
+/* The panel is grey (see --dialog-bg), so everything that reads as a card on
+   top of it says so explicitly -- otherwise the spec table and the viewer's
+   control strip sank into the ground they are supposed to sit on. */
+.tp-overlay-panel .tp-spec-table,
+.tp-overlay-panel .tp-svg-controls,
+.tp-overlay-panel .tp-measure-table-wrap .measure-table td { background: var(--surface); }
+/* The tab bar, the footer actions and the viewer controls each carried their
+   own face -- a joined segmented strip, a muted outline button and a bare
+   icon button. One face for all three: white, 34px, --r-md, gold when active.
+   The tabs stop being a segmented group here (no shared border, no clipped
+   corners) so a tab looks like the buttons it sits above, not like a widget. */
+.tp-overlay-panel .ov-tabs {
+  gap: var(--sp-1);
+  border: none;
+  background: none;
+  overflow: visible;
+}
+.tp-overlay-panel .ov-tabs .toggle-btn,
+.tp-overlay-panel .tp-modal-btn,
+.tp-overlay-panel .tp-ctrl-btn {
+  min-height: 34px;
+  border: 1px solid var(--border-strong);
+  border-right: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+.tp-overlay-panel .ov-tabs .toggle-btn:hover,
+.tp-overlay-panel .tp-modal-btn:hover,
+.tp-overlay-panel .tp-ctrl-btn:hover {
+  background: var(--surface);
+  color: var(--fg);
+  border-color: var(--fg-subtle);
+}
+.tp-overlay-panel .ov-tabs .toggle-btn.active,
+.tp-overlay-panel .ov-tabs .toggle-btn.active:hover {
+  background: var(--gold-grad);
+  color: var(--on-gold);
+  border-color: transparent;
+}
+.tp-overlay-panel .ov-tabs .toggle-btn.active .ov-tab-dot { background: var(--on-gold); }
+/* A variation is a button too, so its label chip follows the same rule: white
+   with the thumbnail's own edge, gold when it is the one on the plate. It used
+   to be a dark zinc bar, the one near-black chip in a dialog whose whole point
+   is black line art. */
+.tp-overlay-panel .tp-thumb-item { border-color: var(--border-strong); }
+.tp-overlay-panel .tp-thumb-item span {
+  background: var(--surface);
+  color: var(--fg-muted);
+  border-top: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 11px;
+}
+.tp-overlay-panel .tp-thumb-item.is-active span {
+  background: var(--gold-grad);
+  color: var(--on-gold);
+  border-top-color: transparent;
+}
 
 /* --- overlay task (a run started from a card) --------------------------- */
 .tp-task {
@@ -1847,7 +2010,7 @@ img.result, object.result {
 }
 
 /* ==========================================================================
-   Green-accent redesign
+   Gold-accent redesign
    --------------------------------------------------------------------------
    Overrides layered on top of the base sheet rather than edited into it, so
    the structural rules above stay readable and this pass can be reviewed (or
@@ -1869,10 +2032,23 @@ img.result, object.result {
   flex-direction: row;
   align-items: center;
   justify-content: space-between;
-  flex-wrap: nowrap;
+  /* Wrap, not nowrap. The group is `overflow: hidden`, so when the title and a
+     two-segment switch together ran past the rail's 350px the second segment
+     was not squeezed -- it was CLIPPED, and "Manual" simply did not exist as
+     far as anyone could tell. Wrapping drops the switch to its own line in
+     that case and keeps both segments reachable. */
+  flex-wrap: wrap;
   gap: var(--sp-3);
 }
 .studio-step-title { flex: 0 0 auto; }
+/* ...and the switch is sized to have a fair chance of fitting beside the title
+   in the first place: "AI Recommendation" is a long label for a 350px rail, so
+   this one group runs a step smaller than the rest. */
+#measure-tabs .toggle-btn {
+  font-size: 12px;
+  padding: 0 var(--sp-2);
+  min-height: 34px;
+}
 .toggle-group, .toolbar-group {
   display: flex;
   width: auto;
@@ -1900,8 +2076,9 @@ img.result, object.result {
 .toggle-btn:hover, .toolbar-btn:hover { background: var(--surface-2); color: var(--fg); }
 .toggle-btn.active, .toolbar-btn.active,
 .toggle-btn.active:hover, .toolbar-btn.active:hover {
-  background: var(--primary);
-  color: var(--on-primary);
+  background: var(--gold-grad);
+  color: var(--on-gold);
+  text-shadow: 0 1px 2px rgba(23, 19, 10, .45);
   /* Inset ring rather than a border so the segment keeps its width when it
      activates and doesn't shift its neighbour. */
   box-shadow: inset 0 0 0 1.5px var(--primary);
@@ -1936,13 +2113,29 @@ img.result, object.result {
   min-height: 48px;
   border: none;
   border-radius: var(--r-md);
-  background: var(--primary);
-  color: var(--on-primary);
+  background: var(--gold-grad);
+  color: var(--on-gold);
   font-size: 14px; font-weight: 700;
+  /* The gradient's bright midpoint is only ~2.4:1 with white, so the label gets
+     a dark halo to hold its edge where it crosses that band. */
+  text-shadow: 0 1px 2px rgba(23, 19, 10, .45);
   box-shadow: var(--shadow-sm);
   transition: background var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
-#generate-btn:hover:not(:disabled) { background: var(--primary-hover); box-shadow: var(--shadow-md); }
+#generate-btn:hover:not(:disabled) { background: var(--gold-grad-h); box-shadow: var(--shadow-md); }
+/* Pressed: the CTA had a hover state and nothing for the click itself, so on a
+   trackpad -- where the pointer is already hovering when you press -- the
+   button gave no answer at all and the run looked like it had not started.
+   Sink it into the rail and deepen the gold for as long as the button is held. */
+#generate-btn:active:not(:disabled) {
+  background: linear-gradient(145deg, var(--gold-700) 0%, var(--gold-600) 42%, var(--gold-800) 100%);
+  box-shadow: inset 0 2px 6px rgba(23, 19, 10, .45);
+  transform: translateY(1px);
+}
+#generate-btn:focus-visible {
+  outline: 2px solid var(--gold-300);
+  outline-offset: 2px;
+}
 
 /* --- dashboard header: title block + search + layout toggle -------------- */
 .studio-main-head { align-items: flex-start; flex-wrap: wrap; }
@@ -1971,8 +2164,19 @@ img.result, object.result {
 .toolbar-btn.icon-only { flex: 0 0 40px; width: 40px; padding: 0; }
 
 /* --- cards --------------------------------------------------------------- */
-.tp-card { background: var(--surface); }
-.tp-size-badge { background: var(--primary); color: var(--on-primary); }
+/* Opaque card. It was translucent with a backdrop blur, which worked over flat
+   tone but not over marble -- the veins read straight through the card and
+   competed with the artwork. The marble is the table; the card sits on it. */
+.tp-card {
+  background: var(--glass-bg);
+  border-color: var(--glass-edge);
+  box-shadow: var(--shadow-sm);
+}
+.tp-size-badge {
+  background: var(--gold-grad);
+  color: var(--on-gold);
+  text-shadow: 0 1px 2px rgba(23, 19, 10, .45);
+}
 .tp-card-caption {
   display: flex; flex-direction: column; gap: 1px;
   padding: var(--sp-3) var(--sp-3) var(--sp-2);
@@ -1990,9 +2194,6 @@ img.result, object.result {
 .tp-card-foot { padding: 0 var(--sp-3) var(--sp-3); gap: var(--sp-2); }
 .tp-card-foot-btn { min-height: 38px; color: var(--fg); }
 .tp-card-foot-btn:hover { background: var(--surface-2); color: var(--fg); border-color: var(--border-strong); }
-/* Spec is the green-outlined action in the mock; Edit stays neutral. */
-.tp-card-foot-btn[data-act="spec"] { border-color: var(--primary); color: var(--primary); }
-.tp-card-foot-btn[data-act="spec"]:hover { background: var(--primary); color: var(--on-primary); border-color: var(--primary); }
 
 /* --- card media: less dead space around the flat -------------------------
    Flats come out around 1.79:1 (front + back side by side), so a 4/5 portrait
@@ -2022,6 +2223,17 @@ img.result, object.result {
 .tp-card-skeleton .tp-card-media { background: var(--surface-2); }
 
 /* --- list layout --------------------------------------------------------- */
+/* Recent/All lives in the dashboard head, beside the grid/list toggle, so the
+   two controls that decide what the grid shows sit together. Matched to the
+   toggle's height rather than the form selects' 32px. */
+.dash-scope { min-height: 34px; font-weight: 600; }
+/* What "Recent" is hiding, said once under the grid (see Gallery.tsx). */
+.tp-gallery-more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: var(--sp-4);
+}
 .tp-gallery.is-list { grid-template-columns: 1fr; }
 .tp-gallery.is-list .tp-card { display: grid; grid-template-columns: 180px 1fr auto; align-items: center; }
 .tp-gallery.is-list .tp-card-media { aspect-ratio: 16 / 9; }
@@ -2073,3 +2285,394 @@ img.result, object.result {
   border: 1px solid var(--canvas-border);
   border-radius: var(--r-sm);
 }
+
+/* ==========================================================================
+   Dark rail + cream dropzones
+   --------------------------------------------------------------------------
+   The left form column becomes a fixed dark brand surface in both themes. It
+   is done by REDEFINING the shell tokens inside `.studio-sidebar` rather than
+   by restyling the ~15 controls it contains -- every child already reads
+   --surface / --fg / --border, so they invert for free and stay in sync with
+   any later change to the base sheet.
+
+   --canvas is deliberately NOT overridden: sketch previews are black strokes
+   on transparency and need their light plate on a dark rail too.
+   ========================================================================== */
+
+.studio-sidebar {
+  --bg:            var(--rail-bg);
+  --surface:       var(--rail-surface);
+  --surface-2:     var(--rail-surface-2);
+  --fg:            var(--rail-fg);
+  --fg-muted:      var(--rail-muted);
+  --fg-subtle:     var(--rail-subtle);
+  --border:        var(--rail-border);
+  --border-strong: var(--rail-border-strong);
+  /* On near-black the brand can afford its bright step, and a bright gold fill
+     wants a dark label (7.7:1) rather than white (2.4:1). */
+  --primary:       var(--gold-500);
+  --primary-hover: var(--gold-300);
+  --on-primary:    #17130A;
+  --accent:        var(--gold-500);
+  --accent-weak:   rgba(212, 169, 74, .14);
+  --accent-text:   var(--gold-300);
+
+  background: var(--rail-bg);
+  color: var(--rail-fg);
+  /* The rail is a child of .app-shell, not of the dashboard column, so it runs
+     the whole height of the window with the top bar beside it. That also means
+     it no longer needs --sidebar-max: nothing sits above it to measure around. */
+  width: var(--sidebar-w);
+  height: 100vh;
+  max-height: 100vh;
+  top: 0;
+  padding: var(--sp-5) var(--sp-4);
+  border-radius: 0;
+}
+/* Both existed to divide two light columns inside .studio-layout. The rail is
+   no longer one of them: the plate now spans the full dashboard column. */
+.studio-layout::before { display: none; }
+/* The plate only ever covered the grid, which starts BELOW the dashboard
+   heading -- so nothing was painted behind the header or the top-right corner.
+   .app-main owns the frosting now and the plate is retired. */
+.studio-layout::after { display: none; }
+.app-main {
+  /* Frosted, not banded: a white base with a few wide, soft grey patches, so the
+     column reads as lit glass rather than as one flat slab or a gradient stripe.
+     The blob colour is a token, so dark mode lifts instead of darkens. */
+  /* Two thin grey layers drifting across the ground on a shallow diagonal. Kept
+     narrow on purpose -- as wide radial blobs they dominated the column; as
+     bands they read as depth behind the cards. Soft stops on both sides so
+     neither has an edge. */
+  background:
+    linear-gradient(196deg,
+      transparent 26%, var(--plate-shade) 33%, var(--plate-shade) 37%, transparent 45%),
+    linear-gradient(196deg,
+      transparent 64%, var(--plate-shade) 71%, var(--plate-shade) 74%, transparent 82%),
+    var(--paper);
+}
+/* On the rail, the mode switch is BLACK until the pointer is on it. The
+   selected segment used to carry a full gold fill at rest, which made a plain
+   two-way switch the loudest object on the sidebar -- louder than the Generate
+   CTA, the one thing on the rail that has earned gold. Gold is the answer to
+   the pointer here, not the resting state: hover and press fill it, selection
+   is said in gold TEXT on the rail's own surface instead. */
+.studio-sidebar .toolbar-btn,
+.studio-sidebar .toolbar-btn.active {
+  background: transparent;
+  color: var(--rail-muted);
+}
+.studio-sidebar .toolbar-btn.active {
+  background: var(--rail-surface-2);
+  color: var(--gold-300);
+  font-weight: 700;
+}
+.studio-sidebar .toolbar-btn:hover,
+.studio-sidebar .toolbar-btn.active:hover {
+  background: var(--gold-500);
+  color: #17130A;
+}
+.studio-sidebar .toolbar-btn:active,
+.studio-sidebar .toolbar-btn.active:active {
+  background: var(--gold-300);
+  color: #17130A;
+}
+.studio-sidebar .studio-footer { background: transparent; }
+/* Output type is one row: label left, pill select right. The base `label` rule
+   is a fixed-width inline-block, which left a dead gap between the two. */
+.output-type-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+}
+.output-type-field label { width: auto; margin: 0; }
+.output-type-field select {
+  min-height: 38px;
+  padding: var(--sp-1) var(--sp-4);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface);
+}
+
+/* --- top bar -------------------------------------------------------------- */
+/* Bleeds into .app-main's side padding so its underline runs the full width of
+   the column, meeting the rail's edge. */
+.app-main { padding: 0 var(--sp-6) var(--sp-10); }
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  margin: 0 calc(var(--sp-6) * -1) var(--sp-5);
+  padding: var(--sp-3) var(--sp-6);
+  border-bottom: 1px solid var(--border);
+  /* Solid white: the header is its own bar, above the field. Left transparent it
+     picked up the warm ground and read as a beige wash across the top. */
+  background: var(--surface);
+}
+.topbar-search {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  /* Sized to its content, not to the row: stretched to the full column it read
+     as a page-wide banner rather than a control. */
+  flex: 0 1 440px;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--fg-subtle);
+}
+.topbar-search:focus-within { border-color: var(--primary); color: var(--fg-muted); }
+.topbar-search input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: none;
+  outline: none;
+  font: inherit;
+  font-size: 13px;
+  color: var(--fg);
+}
+.topbar-search input::placeholder { color: var(--fg-subtle); }
+.topbar-kbd {
+  flex-shrink: 0;
+  padding: 2px var(--sp-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  font-family: var(--font-ui);
+  font-size: 11px;
+  color: var(--fg-subtle);
+}
+.topbar-tools { display: flex; align-items: center; gap: var(--sp-3); flex-shrink: 0; }
+.topbar-sun { color: var(--fg-muted); flex-shrink: 0; }
+
+/* Theme switch: a real ARIA switch, gold when dark mode is on. */
+.topbar-switch {
+  width: 42px;
+  height: 24px;
+  flex-shrink: 0;
+  padding: 3px;
+  border: none;
+  border-radius: 999px;
+  background: var(--zinc-300);
+  cursor: pointer;
+  transition: background var(--dur) var(--ease);
+}
+.topbar-switch.is-on { background: linear-gradient(90deg, var(--gold-700), var(--gold-500)); }
+.topbar-switch-knob {
+  display: block;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: #fff;
+  box-shadow: var(--shadow-sm);
+  transition: transform var(--dur) var(--ease);
+}
+.topbar-switch.is-on .topbar-switch-knob { transform: translateX(18px); }
+
+.topbar-pill {
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.topbar-pill:hover { border-color: var(--border-strong); }
+
+.topbar-account { position: relative; }
+.topbar-account-btn {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  border: none;
+  border-radius: 999px;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.topbar-account-btn:hover { background: var(--surface-2); }
+.topbar-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  border-radius: 999px;
+  background: var(--avatar-bg);
+  color: var(--avatar-fg);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .02em;
+}
+.topbar-account-name { white-space: nowrap; }
+.topbar-menu { position: absolute; top: calc(100% + var(--sp-2)); right: 0; z-index: 30; min-width: 180px; }
+.topbar-menu-meta {
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--fg-subtle);
+}
+.topbar-menu-item {
+  display: block;
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border: none;
+  background: none;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  color: var(--fg);
+  cursor: pointer;
+}
+.topbar-menu-item:hover { background: var(--surface-2); }
+.topbar-menu-item.is-danger { color: var(--danger); }
+.topbar-menu-item.is-danger:hover { background: var(--danger-weak); }
+
+/* --- dashboard heading --------------------------------------------------- */
+.dash-title { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
+/* Count sits under the title, not beside it. */
+.dash-title-text { display: flex; flex-direction: column; gap: 2px; }
+.dash-title-text .studio-note { margin: 0; }
+.dash-title-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 46px;
+  height: 46px;
+  flex-shrink: 0;
+  border-radius: var(--r-lg);
+  background: var(--dropzone-bg-hover);
+  color: var(--gold-700);
+}
+/* Nested badge: a cream plate holding a solid gold chip, the way the mock draws
+   it -- the outer tile is the surface, the inner chip is the icon itself. */
+.dash-title-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--r-md);
+  background: linear-gradient(160deg, var(--gold-600), var(--gold-800));
+  color: #FFF8E8;
+}
+.dash-title-badge svg { width: 19px; height: 19px; }
+.dash-title h2 { font-size: 26px; letter-spacing: -.02em; }
+
+/* --- rail header: brand + collapse --------------------------------------- */
+.rail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding-bottom: var(--sp-4);
+  margin-bottom: var(--sp-4);
+  border-bottom: 1px solid var(--rail-border);
+  flex-shrink: 0;
+}
+.rail-brand { color: var(--rail-fg); }
+.rail-brand .app-brand-mark { color: var(--gold-500); }
+/* The wordmark sits in the UI face, not the Syne display face the rest of the
+   headings use -- in the mock it reads as a plain semibold label beside the
+   mark rather than as a piece of display type. */
+.rail-brand-name {
+  color: var(--rail-fg);
+  font-family: var(--font-ui);
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+.rail-collapse {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  border: 1px solid var(--rail-border);
+  border-radius: var(--r-md);
+  background: var(--rail-surface);
+  color: var(--rail-muted);
+  cursor: pointer;
+  transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+.rail-collapse:hover { color: var(--gold-500); border-color: var(--gold-700); }
+
+/* Collapsed: an icon-width strip. Content is removed from the a11y tree with
+   `display:none`, not just visually hidden -- a collapsed rail should not be
+   tabbable. */
+.studio-sidebar.is-collapsed {
+  width: calc(64px + var(--sp-6));
+  padding-right: var(--sp-3);
+}
+.studio-sidebar.is-collapsed .studio-sidebar-scroll,
+.studio-sidebar.is-collapsed .studio-footer,
+.studio-sidebar.is-collapsed .rail-brand-name { display: none; }
+.studio-sidebar.is-collapsed .rail-head {
+  flex-direction: column;
+  gap: var(--sp-3);
+  border-bottom: none;
+}
+.studio-sidebar.is-collapsed .rail-collapse svg { transform: scaleX(-1); }
+
+/* --- dropzones ------------------------------------------------------------
+   At rest a dropzone matches its surface -- dark inside the rail. The cream
+   plate is the HOVER state: it lights up under the pointer instead of sitting
+   permanently lit, so the eye is drawn to whichever one you are aiming at. */
+.dropzone {
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  color: var(--fg-muted);
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+.dropzone .dropzone-icon { color: var(--primary); }
+/* The reference zone's "+" is a bare svg with no .dropzone-icon wrapper, so it
+   would otherwise inherit the zone's muted body colour. */
+.ref-dropzone > svg { color: var(--primary); }
+.dropzone .dropzone-title { color: var(--fg); }
+.dropzone .dropzone-hint { color: var(--fg-muted); }
+.dropzone .dropzone-shortcut,
+.dropzone .dropzone-formats { color: var(--fg-subtle); }
+/* Short gold rule above the format line, as in the mock. */
+.dropzone .dropzone-formats { position: relative; margin-top: var(--sp-3); }
+.dropzone .dropzone-formats::before {
+  content: "";
+  position: absolute;
+  top: calc(var(--sp-2) * -1);
+  left: 50%;
+  transform: translateX(-50%);
+  width: 28px;
+  height: 1px;
+  background: var(--primary);
+}
+
+.dropzone:hover,
+.dropzone.dragover,
+.ref-dropzone:hover {
+  background: var(--dropzone-bg);
+  border-color: var(--gold-500);
+  color: var(--dropzone-hint);
+}
+.dropzone:hover .dropzone-icon,
+.dropzone.dragover .dropzone-icon,
+.dropzone:hover .dropzone-title,
+.dropzone.dragover .dropzone-title,
+.ref-dropzone:hover .dropzone-icon,
+.ref-dropzone:hover .dropzone-title { color: var(--dropzone-fg); }
+.dropzone:hover .dropzone-hint,
+.dropzone.dragover .dropzone-hint,
+.dropzone:hover .dropzone-shortcut,
+.dropzone.dragover .dropzone-shortcut,
+.dropzone:hover .dropzone-formats,
+.dropzone.dragover .dropzone-formats,
+.ref-dropzone:hover .dropzone-shortcut { color: var(--dropzone-hint); }

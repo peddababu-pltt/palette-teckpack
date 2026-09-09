@@ -18,7 +18,7 @@ import { StageEngine } from "../engine"
 import Sidebar, { type GenerateSubmission } from "./Sidebar"
 import Gallery from "./Gallery"
 import Overlay from "./Overlay"
-import PlatformBar from "./PlatformBar"
+import TopBar from "./TopBar"
 
 // Measures the sticky sidebar's real usable height: it sits ~92px down until
 // the page header scrolls away, so its available height changes as the page
@@ -89,6 +89,9 @@ export default function App(_props: PluginComponentProps) {
   const [useAsSketchUrl, setUseAsSketchUrl] = useState<string | null>(null)
   const [upscaleWarning, setUpscaleWarning] = useState<{ exhausted: boolean } | null>(null)
   const [overlay, setOverlay] = useState<{ jobId: string; tab: OverlayTab } | null>(null)
+  // Owned here so the shell search and the dashboard's own field are one
+  // filter rather than two that disagree.
+  const [search, setSearch] = useState("")
 
   const patchJob = useCallback((jobId: string, patch: (job: Job) => Job) => {
     setJobs((prev) => prev.map((j) => (j.job_id === jobId ? patch(j) : j)))
@@ -201,7 +204,18 @@ export default function App(_props: PluginComponentProps) {
 
   return (
     <div className="app-shell">
+      {/* The rail is a sibling of the main column, not a column inside it, so
+          it runs the full height of the window with the top bar beside it. */}
+      <Sidebar
+        pluginId={pluginId}
+        generating={generating}
+        useAsSketchUrl={useAsSketchUrl}
+        overlayOpen={!!overlay}
+        onGenerate={handleGenerate}
+      />
       <main className="app-main">
+        <TopBar search={search} onSearchChange={setSearch} onDeleteAll={handleDeleteAll} />
+
         {upscaleWarning && (
           <div id="upscale-warning" className="app-banner">
             {upscaleWarning.exhausted ? (
@@ -216,40 +230,12 @@ export default function App(_props: PluginComponentProps) {
           </div>
         )}
 
-        <header className="dash-head">
-          <div className="app-brand">
-            <svg
-              className="app-brand-mark"
-              width="26"
-              height="26"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.8"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden="true"
-            >
-              <path d="M12 2.5 2.5 7 12 11.5 21.5 7 12 2.5z" />
-              <path d="M2.5 12 12 16.5 21.5 12" />
-              <path d="M2.5 17 12 21.5 21.5 17" />
-            </svg>
-            {t("app.brand")}
-          </div>
-          <div className="tp-modal-actions">
-            <PlatformBar />
-            <button type="button" className="btn-reset btn-danger-text" onClick={handleDeleteAll}>
-              {t("app.deleteAll")}
-            </button>
-          </div>
-        </header>
-
         <div className="studio-layout">
-          <Sidebar pluginId={pluginId} generating={generating} useAsSketchUrl={useAsSketchUrl} overlayOpen={!!overlay} onGenerate={handleGenerate} />
           <Gallery
             jobs={jobs}
             generating={generating}
             genPercent={genPercent}
+            search={search}
             onCancelGenerate={handleCancelGenerate}
             onOpenCard={openCard}
             onDeleteJob={handleDeleteJob}

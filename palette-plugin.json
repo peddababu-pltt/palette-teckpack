@@ -2,7 +2,7 @@
   "manifest_version": "1",
   "id": "techpack",
   "name": "Techpack Studio",
-  "version": "1.0.25",
+  "version": "1.1.0",
   "developer": "Your Team",
   "category": "Productivity",
   "tagline": "Photo to sewing-pattern techpack pipeline",
@@ -39,6 +39,7 @@
   "backend": {
     "entry": "./backend/api/main.py"
   },
+  "data_scope": "organization",
   "permissions": [
     "resources:read",
     "resources:write"
