@@ -1,6 +1,6 @@
 [project]
 name = "techpack"
-version = "1.1.7"
+version = "1.1.16"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.129.0",

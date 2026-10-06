@@ -144,9 +144,13 @@ def subprocess_env(ctx: PluginContext) -> dict:
         value = ctx.secret(key, "")
         if value:
             env[key] = value
-    # Hosted: Claude/Gemini calls go through ctx.llm via the loopback bridge
-    # (see llm_bridge.py); the job's runner releases the session when it ends.
-    env.update(llm_bridge.env_for(ctx))
+    # The pipeline runs on after the route returns, and a request's ctx.llm is
+    # request-scoped: called from the bridge minutes later it fails with
+    # `billing_context_missing`. With the app's own provider keys set, the
+    # scripts call Anthropic / Google directly (as under `pltt dev`); the
+    # ctx.llm bridge (llm_bridge.py) is only the fallback when no key is.
+    if not (env.get("ANTHROPIC_API_KEY") and env.get("GOOGLE_AI_API_KEY")):
+        env.update(llm_bridge.env_for(ctx))
     return env
 
 JOB_QUEUES: dict[str, asyncio.Queue] = {}
@@ -382,15 +386,21 @@ async def health() -> Response:
     return Response(content=json.dumps({"ok": True}), media_type="application/json")
 
 
+# Shipped inside backend/ (the repo's node_modules is not part of the hosted
+# bundle, so the worker 500'd there and no pattern PDF could load). Copy it
+# again from node_modules/pdfjs-dist/build/ whenever pdfjs-dist is upgraded --
+# pdf.js refuses a worker from a different version than its own.
+PDF_WORKER_PATHS = (
+    Path(__file__).resolve().parents[1] / "assets" / "pdf.worker.min.mjs",
+    Path(__file__).resolve().parents[2] / "node_modules" / "pdfjs-dist" / "build" / "pdf.worker.min.mjs",
+)
+
+
 @router.get("/assets/pdf.worker.min.mjs")
 async def pdfjs_worker() -> Response:
-    worker_path = (
-        Path(__file__).parent.parent.parent
-        / "node_modules"
-        / "pdfjs-dist"
-        / "build"
-        / "pdf.worker.min.mjs"
-    )
+    worker_path = next((p for p in PDF_WORKER_PATHS if p.is_file()), None)
+    if worker_path is None:
+        return JSONResponse({"error": "pdf.js worker missing"}, status_code=404)
     return FileResponse(str(worker_path), media_type="application/javascript")
 
 
@@ -961,6 +971,53 @@ async def stage5(
         subprocess_env(ctx),
     ))
     return Response(content=json.dumps({"ok": True}), media_type="application/json")
+
+
+DATA_ROOM_NAME = "Techpack"
+
+
+@router.post("/jobs/{job_id}/save-to-dataroom", dependencies=[require_permission("data_rooms:write")])
+async def save_to_dataroom(job_id: str, ctx: PluginContext = Depends(get_plugin_context)) -> Response:
+    """Copies the job's big deliverables -- the pattern pages PDF and the 3D
+    garment -- into the organisation's "Techpack" Data Room, one folder per job,
+    where users find them as documents and they outlive the job folder on the
+    hosted machine's local disk. The frontend calls it right after a pattern
+    draft or a 3D build finishes: this needs a live request's ctx (a background
+    stage's would be gone by then). Files already there are left alone, and a
+    runtime without the Data Room service (pltt dev) just reports skipped."""
+    paths = job_paths(job_id)
+    if not paths["dir"].is_dir():
+        return JSONResponse({"error": "unknown job_id"}, status_code=404)
+    rooms = getattr(ctx, "data_rooms", None)
+    design = {}
+    try:
+        design = json.loads(paths["pattern_design"].read_text())
+    except (OSError, ValueError):
+        pass
+    files = []
+    if paths["pattern_pages_pdf"].is_file():
+        files.append((f"pattern-{design.get('size') or 'M'}.pdf", paths["pattern_pages_pdf"], "application/pdf"))
+    glb = paths["dir"] / "garment3d.glb"
+    if glb.is_file():
+        files.append(("garment3d.glb", glb, "model/gltf-binary"))
+    if not files:
+        return JSONResponse({"ok": True, "saved": [], "note": "nothing to save yet"})
+    try:
+        cls = json.loads(paths["classification"].read_text()) if paths["classification"].is_file() else {}
+        label = cls.get("subcategory") or cls.get("category") or "techpack"
+        room = await rooms.ensure_room(DATA_ROOM_NAME, "Sewing patterns and 3D garments from Techpack Studio")
+        folder = await rooms.resolve_folder_path(room["id"], f"{label} · {job_id}", create=True)
+        folder_id = folder["id"] if folder else None
+        saved, kept = [], []
+        for name, path, mime in files:
+            if await rooms.find_file_by_name(room["id"], name, folder_id=folder_id):
+                kept.append(name)
+                continue
+            await rooms.upload_file(room["id"], name, path.read_bytes(), folder_id=folder_id, content_type=mime)
+            saved.append(name)
+    except Exception as exc:  # no Data Room service locally, or the platform refused
+        return JSONResponse({"ok": False, "skipped": True, "reason": str(exc)[:300]})
+    return JSONResponse({"ok": True, "room": DATA_ROOM_NAME, "saved": saved, "already_there": kept})
 
 
 @router.post("/jobs/{job_id}/garment3d", dependencies=[require_permission("resources:write")])

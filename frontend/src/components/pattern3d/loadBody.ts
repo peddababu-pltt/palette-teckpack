@@ -3,7 +3,7 @@
 // built-in sized mannequin when that file isn't installed.
 import * as THREE from "three"
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js"
-import { fetchBinary } from "../../api"
+import { assetUrlFrom, fetchBinary } from "../../api"
 import { buildProceduralMannequin, fitModel, proceduralBody, type Fit } from "./body"
 
 // fetched once per session: it's the same for every job
@@ -31,5 +31,5 @@ export async function loadBody(modelUrl: string, cm: Record<string, number>, des
 
 /** `.../jobs/<id>/file/...` -> `.../assets/mannequin.glb` (same origin + prefix). */
 export function modelUrlFrom(jobFileUrl: string): string {
-  return jobFileUrl.replace(/\/jobs\/[^?]*/, "/assets/mannequin.glb").replace(/\?.*$/, "")
+  return assetUrlFrom(jobFileUrl, "mannequin.glb")
 }

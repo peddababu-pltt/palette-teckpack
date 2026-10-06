@@ -15,6 +15,7 @@ import {
   cancelJobApi,
   makeLogProgress,
   startStage4,
+  saveToDataRoom,
   startStage5,
   watchJob,
   type Job,
@@ -165,6 +166,8 @@ export class StageEngine {
                 ...(payload.pieces_file ? { pattern_pieces: payload.pieces_file } : {}),
               },
             }))
+            // the pattern pages PDF also goes into the org's Data Room
+            if (kind === "pattern") void saveToDataRoom(this.pluginId, job.job_id)
           }
           this.emit()
           resolve()

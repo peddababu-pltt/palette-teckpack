@@ -243,7 +243,18 @@ async def dispatch(method: str, path: str, body: bytes) -> tuple[int, dict]:
     except (ValueError, TypeError) as exc:
         return 400, _error(provider, 400, f"bridge could not translate the request: {exc}")
     try:
-        reply = await llm.chat(messages, fallback=False, **opts)
+        try:
+            reply = await llm.chat(messages, fallback=False, **opts)
+        except Exception as exc:
+            # The exact model first; when the platform won't run it (a workspace
+            # security policy that pins one model -- "this workspace's security
+            # policy runs gpt-5.5; 'claude-sonnet-4-6' was not run" -- or a
+            # provider the platform has no key for), let it substitute the model
+            # it will run rather than failing the whole pipeline step. Budget
+            # refusals are not retried: a substitute would be refused the same.
+            if not _is_platform_refusal(exc) or getattr(exc, "reason", None) == "billing_disabled":
+                raise
+            reply = await llm.chat(messages, fallback=True, **opts)
     except Exception as exc:
         status = 400 if _is_platform_refusal(exc) else 502
         return status, _error(provider, status, f"Palette ctx.llm: {exc}")

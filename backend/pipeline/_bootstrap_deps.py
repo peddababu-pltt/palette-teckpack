@@ -32,7 +32,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-_VENDOR_DIR = Path(__file__).resolve().parent / "_vendor"
+# Hosted, the plugin's own folder is the one writable place it has. Locally
+# (a git checkout) the same installs go outside backend/: `pltt` bundles every
+# file under backend/, and a vendored scipy + OpenCV there put the backend
+# bundle past its size limit.
+_PIPELINE_DIR = Path(__file__).resolve().parent
+_REPO_DIR = _PIPELINE_DIR.parents[1]
+_VENDOR_DIR = (
+    _REPO_DIR / ".palette" / "py-vendor" if (_REPO_DIR / ".git").exists() else _PIPELINE_DIR / "_vendor"
+)
 _PIP_READY = _VENDOR_DIR / ".pip-ready"
 
 if str(_VENDOR_DIR) not in sys.path:

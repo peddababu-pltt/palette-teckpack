@@ -2,7 +2,7 @@
 // github.com/Qingcsai/3DVirtualTryOn by scripts/extract-vton-assets.py): a scanned
 // body and T-shirt / trouser scans already aligned to it.
 import * as THREE from "three"
-import { fetchBinary, fetchJson } from "../api"
+import { assetUrlFrom, fetchBinary, fetchJson } from "../api"
 
 export type ScanKind = "body" | "top" | "bottom"
 
@@ -28,21 +28,23 @@ interface Manifest {
   meshes: ScanMeta[]
 }
 
-/** `.../jobs/<id>/file/...` -> `.../assets/vton/` (same origin + prefix). */
-export function vtonBaseFrom(jobFileUrl: string): string {
-  return jobFileUrl.replace(/\/jobs\/[^?]*/, "/assets/vton/").replace(/\?.*$/, "")
+/** Where each try-on asset is served: `.../jobs/<id>/file/...` -> `.../assets/vton/<name>`. */
+export type VtonUrl = (name: string) => string
+
+export function vtonBaseFrom(jobFileUrl: string): VtonUrl {
+  return (name) => assetUrlFrom(jobFileUrl, `vton/${name}`)
 }
 
 // the assets never change: fetched once per session and shared by every job
 let manifest: Promise<Manifest | null> | null = null
 const meshes = new Map<string, Promise<ScanMesh>>()
 
-export function loadManifest(base: string): Promise<Manifest | null> {
-  manifest ??= fetchJson<Manifest>(base + "manifest.json")
+export function loadManifest(base: VtonUrl): Promise<Manifest | null> {
+  manifest ??= fetchJson<Manifest>(base("manifest.json"))
   return manifest
 }
 
-export function loadScan(base: string, meta: ScanMeta): Promise<ScanMesh> {
+export function loadScan(base: VtonUrl, meta: ScanMeta): Promise<ScanMesh> {
   let p = meshes.get(meta.name)
   if (!p) {
     p = readScan(base, meta)
@@ -52,8 +54,8 @@ export function loadScan(base: string, meta: ScanMeta): Promise<ScanMesh> {
   return p
 }
 
-async function readScan(base: string, meta: ScanMeta): Promise<ScanMesh> {
-  const [bin, jpg] = await Promise.all([fetchBinary(`${base}${meta.name}.bin`), fetchBinary(`${base}${meta.name}.jpg`)])
+async function readScan(base: VtonUrl, meta: ScanMeta): Promise<ScanMesh> {
+  const [bin, jpg] = await Promise.all([fetchBinary(base(`${meta.name}.bin`)), fetchBinary(base(`${meta.name}.jpg`))])
   const head = new Uint32Array(bin, 0, 2)
   const nv = head[0], ni = head[1]
   const pos = new Float32Array(bin, 8, nv * 3)

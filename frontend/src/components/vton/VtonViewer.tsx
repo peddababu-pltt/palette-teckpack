@@ -5,7 +5,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { usePluginTranslations } from "@palettelab/sdk"
 import { STRINGS } from "../../strings"
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js"
-import { fetchBinary, fetchJson, resolveUrl, startGarment3D, watchJob, withCacheBust, type Job, type PatternDesign, type PatternPieces3D } from "../../api"
+import { fetchBinary, fetchJson, resolveUrl, saveToDataRoom, startGarment3D, watchJob, withCacheBust, type Job, type PatternDesign, type PatternPieces3D } from "../../api"
 import { loadManifest, loadScan, vtonBaseFrom, type ScanMesh } from "../../vton/assets"
 import { BOTTOM_VARIANTS, TOP_VARIANTS, planFromPattern, type TryOnPlan } from "../../vton/plan"
 import { VtonScene, type Look } from "../../vton/VtonScene"
@@ -294,7 +294,10 @@ export default function VtonViewer({ job, pluginId, onClose, measurePanel, liveC
         if (m) setGen((g) => ({ ...g, pct: +m[1], msg: m[2] }))
         else if (/garment3d:/.test(l)) setGen((g) => ({ ...g, msg: l.replace(/^.*garment3d:\s*/, "") }))
       },
-      onDone: () => { setGen({ busy: false, pct: 100, msg: "", err: false, confirm: false }); setUseGen(true); setGenStamp(Date.now() / 1000) },
+      onDone: () => {
+        setGen({ busy: false, pct: 100, msg: "", err: false, confirm: false }); setUseGen(true); setGenStamp(Date.now() / 1000)
+        void saveToDataRoom(pluginId, job.job_id) // the 3D garment goes into the org's Data Room too
+      },
       onError: (msg) => setGen((g) => ({ ...g, busy: false, msg: g.msg ? `${msg} — ${g.msg}` : msg, err: true })),
       onCancelled: () => setGen({ busy: false, pct: 0, msg: "", err: false, confirm: false }),
     }, "garment3d")

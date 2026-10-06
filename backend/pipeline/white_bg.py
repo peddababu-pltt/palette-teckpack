@@ -13,6 +13,11 @@ background in from the image border and paints it pure white:
     background to the garment's edge is sharper than the gradient;
   * it only starts from border pixels that are light and nearly colourless,
     so a garment cropped by the frame is never a seed;
+  * and it only ever ENTERS pixels that are light and nearly colourless too.
+    The step test alone let it walk into pale fabric (light blue, cream) that
+    fades out softly toward the background: on a pale-blue shirt it bleached
+    whole body panels white, leaving the fabric's darker texture as speckles.
+    Tinted fabric is now a wall however gentle its edge;
   * the mask edge is feathered by a pixel so the garment doesn't get a hard
     jagged outline against the new white.
 
@@ -20,31 +25,43 @@ Usage:  python3 white_bg.py image.png [out.png]     (in place without out)
 """
 import sys
 
-import cv2
-import numpy as np
-from PIL import Image
+from _bootstrap_deps import ensure
+
+# the hosted runtime's shared venv has no OpenCV: install the pinned build
+# (same pin as pyproject.toml) on first use -- see _bootstrap_deps.py
+ensure(modules=["cv2"], packages=["opencv-python-headless==4.14.0.94"])
+import cv2  # noqa: E402
+import numpy as np  # noqa: E402
+from PIL import Image  # noqa: E402
 
 STEP = 3          # max per-pixel difference the flood crosses (gradient, not edges)
 SEED_MIN = 225    # border pixel must be at least this light to start a flood
 SEED_CHROMA = 18  # ...and this close to grey (max channel spread)
+BG_MIN = 205      # the flood never enters a pixel darker than this (floor shadow is ~215+)
+BG_CHROMA = 10    # ...or one more coloured than this (pale-blue fabric is 20+)
 
 
 def whiten_background(rgb: np.ndarray) -> np.ndarray:
     h, w = rgb.shape[:2]
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     mask = np.zeros((h + 2, w + 2), np.uint8)
+    # floodFill never fills where the mask is already non-zero: mark every pixel
+    # that does not look like background (1), then fill the rest from the border
+    px = rgb.astype(np.int16)
+    looks_bg = (px.min(2) >= BG_MIN) & (px.max(2) - px.min(2) <= BG_CHROMA)
+    mask[1:-1, 1:-1][~looks_bg] = 1
     flags = 4 | cv2.FLOODFILL_MASK_ONLY | (255 << 8)  # floating range (neighbour-relative)
     lo = up = (STEP, STEP, STEP)
     border = [(x, 0) for x in range(0, w, 4)] + [(x, h - 1) for x in range(0, w, 4)] + \
              [(0, y) for y in range(0, h, 4)] + [(w - 1, y) for y in range(0, h, 4)]
     for x, y in border:
-        if mask[y + 1, x + 1]:
+        if mask[y + 1, x + 1]:   # already filled, or not background-like
             continue
         px = rgb[y, x].astype(int)
         if px.min() < SEED_MIN or px.max() - px.min() > SEED_CHROMA:
             continue
         cv2.floodFill(bgr, mask, (x, y), (0, 0, 0), lo, up, flags)
-    bg = mask[1:-1, 1:-1] > 0
+    bg = mask[1:-1, 1:-1] == 255
     if not bg.any():
         return rgb
     # feather: 1px soft edge between the garment and the new white

@@ -1816,6 +1816,7 @@ def main(in_png, labels_npy, groups_json, out_svg):
     # traced version of whatever part of it the inked layer does not cover.
     ring_full = {}
     boundary_paths = {}
+    outline_paths = {}   # part name -> its region's silhouette (standalone export)
 
     for nm, p in cfg["parts"].items():
         reg = part_regs[nm]
@@ -2421,6 +2422,14 @@ def main(in_png, labels_npy, groups_json, out_svg):
                 print(f"  [{nm}] complete-boundary copy "
                       f"({int(missing.sum())}px not in the inked layer)")
         boundary_paths[nm] = bpaths
+        # The piece's own silhouette, for the standalone export's outline
+        # (see _with_outline in EXPORT_PARTS): the drawn ring is only as even
+        # as the sketch, so a cuff whose sleeve-side edge is a hairline seam,
+        # with notches where neighbouring strokes end, came out of the export
+        # thin on one side and open at the corners.
+        if reg.any():
+            canvas_o, oscale = thin_canvas(reg, dil, 0.0)
+            outline_paths[nm] = scale_paths(trace(canvas_o, ss_of(oscale)), oscale)
         layers.append((zkey(nm), nm, paths, guide_paths))
         print(f"  [{nm}] {len(paths)} paths")
 
@@ -2705,6 +2714,21 @@ def main(in_png, labels_npy, groups_json, out_svg):
             return re.sub(r'(<path class="component-boundary"[^>]*?fill=")none(")',
                           r'\g<1>#000000\g<2>', svg_fragment)
 
+        # Every extracted piece gets one even, closed black outline on all
+        # sides: its region's silhouette stroked at the sketch's own outline
+        # weight, centred on the region edge (half over the drawn line, half
+        # just inside). Only in the standalone crop -- in the composed drawing
+        # each neighbour would stroke the shared seam again.
+        outline_w = max(3.0, 1.5 * float(outline_px))
+
+        def _with_outline(nm: str, svg_fragment: str) -> str:
+            if not outline_paths.get(nm) or os.environ.get("PART_OUTLINE", "1") != "1":
+                return svg_fragment
+            d = " ".join(bake(d_, tr) for d_, tr in outline_paths[nm])
+            stroke = (f'<path class="part-outline" d="{d}" fill="none" stroke="#000000" '
+                      f'stroke-width="{outline_w:.1f}" stroke-linejoin="round"/>')
+            return svg_fragment.replace("</g>", stroke + "</g>", 1)
+
         for nm, g in groups.items():
             if nm.startswith(("stitch_", "button_", "text_")):
                 continue
@@ -2717,7 +2741,7 @@ def main(in_png, labels_npy, groups_json, out_svg):
             # hiding this piece's own surface detail.
             extra_g = "".join(groups[m] for m in owned_marks.get(nm, [])
                                if m in groups)
-            svg2png(svg_bytes=(head + _visible_boundary(g) + extra_g + "</svg>").encode(),
+            svg2png(svg_bytes=(head + _with_outline(nm, _visible_boundary(g)) + extra_g + "</svg>").encode(),
                     write_to=os.path.join(pdir, nm + ".png"),
                     output_width=min(W, 1600))
         svg2png(svg_path=out_svg,

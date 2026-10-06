@@ -2915,3 +2915,13 @@ img.result, object.result {
   color: var(--fg);
   font-variant-numeric: tabular-nums;
 }
+
+/* --- equal-height dashboard cards ---------------------------------------- */
+/* A job without a classification has no sub-line, and the empty span collapsed
+   to nothing -- that card came out a line shorter than its neighbours. Keep the
+   line's height either way, stretch every card in a row to the same height and
+   pin the buttons to the bottom. The list view keeps its own row layout. */
+.tp-gallery:not(.is-list) { align-items: stretch; }
+.tp-gallery:not(.is-list) .tp-card { display: flex; flex-direction: column; }
+.tp-gallery:not(.is-list) .tp-card-foot { margin-top: auto; }
+.tp-card-sub { min-height: 1.35em; line-height: 1.35; }

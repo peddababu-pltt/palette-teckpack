@@ -11,6 +11,7 @@ __pycache__/
 *.pyc
 .ruff_cache/
 .palette/test-venv/
+.palette/py-vendor/
 .palette/dev/
 .palette/last-publish.json
 backend/pipeline/_vendor/

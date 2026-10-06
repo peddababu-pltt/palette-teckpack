@@ -290,6 +290,17 @@ export function resolveUrl(u: string | null | undefined): string | null {
 // pattern-pages.pdf and parts.svg (+ its part PNGs) are overwritten in place
 // on every (re)trace, so their URL never changes and the browser happily
 // serves a stale cached copy. Cache-bust with the job's mtime.
+/** A backend asset next to a job file: `.../jobs/<id>/file/x?v=..&preview_token=..`
+ *  -> `.../assets/<path>?preview_token=..`. Keeps the query (a hosted preview
+ *  authorises every request with its token; without it the asset is refused and
+ *  the 3D try-on fell back to its stand-in body), drops the job's cache-bust. */
+export function assetUrlFrom(jobFileUrl: string, assetPath: string): string {
+  const u = new URL(jobFileUrl, window.location.href)
+  u.pathname = u.pathname.replace(/\/jobs\/.*$/, `/assets/${assetPath}`)
+  u.searchParams.delete("v")
+  return u.href
+}
+
 export function withCacheBust(url: string | null, mtime: number | null | undefined): string | null {
   if (!url) return null
   const v = Math.round((mtime || 0) * 1000)
@@ -571,6 +582,18 @@ export async function startStage5(
     return await res.json()
   } catch (err: any) {
     return { error: err?.message || String(err) }
+  }
+}
+
+/** Copies the job's pattern PDF and 3D garment into the org's "Techpack" Data
+ *  Room (backend save_to_dataroom). Best effort: never throws. */
+export async function saveToDataRoom(pluginId: string, jobId: string): Promise<void> {
+  try {
+    const res = await apiCall(`${jobsBase(pluginId)}/${jobId}/save-to-dataroom`, { method: "POST" })
+    const out = await res.json()
+    if (out?.skipped || out?.error) console.info("[techpack] Data Room copy skipped:", out.reason || out.error)
+  } catch (err) {
+    console.info("[techpack] Data Room copy skipped:", err)
   }
 }
 

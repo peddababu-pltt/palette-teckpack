@@ -2,7 +2,7 @@
   "manifest_version": "1",
   "id": "techpack",
   "name": "Techpack Studio",
-  "version": "1.1.7",
+  "version": "1.1.16",
   "developer": "Your Team",
   "category": "Productivity",
   "tagline": "Photo to sewing-pattern techpack pipeline",
@@ -28,7 +28,9 @@
     "file_uploads": true,
     "external_network": [
       "router-api.pltt.ai",
-      "three.ws"
+      "three.ws",
+      "api.anthropic.com",
+      "generativelanguage.googleapis.com"
     ]
   },
   "frontend": {
@@ -41,7 +43,9 @@
   "data_scope": "organization",
   "permissions": [
     "resources:read",
-    "resources:write"
+    "resources:write",
+    "data_rooms:read",
+    "data_rooms:write"
   ],
   "public_routes": [
     "/health",

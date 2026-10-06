@@ -125,7 +125,12 @@ export default function PdfViewer({
       // Derive worker URL from the pdf URL so it works in local dev, staging,
       // and preview environments without needing a separate pluginId prop.
       // url = "http://host/<prefix>/jobs/<id>/file/pattern-pages.pdf"
-      pdfjsLib.GlobalWorkerOptions.workerSrc = url.replace(/\/jobs\/.*$/, "/assets/pdf.worker.min.mjs")
+      // Keep the query string: a hosted preview authorises every request with
+      // its ?preview_token=..., and the worker URL without it was refused (401).
+      const workerUrl = new URL(url, window.location.href)
+      workerUrl.pathname = workerUrl.pathname.replace(/\/jobs\/.*$/, "/assets/pdf.worker.min.mjs")
+      workerUrl.searchParams.delete("v")
+      pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl.href
       const data = await fetchBinary(url)
       if (destroyed) return
       doc = await pdfjsLib.getDocument({ data: new Uint8Array(data) }).promise
