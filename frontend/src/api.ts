@@ -119,6 +119,7 @@ export interface JobOutputs {
   pattern_svg: string | null
   pattern_pages: string | null
   design: string | null
+  pattern_pieces?: string | null
   measurements: string | null
   redraw: string | null
 }
@@ -154,7 +155,23 @@ export interface Job {
   outputs: JobOutputs
 }
 
+export interface PatternMeasurement {
+  key: string
+  label: string
+  how: string
+  cm: number | null
+  overridden: boolean
+}
+
 export interface PatternDesign {
+  design?: string
+  designKey?: string
+  custom?: boolean
+  size?: string
+  sizes?: string[]
+  measurements?: PatternMeasurement[]
+  sizeTable?: Record<string, Record<string, number | null>>
+  extraPieces?: string[]
   fit?: string
   closure?: string
   buttonCount?: number
@@ -163,6 +180,26 @@ export interface PatternDesign {
   neckline?: string
   sleeveLength?: string
   [key: string]: unknown
+}
+
+// pattern-pieces.json: one transparent PNG per cut piece, for the 3D preview.
+export interface PatternPiece3D {
+  suffix: string
+  file: string // relative to the job dir
+  wMm: number
+  hMm: number
+  // the cutline's box inside the texture, mm from its top-left
+  cutMm: { x: number; y: number; w: number; h: number }
+  onFold: boolean
+  extra: boolean
+  // AI read of the piece (backend piece-placement.mjs); absent when unavailable
+  place?: { role: string; centreEdge: "left" | "right" | "none"; sewnOn: string }
+}
+
+export interface PatternPieces3D {
+  dir: string
+  garment?: { region: "upper" | "lower" | "full" } | null
+  pieces: PatternPiece3D[]
 }
 
 export interface PartInfo {
@@ -357,6 +394,48 @@ async function apiCall(path: string, init?: RequestInit): Promise<Response> {
 
 // ---------------- REST calls ----------------
 
+/** Is the high-quality (Blender) garment simulation available on this server? */
+export async function simulateAvailable(pluginId: string): Promise<boolean> {
+  try {
+    const res = await fetchWithRefresh(withPreviewQuery(`${base(pluginId)}/simulate/available`), { credentials: credentialsMode() })
+    return res.ok && !!(await res.json()).available
+  } catch {
+    return false
+  }
+}
+
+/** Queue a Blender simulation of the assembled garment (progress: watchJob(..., "simulate")). */
+export async function startBlenderSim(pluginId: string, jobId: string, payload: unknown): Promise<{ status?: string; error?: string }> {
+  const fd = new FormData()
+  fd.append("payload", new Blob([JSON.stringify(payload)], { type: "application/json" }), "garment-sim-input.json")
+  try {
+    const res = await fetchWithRefresh(withPreviewQuery(`${jobsBase(pluginId)}/${jobId}/simulate`), {
+      method: "POST", body: fd, credentials: credentialsMode(),
+    })
+    return await res.json()
+  } catch (err: any) {
+    return { error: err?.message || String(err) }
+  }
+}
+
+/** Upload an image of sewing-pattern pieces: segmented + classified into a new job. */
+export async function uploadPatternImage(
+  pluginId: string, file: File, longestCm: number, size: string,
+): Promise<{ job_id?: string; error?: string }> {
+  const fd = new FormData()
+  fd.append("image", file, file.name || "pattern.png")
+  fd.append("longest_cm", String(longestCm))
+  fd.append("size", size)
+  try {
+    const res = await fetchWithRefresh(withPreviewQuery(`${base(pluginId)}/jobs/pattern-image`), {
+      method: "POST", body: fd, credentials: credentialsMode(),
+    })
+    return await res.json()
+  } catch (err: any) {
+    return { error: err?.message || String(err) }
+  }
+}
+
 export async function analyzeImage(pluginId: string, file: File): Promise<AnalyzeResponse> {
   const fd = new FormData()
   fd.append("image", file, file.name || "upload.png")
@@ -453,9 +532,42 @@ export async function startStage4(pluginId: string, jobId: string): Promise<{ ok
   }
 }
 
-export async function startStage5(pluginId: string, jobId: string): Promise<{ ok?: boolean; error?: string }> {
+// Size + measurement overrides from the pattern tab's editor; omitted for a plain
+// (auto) draft, which then keeps whatever the job was created with.
+export interface PatternParams {
+  size: string
+  measurements: Record<string, number>
+}
+
+/** Real 3D garment for the try-on (backend garment3d.py): the sketch made
+ *  photoreal and reconstructed by three.ws. Watch with stage "garment3d". */
+/** `region` "upper" shoots the garment in a T-pose (the try-on raises the arms to it). */
+export async function startGarment3D(pluginId: string, jobId: string, colour: string, desc: string, region: "upper" | "lower" = "upper"): Promise<{ ok?: boolean; error?: string }> {
+  const body = new FormData()
+  body.append("colour", colour)
+  body.append("desc", desc)
+  body.append("region", region)
   try {
-    const res = await apiCall(`${jobsBase(pluginId)}/${jobId}/stage5`, { method: "POST" })
+    const res = await apiCall(`${jobsBase(pluginId)}/${jobId}/garment3d`, { method: "POST", body })
+    return await res.json()
+  } catch (err: any) {
+    return { error: err?.message || String(err) }
+  }
+}
+
+export async function startStage5(
+  pluginId: string,
+  jobId: string,
+  params?: PatternParams,
+): Promise<{ ok?: boolean; error?: string }> {
+  let body: FormData | undefined
+  if (params) {
+    body = new FormData()
+    body.append("size", params.size)
+    body.append("measurements", JSON.stringify(params.measurements))
+  }
+  try {
+    const res = await apiCall(`${jobsBase(pluginId)}/${jobId}/stage5`, { method: "POST", body })
     return await res.json()
   } catch (err: any) {
     return { error: err?.message || String(err) }
@@ -494,9 +606,12 @@ export async function getParts(pluginId: string, jobId: string, bust?: number): 
 
 // Fetch a backend-hosted JSON file (pattern-design.json, measurements.json)
 // given its resolved absolute URL.
+// Job files are rewritten in place by redrafts while their ?v= stays the job's
+// sketch time, so always revalidate (a 304 when unchanged) -- never trust a
+// copy the browser cached on its own before the server sent Cache-Control.
 export async function fetchJson<T>(absUrl: string): Promise<T | null> {
   try {
-    const res = await fetchWithRefresh(absUrl, { credentials: credentialsMode() })
+    const res = await fetchWithRefresh(absUrl, { credentials: credentialsMode(), cache: "no-cache" })
     if (!res.ok) return null
     return (await res.json()) as T
   } catch {
@@ -510,7 +625,7 @@ export async function fetchJson<T>(absUrl: string): Promise<T | null> {
 // (staging/production) never gets attached to it and every load 401s
 // regardless of the auth handling everywhere else in this file.
 export async function fetchBinary(absUrl: string): Promise<ArrayBuffer> {
-  const res = await fetchWithRefresh(absUrl, { credentials: credentialsMode() })
+  const res = await fetchWithRefresh(absUrl, { credentials: credentialsMode(), cache: "no-cache" })
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
   return res.arrayBuffer()
 }

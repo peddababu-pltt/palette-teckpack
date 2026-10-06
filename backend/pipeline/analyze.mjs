@@ -2,10 +2,11 @@
 import fs from 'fs'
 import path from 'path'
 import { GoogleGenAI } from '@google/genai'
+import { CATALOGUE_HINT, validCatalogueMatch } from './catalogue.mjs'
 
 const SCHEMA_HINT = `Respond with ONLY a raw JSON object, no prose, no markdown fences:
 {
-  "garmentCategory": "tshirt | tanktop | corset_top | wrap_top | draped_top | buttonup_shirt | trousers | cycling_breeches | shorts | shorts_cargo | skirt_pencil | skirt_circle | skirt | jumpsuit | overalls | underwear | briefs | bomber_jacket | denim_jacket | jacket | coat | vest | blazer | cardigan | hoodie_zip | hoodie_pullover | hoodie_wrap | hoodie | sweater | sweatshirt | bikini_top | one_piece_swimsuit | leggings_capri | leggings_full | leggings | onesie | apron | bowtie | unsupported"  <- pick the closest real garment type by CONSTRUCTION, checked in this order:\n  UPPER BODY, sleeved/sleeveless tops: "tanktop" = basic sleeveless tee. "corset_top" = fitted cropped top/bodice with front lacing/lace-up grommets and a peplum hem. "wrap_top" = front closes with one panel crossing over the other, a diagonal overlap seam visible down the front. "draped_top" = soft cowl/draped fold gathered at the neckline (not a flat crew/scoop). "tshirt" = plain crew or scoop neckline, no lacing/wrap/drape/buttons, the default upper-body fallback. "buttonup_shirt" = woven collar (point or spread) with a full button-down front placket.\n  JACKETS/OUTERWEAR: "bomber_jacket" = ribbed knit collar/cuffs/waist-hem band (contrast or self-color), snap- or zip-front, welt/patch hip pockets, no woven lapel — quilted/puffer fill counts here too. "denim_jacket" = trucker-style: front yoke seam across the chest, two chest button-flap pockets, sits at waist with a banded hem, denim or twill fabric. "vest" = sleeveless, tailored, front button closure, worn over a shirt (waistcoat). "jacket"/"coat"/"blazer"/"cardigan" = tailored woven construction with a notch or roll lapel collar, welt/flap pockets, front button or double-breasted closure, woolen or structured fabric — "coat" only if it clearly extends to the knee or below, otherwise "jacket"/"blazer"/"cardigan".\n  HOODIES/SWEATERS: "hoodie_zip" = hood + a full front zipper. "hoodie_pullover" = hood, no front opening, raglan/diagonal shoulder-to-underarm seam, drawstring hood, kangaroo pocket. "hoodie_wrap" = hood, asymmetric drape-front closing with a single button/toggle off to one side, no separate front/back symmetry. "hoodie" = has a hood but fits none of the above (fitted, no kangaroo pocket) — the default hoodie fallback. "sweatshirt"/"sweater" = crew neckline, ribbed cuffs/hem, no hood.\n  BOTTOMS: "trousers" = full-length flat-front or pleated pants. "cycling_breeches" = puffy/bloused through the thigh, gathered into a band just below the knee. "shorts_cargo" = wide waistband, large patch pockets on the leg, no fly. "shorts" = above/at-knee length with a separate waistband seam and typically a fly (denim shorts, casual shorts) — default shorts fallback. "skirt_pencil" = straight/fitted skirt, narrow silhouette. "skirt_circle" = very full flared skirt that would lie flat as a circle. "skirt" = any other skirt silhouette (A-line etc), the default skirt fallback. "jumpsuit"/"overalls" = one-piece combining a top and full-length trousers.\n  UNDERWEAR/SWIM: "underwear" = snug men\'s boxer-briefs with a leg gusset/crotch seam and NO distinct waistband panel. "briefs" = women\'s hip-hugging brief/panty cut, no leg extension. "bikini_top" = triangle/halter bikini top with ties. "one_piece_swimsuit" = full-coverage one-piece, may have a front zip and built-in leg/sleeve ribbing.\n  LEGGINGS: "leggings_capri" = ends mid-calf. "leggings_full" = ends at the ankle.\n  OTHER: "onesie" = short/long-sleeve snap-front baby bodysuit/romper. "apron" = front panel with a large patch pocket and neck+waist ties/straps, open back. "bowtie" = a bow tie. Use "unsupported" only if it\'s not a garment at all,
+  "garmentCategory": "tshirt | tanktop | corset_top | wrap_top | draped_top | buttonup_shirt | trousers | cycling_breeches | shorts | shorts_cargo | skirt_pencil | skirt_circle | skirt | jumpsuit | overalls | underwear | briefs | bomber_jacket | denim_jacket | jacket | coat | vest | blazer | cardigan | hoodie_zip | hoodie_pullover | hoodie_wrap | hoodie | sweater | sweatshirt | bikini_top | one_piece_swimsuit | leggings_capri | leggings_full | leggings | onesie | apron | bowtie | other | unsupported"  <- pick the closest real garment type by CONSTRUCTION, checked in this order:\n  UPPER BODY, sleeved/sleeveless tops: "tanktop" = basic sleeveless tee. "corset_top" = fitted cropped top/bodice with front lacing/lace-up grommets and a peplum hem. "wrap_top" = front closes with one panel crossing over the other, a diagonal overlap seam visible down the front. "draped_top" = soft cowl/draped fold gathered at the neckline (not a flat crew/scoop). "tshirt" = plain crew or scoop neckline, no lacing/wrap/drape/buttons, the default upper-body fallback. "buttonup_shirt" = woven collar (point or spread) with a full button-down front placket.\n  JACKETS/OUTERWEAR: "bomber_jacket" = ribbed knit collar/cuffs/waist-hem band (contrast or self-color), snap- or zip-front, welt/patch hip pockets, no woven lapel — quilted/puffer fill counts here too. "denim_jacket" = trucker-style: front yoke seam across the chest, two chest button-flap pockets, sits at waist with a banded hem, denim or twill fabric. "vest" = sleeveless, tailored, front button closure, worn over a shirt (waistcoat). "jacket"/"coat"/"blazer"/"cardigan" = tailored woven construction with a notch or roll lapel collar, welt/flap pockets, front button or double-breasted closure, woolen or structured fabric — "coat" only if it clearly extends to the knee or below, otherwise "jacket"/"blazer"/"cardigan".\n  HOODIES/SWEATERS: "hoodie_zip" = hood + a full front zipper. "hoodie_pullover" = hood, no front opening, raglan/diagonal shoulder-to-underarm seam, drawstring hood, kangaroo pocket. "hoodie_wrap" = hood, asymmetric drape-front closing with a single button/toggle off to one side, no separate front/back symmetry. "hoodie" = has a hood but fits none of the above (fitted, no kangaroo pocket) — the default hoodie fallback. "sweatshirt"/"sweater" = crew neckline, ribbed cuffs/hem, no hood.\n  BOTTOMS: "trousers" = full-length flat-front or pleated pants. "cycling_breeches" = puffy/bloused through the thigh, gathered into a band just below the knee. "shorts_cargo" = wide waistband, large patch pockets on the leg, no fly. "shorts" = above/at-knee length with a separate waistband seam and typically a fly (denim shorts, casual shorts) — default shorts fallback. "skirt_pencil" = straight/fitted skirt, narrow silhouette. "skirt_circle" = very full flared skirt that would lie flat as a circle. "skirt" = any other skirt silhouette (A-line etc), the default skirt fallback. "jumpsuit"/"overalls" = one-piece combining a top and full-length trousers.\n  UNDERWEAR/SWIM: "underwear" = snug men\'s boxer-briefs with a leg gusset/crotch seam and NO distinct waistband panel. "briefs" = women\'s hip-hugging brief/panty cut, no leg extension. "bikini_top" = triangle/halter bikini top with ties. "one_piece_swimsuit" = full-coverage one-piece, may have a front zip and built-in leg/sleeve ribbing.\n  LEGGINGS: "leggings_capri" = ends mid-calf. "leggings_full" = ends at the ankle.\n  OTHER: "onesie" = short/long-sleeve snap-front baby bodysuit/romper. "apron" = front panel with a large patch pocket and neck+waist ties/straps, open back. "bowtie" = a bow tie. Use "other" for a real garment whose construction clearly matches NONE of the types above (e.g. a dress, kimono, cape, poncho, saree blouse, kurta, dungaree dress) — it will be drafted from scratch. Use "unsupported" only if it\'s not a garment at all,
   "sleeveLength": "sleeveless | short | elbow | three_quarter | long | n/a",
   "neckline": "crew | scoop | v | collar | n/a",
   "closure": "button | zipper | snap | drawstring | pullover | n/a"  <- how the front actually closes, look closely (a zipper pull/teeth means zipper, not button),
@@ -23,6 +24,7 @@ const SCHEMA_HINT = `Respond with ONLY a raw JSON object, no prose, no markdown 
   "fit": "fitted | regular | relaxed | oversized",
   "garmentLength": "cropped | regular | long | n/a",
   "apparentSize": "XS | S | M | L | XL | XXL | unknown"  <- estimate the garment's size from its cut and proportions,
+  ${CATALOGUE_HINT},
   "confidence": <number 0..1>,
   "notes": "<one sentence describing the garment>"
 }`
@@ -35,7 +37,7 @@ const ALLOWED = {
     'bomber_jacket', 'denim_jacket', 'jacket', 'coat', 'vest', 'blazer', 'cardigan',
     'hoodie_zip', 'hoodie_pullover', 'hoodie_wrap', 'hoodie', 'sweater', 'sweatshirt',
     'bikini_top', 'one_piece_swimsuit', 'leggings_capri', 'leggings_full', 'leggings',
-    'onesie', 'apron', 'bowtie', 'unsupported',
+    'onesie', 'apron', 'bowtie', 'other', 'unsupported',
   ],
   sleeveLength: ['sleeveless', 'short', 'elbow', 'three_quarter', 'long', 'n/a'],
   neckline: ['crew', 'scoop', 'v', 'collar', 'n/a'],
@@ -53,7 +55,15 @@ const ALLOWED_POCKET_POSITION = ['chest', 'hip', 'n/a']
 
 const MEDIA = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' }
 
+// catalogueMatch is advisory: a malformed one is dropped (the draft then falls back
+// to the category table) rather than failing the whole analysis.
+function keepCatalogueMatch(obj) {
+  if (obj && 'catalogueMatch' in obj && !validCatalogueMatch(obj.catalogueMatch)) delete obj.catalogueMatch
+  return obj
+}
+
 function validate(obj) {
+  keepCatalogueMatch(obj)
   for (const [key, allowed] of Object.entries(ALLOWED)) {
     if (!allowed.includes(obj[key])) throw new Error(`invalid ${key}: ${obj[key]}`)
   }
@@ -113,6 +123,7 @@ const ALLOWED_SCREEN_CATEGORIES = ALLOWED.garmentCategory
 const ALLOWED_IMAGE_KIND = ['photo', 'flat_sketch', 'not_a_garment']
 
 function validateScreen(obj) {
+  keepCatalogueMatch(obj)
   if (!ALLOWED_IMAGE_KIND.includes(obj.imageKind))
     throw new Error(`invalid imageKind: ${obj.imageKind}`)
   if (!ALLOWED_SCREEN_CATEGORIES.includes(obj.garmentCategory))
@@ -133,8 +144,9 @@ function validateScreen(obj) {
 const SCREEN_SCHEMA_HINT = `Respond with ONLY a raw JSON object, no prose, no markdown fences:
 {
   "imageKind": "photo | flat_sketch | not_a_garment"  <- "photo" = a photograph or photorealistic render of a real garment, with real fabric texture, shading, folds and lighting. "flat_sketch" = a technical flat, line drawing, CAD illustration or vector mockup: flat line art, no photographic texture, usually pure white background, often front and back laid side by side. "not_a_garment" = anything that is neither (a person's face, a landscape, a document, a logo),
-  "garmentCategory": "${ALLOWED_SCREEN_CATEGORIES.join(' | ')}"  <- the closest garment type by construction; "unsupported" if imageKind is "not_a_garment" or you cannot tell,
+  "garmentCategory": "${ALLOWED_SCREEN_CATEGORIES.join(' | ')}"  <- the closest garment type by construction; "other" for a real garment that matches none of the listed types (a dress, kimono, cape, kurta...); "unsupported" if imageKind is "not_a_garment" or you cannot tell,
   "apparentSize": "XS | S | M | L | XL | XXL | unknown"  <- estimate the garment's size from its cut and proportions,
+  ${CATALOGUE_HINT},
   "confidence": <number 0..1>,
   "notes": "<one sentence describing what you see>"
 }`

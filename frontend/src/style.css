@@ -2676,3 +2676,242 @@ img.result, object.result {
 .dropzone:hover .dropzone-formats,
 .dropzone.dragover .dropzone-formats,
 .ref-dropzone:hover .dropzone-shortcut { color: var(--dropzone-hint); }
+
+/* --- sewing pattern: size & measurements panel --------------------------- */
+/* Right column of the pattern viewer: the page list, then the size/measurement
+   card. The column is capped to the viewport and never scrolls itself -- the
+   page list and the measurement fields each scroll inside their own card, and
+   the size chips stay pinned at the top of theirs. */
+.tp-viewer-layout:has(.tp-pdf-side) { grid-template-columns: minmax(0, 1fr) 272px; }
+.tp-pdf-side {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  min-width: 0;
+  max-height: 85vh;
+  overflow: hidden;
+}
+.tp-pdf-side .tp-pdf-pages-card { position: static; align-self: stretch; flex: 0 0 auto; max-height: 26vh; overflow-y: auto; }
+.tp-pattern-size {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+}
+.tp-pattern-size .tp-parts-head { padding: var(--sp-2) var(--sp-3); }
+.tp-pattern-size-top { flex: 0 0 auto; padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--border); }
+.tp-pattern-size-top .studio-note { margin: 0 0 var(--sp-2); font-size: 11px; }
+.tp-pattern-size-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--sp-2) var(--sp-3) var(--sp-3);
+  scrollbar-width: thin;
+}
+.tp-size-chips { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; }
+.tp-size-chip {
+  min-width: 0;
+  height: 26px;
+  padding: 0;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.tp-size-chip:hover:not(:disabled) { color: var(--fg); border-color: var(--border-strong); }
+.tp-size-chip.is-active { color: var(--on-primary); background: var(--primary); border-color: transparent; }
+.tp-size-chip:disabled { cursor: default; opacity: 0.6; }
+/* minmax(0, 1fr): a plain 1fr column won't shrink below its input's intrinsic
+   width, which pushed the second column out past the card's edge. */
+.tp-pattern-size .measure-fields {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px var(--sp-2);
+  margin: 0 0 var(--sp-2);
+}
+/* The global `label { width: 160px }` rule is what pushed each field past its
+   119px grid cell and the card's edge -- let the cell size it instead. */
+.tp-pattern-size .measure-field { width: auto; min-width: 0; margin: 0; justify-content: flex-end; }
+.tp-pattern-size .measure-field span {
+  font-size: 10px;
+  white-space: normal;
+  overflow: visible;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+.tp-pattern-size .measure-field input {
+  width: 100%;
+  min-width: 0;
+  min-height: 24px;
+  height: 24px;
+  padding: 1px 6px;
+  font-size: 11px;
+}
+.tp-pattern-redraft-progress {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-2);
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+.tp-pattern-redraft-progress .tp-spinner { width: 12px; height: 12px; border-width: 2px; flex-shrink: 0; }
+.tp-pattern-extras { margin-top: var(--sp-2); padding-top: var(--sp-2); border-top: 1px solid var(--border); }
+.tp-pattern-extras-title { margin: 0 0 var(--sp-1); font-size: 11px; font-weight: 700; color: var(--fg-muted); }
+.tp-pattern-extras ul { margin: 0; padding-left: var(--sp-4); font-size: 11px; line-height: 1.5; }
+@media (max-width: 1024px) {
+  .tp-viewer-layout:has(.tp-pdf-side) { grid-template-columns: minmax(0, 1fr); }
+  .tp-pdf-side { position: static; max-height: none; overflow: visible; }
+  .tp-pattern-size-scroll { max-height: 50vh; }
+}
+
+/* --- sewing pattern: 3D preview ----------------------------------------- */
+/* Takes the pattern pages' place inside the same viewer box; the toggle sits at
+   the far right of that box's toolbar. */
+.tp-toolbar-right { margin-left: auto; display: flex; align-items: center; gap: var(--sp-1); }
+.tp-3d-toggle { font-size: 12px; font-weight: 600; }
+.tp-3d-toggle.is-active { color: var(--on-primary); background: var(--primary); border-color: transparent; }
+.tp-3d-view {
+  position: relative;
+  height: min(74vh, 760px);
+  min-height: 420px;
+  background: linear-gradient(#b9c3d2, #8e9aac);
+  overflow: hidden;
+}
+.tp-3d-host { position: absolute; inset: 0; }
+.tp-3d-canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+.tp-3d-canvas:active { cursor: grabbing; }
+.tp-3d-toolbar { position: absolute; top: var(--sp-3); left: 50%; transform: translateX(-50%); }
+.tp-3d-toolbar .toggle-group { box-shadow: var(--shadow-sm); }
+.tp-3d-msg {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  padding: var(--sp-4);
+  text-align: center;
+  font-size: 13px;
+  color: #26303d;
+}
+.tp-3d-msg .tp-spinner { width: 16px; height: 16px; }
+.tp-3d-msg.err { color: var(--danger, #b42318); }
+.tp-3d-note {
+  position: absolute;
+  left: var(--sp-3);
+  right: var(--sp-3);
+  bottom: var(--sp-2);
+  margin: 0;
+  font-size: 11px;
+  color: #2c3542;
+  text-align: center;
+  pointer-events: none;
+}
+
+/* --- 3D virtual try-on ---------------------------------------------------- */
+.vt-root {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-areas: "head head" "side main";
+  background: var(--surface);
+  color: var(--fg);
+}
+.vt-head { grid-area: head; display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-2) var(--sp-4); border-bottom: 1px solid var(--border); }
+.vt-head h2 { font-size: 15px; margin: 0; }
+.vt-sub { flex: 1; font-size: 12px; color: var(--fg-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vt-side { grid-area: side; overflow-y: auto; border-right: 1px solid var(--border); padding: var(--sp-2) var(--sp-3); }
+.vt-side section { padding: var(--sp-2) 0 var(--sp-3); border-bottom: 1px solid var(--border); }
+.vt-side h3 { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--fg-muted); margin: 0 0 var(--sp-2); }
+.vt-side .studio-note { font-size: 11px; margin: var(--sp-1, 4px) 0 0; }
+.vt-measure { padding: 0 0 var(--sp-3); border-bottom: 1px solid var(--border); }
+.vt-measure .tp-parts-card { border: 0; padding: 0; box-shadow: none; background: transparent; }
+.vt-measure .tp-parts-head { padding-left: 0; padding-right: 0; }
+.vt-measure .tp-pattern-size-top, .vt-measure .tp-pattern-size-scroll { padding-left: 0; padding-right: 0; }
+.vt-measure .tp-pattern-size-scroll { max-height: 300px; }
+.vt-measure .measure-fields { grid-template-columns: minmax(0, 1fr); }
+.vt-garment { margin-bottom: var(--sp-2); }
+.vt-garment p { font-size: 12px; margin: 0 0 6px; }
+.vt-chips { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.vt-look { margin-bottom: var(--sp-2); }
+.vt-colour { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-size: 12px; color: var(--fg-muted); width: auto; margin: 0; }
+.vt-colour input[type=color] { width: 40px; height: 28px; padding: 0; border: 1px solid var(--border); border-radius: var(--r-sm); }
+.vt-views { display: flex; flex-wrap: wrap; gap: 4px; }
+.vt-views .tp-ctrl-btn { font-size: 12px; }
+.vt-views .tp-ctrl-btn.is-active { background: var(--accent, #9a7417); color: #fff; }
+.vt-main { grid-area: main; position: relative; display: flex; min-width: 0; min-height: 0; }
+.vt-canvas-host { position: relative; flex: 1; min-height: 0; }
+.vt-canvas { display: block; width: 100%; height: 100%; }
+.vt-msg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 13px; color: var(--fg-muted); }
+.vt-msg.err { color: #b42318; padding: var(--sp-4); text-align: center; }
+.vt-msg .tp-spinner, .vt-badge .tp-spinner { width: 14px; height: 14px; }
+.vt-badge {
+  position: absolute; top: var(--sp-3); left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 8px; padding: 6px 12px; font-size: 12px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 999px; box-shadow: var(--shadow-md);
+}
+.vt-hint { position: absolute; bottom: var(--sp-2); left: 0; right: 0; text-align: center; font-size: 11px; color: #5b6472; pointer-events: none; }
+.vt-viewmode {
+  position: absolute; top: var(--sp-3); right: var(--sp-3); z-index: 2;
+  background: var(--surface); border-radius: 8px; box-shadow: var(--shadow-md);
+}
+.vt-pattern-note {
+  position: absolute; top: calc(var(--sp-3) + 44px); right: var(--sp-3); z-index: 2; max-width: 280px; margin: 0;
+  padding: 6px 10px; font-size: 11px; line-height: 1.4; color: var(--fg-muted);
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+}
+@media (max-width: 900px) {
+  .vt-root { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 50vh minmax(0, 1fr); grid-template-areas: "head" "main" "side"; }
+  .vt-side { border-right: 0; border-top: 1px solid var(--border); }
+}
+.vt-ease { display: grid; grid-template-columns: 1fr auto; gap: 4px 8px; align-items: center; font-size: 12px; color: var(--fg-muted); width: auto; margin: var(--sp-2) 0; }
+.vt-ease strong { color: var(--fg); font-variant-numeric: tabular-nums; }
+.vt-ease input { grid-column: 1 / -1; width: 100%; }
+.vt-gen-btn { width: 100%; justify-content: center; font-size: 12px; }
+.vt-gen-btn .tp-spinner { width: 12px; height: 12px; }
+.vt-confirm .studio-note { margin-bottom: var(--sp-2); }
+.vt-progress { height: 4px; border-radius: 2px; background: var(--surface-2); margin-top: var(--sp-2); overflow: hidden; }
+.vt-progress > div { height: 100%; background: var(--accent, #9a7417); transition: width 0.4s; }
+.vt-side .studio-note.err { color: #b42318; }
+.vt-gen-images { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin: 6px 0; }
+.vt-gen-images img { width: 100%; aspect-ratio: 1; object-fit: contain; background: #fff; border: 1px solid var(--border, #ddd); border-radius: 6px; }
+.vt-tpose-card {
+  position: absolute; top: var(--sp-3); left: var(--sp-3); width: min(240px, 38%); margin: 0;
+  background: #fff; border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow-md); overflow: hidden;
+}
+.vt-tpose-card img { display: block; width: 100%; aspect-ratio: 1; object-fit: contain; }
+.vt-tpose-card figcaption { display: flex; align-items: center; gap: 6px; padding: 6px 10px; font-size: 12px; border-top: 1px solid var(--border); }
+.vt-tpose-card .tp-spinner { width: 12px; height: 12px; }
+
+.vt-pieces .vt-piece-head,
+.vt-pieces .vt-piece-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 76px 76px;
+  gap: var(--sp-2);
+  align-items: center;
+}
+.vt-pieces .vt-piece-head { font-size: 11px; color: var(--fg-muted); margin: var(--sp-2) 0 var(--sp-1); }
+.vt-pieces .vt-piece-row { padding: 3px 0; }
+.vt-pieces .vt-piece-name { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vt-pieces input {
+  width: 100%;
+  min-height: 32px;
+  padding: 4px 8px;
+  font-size: 13px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}

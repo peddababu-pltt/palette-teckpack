@@ -25,6 +25,7 @@ from pathlib import Path
 import anthropic
 import requests
 from PIL import Image
+from white_bg import whiten_file
 from warp_pattern import (
     API_KEY,
     BASE_URL,
@@ -89,7 +90,8 @@ _REFERENCE_DETAIL_RULE = (
 
 _REALISTIC_PROMPT_BASE = (
     "Convert this black and white technical flat sketch into a photorealistic fashion "
-    "product flat-lay photograph. Lay the garment flat on a clean white background, "
+    "product flat-lay photograph. Lay the garment flat on a pure white (#FFFFFF) background -- "
+    "the same flat white as the input sketch, with no grey, no gradient, no vignette and no floor shadow -- "
     "keeping the same flat layout and view arrangement as the input. "
     "Show realistic fabric texture, natural soft shadows, stitching quality. "
     "Keep the same silhouette and construction details as the reference — "
@@ -594,6 +596,9 @@ def main():
                                              reference_urls)
         realistic_file = "realistic.png"
         (out_dir / realistic_file).write_bytes(realistic_bytes)
+        # the model's "white" comes back ~249 grey with a gradient; next to the
+        # pure-white sketch in the slider it reads as a grey box (see white_bg.py)
+        whiten_file(str(out_dir / realistic_file))
 
         manifest.append({
             "id": "realistic", "label": "Realistic",

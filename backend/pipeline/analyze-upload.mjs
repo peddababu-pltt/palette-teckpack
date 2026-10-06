@@ -14,15 +14,10 @@ try { process.loadEnvFile(new URL('./.env', import.meta.url)) } catch {}
 import { screenImage } from './analyze.mjs'
 import {
   DESIGNS, CATEGORY_TO_DESIGN, BODY_REGION,
-  HOW_TO_MEASURE, defaultMeasurements,
+  HOW_TO_MEASURE, defaultMeasurements, humanLabel,
 } from './designs.mjs'
-
-// hpsToWaistBack -> "Hps To Waist Back"
-function humanLabel(key) {
-  return key
-    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-    .replace(/^./, (c) => c.toUpperCase())
-}
+import { CUSTOM_MEASUREMENTS } from './extra-pieces.mjs'
+import { CATALOGUE_MATCH_MIN } from './catalogue.mjs'
 
 function fail(message) {
   process.stdout.write(JSON.stringify({ error: message }) + '\n')
@@ -39,8 +34,18 @@ try {
   fail(`vision screen failed: ${e.message}`)
 }
 
-const design = CATEGORY_TO_DESIGN[screen.garmentCategory] || null
-const entry = design ? DESIGNS[design] : null
+// A real garment with no catalogue design ("other") is drafted by AI from scratch
+// (extra-pieces.mjs draftCustomPieces) — it still needs body measurements.
+// Same catalogue-first rule as photo-draft.mjs, so the measurement fields asked for
+// here are the ones the draft will actually use.
+const m = screen.catalogueMatch
+const matched = m && m.design !== 'none' && DESIGNS[m.design] && m.similarity >= CATALOGUE_MATCH_MIN ? m.design : null
+const isGarment = screen.imageKind !== 'not_a_garment' && screen.garmentCategory !== 'unsupported'
+const isCustom = isGarment && (m ? !matched : screen.garmentCategory === 'other')
+const design = isCustom ? 'custom' : matched || CATEGORY_TO_DESIGN[screen.garmentCategory] || null
+const entry = isCustom
+  ? { label: 'Custom AI draft (not in pattern catalogue)', Design: { patternConfig: { measurements: CUSTOM_MEASUREMENTS } } }
+  : design ? DESIGNS[design] : null
 
 // The list is read straight off the design the draft will actually use, so the
 // sidebar can never ask for a field the pattern ignores or miss one it needs.
@@ -62,7 +67,7 @@ process.stdout.write(JSON.stringify({
   garmentCategory: screen.garmentCategory,
   design,
   designLabel: entry ? entry.label : null,
-  bodyRegion: design ? BODY_REGION[design] || null : null,
+  bodyRegion: design ? BODY_REGION[design] || (isCustom ? 'full' : null) : null,
   apparentSize: screen.apparentSize,
   confidence: screen.confidence,
   notes: screen.notes,

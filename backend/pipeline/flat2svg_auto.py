@@ -62,7 +62,14 @@ def main(in_png, out_svg, min_area=None):
     # model to read region numbers off a preview, it locates each part by
     # language (evf-sam) and assigns whole CV regions by overlap. Same output
     # contract either way, so step 3 is unchanged.
-    namer = "seg_ai.py" if os.environ.get("SEG_AI") == "1" else "name_regions.py"
+    #
+    # PART_NAMER=locate uses part_locate.py: the model outlines each part and
+    # geometry assigns the regions, checked and corrected by its own
+    # garment-agnostic checks -- so verify_layers' review (and the
+    # region-numbering repairs it re-applies) is skipped for it.
+    locate = os.environ.get("PART_NAMER", "regions").lower() == "locate"
+    namer = ("part_locate.py" if locate else
+             "seg_ai.py" if os.environ.get("SEG_AI") == "1" else "name_regions.py")
     run(os.path.join(here, namer), segdir, groups)
     work = os.path.join(segdir, "work.png")
     labels = os.path.join(segdir, "labels.npy")
@@ -70,7 +77,7 @@ def main(in_png, out_svg, min_area=None):
 
     # self-check loop: AI reviews the extracted layers, corrects grouping,
     # and we re-trace -- up to 3 rounds (disable with SKIP_VERIFY=1)
-    if not os.environ.get("SKIP_VERIFY"):
+    if not os.environ.get("SKIP_VERIFY") and not locate:
         for round_ in (1, 2, 3):
             r = subprocess.run([sys.executable,
                                 os.path.join(here, "verify_layers.py"),

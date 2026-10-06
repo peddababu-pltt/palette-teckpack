@@ -58,6 +58,11 @@ DETAIL_MAX_LEN = 300   # long side; keeps a whole placket/seam strip out
 # than line art, which traces as solid black (see the pick in main()).
 INK_RATIO_CAP = 1.7
 
+# Faint-line bridge for the saved tracing ink (see bridge_faint_lines).
+BRIDGE_WEAK_T = int(os.environ.get("BRIDGE_WEAK_T", "215"))  # 0 disables
+BRIDGE_BODY_T = 200   # grey kept at full width along a bridged hairline
+BRIDGE_MIN_LEN = 30   # px of centerline a run needs without seeding ink
+
 # Quilt/lattice collapse (see main()). Fires only when BOTH hold, so a plain
 # sketch with a handful of regions is never touched:
 TILE_MIN_COUNT = 100    # a lattice means many regions, not a few panels
@@ -115,6 +120,51 @@ def stroke_width_map(ink):
     idx = ndimage.distance_transform_edt(~sk, return_distances=False,
                                          return_indices=True)
     return np.where(ink, 2.0 * dt[idx[0], idx[1]], 0.0), sk
+
+
+def bridge_faint_lines(a, ink, t):
+    """Rejoin hairlines the ink threshold broke into dashes. Tracing ink only.
+
+    Quilt lattices and rib hatching are drawn 1px wide in grey: their cores
+    sit at ~110-170 and the anti-aliased runs between them at ~170-215. A cut
+    picked for enclosing panels (160 on the quilted bomber) keeps only the
+    cores, so every lattice line came out as hundreds of separate ticks (926
+    components there against 72 at a 200 cut). remove_pattern_noise then
+    deleted the ticks spread across the canvas, and the tracer filed the rest
+    as stitch dashes -- the SVG drew the quilting as broken scratches.
+
+    Hysteresis: grey pixels under BRIDGE_WEAK_T are kept when their component
+    already holds ink (or, for a run whose cores the noise pass removed, holds
+    pixels under the cut and is at least BRIDGE_MIN_LEN long, so isolated
+    halftone dots stay out). What gets added is the line's own grey body,
+    centerline guaranteed 4-connected so a 1px diagonal does not pinch to
+    nothing in the tracer -- and never next to a heavy stroke, so outline
+    weight is unchanged.
+    """
+    weak = a < BRIDGE_WEAK_T
+    if t >= BRIDGE_WEAK_T or not weak.any():
+        return ink
+    lab, n = ndimage.label(weak, structure=np.ones((3, 3)))
+    sk = skeletonize(weak)
+    slen = ndimage.sum_labels(sk, lab, np.arange(n + 1))
+    keep = np.zeros(n + 1, bool)
+    keep[np.unique(lab[ink])] = True
+    cored = np.unique(lab[a < t])
+    keep[cored] |= slen[cored] >= BRIDGE_MIN_LEN
+    keep[0] = False
+    hy = keep[lab]
+    cross = ndimage.generate_binary_structure(2, 1)
+    near_heavy = ndimage.binary_dilation(
+        ndimage.distance_transform_edt(ink) >= 2, cross, iterations=3)
+    add = (ndimage.binary_dilation(sk & hy, cross) & hy) | (hy & (a < BRIDGE_BODY_T))
+    out = ink | (add & ~near_heavy)
+    if out.sum() > ink.sum() * INK_RATIO_CAP:
+        # Grew like shading, not like hairlines: leave the ink alone.
+        print(f"  faint-line bridge skipped ({int(out.sum())}px vs "
+              f"{int(ink.sum())}px ink)")
+        return ink
+    print(f"  faint-line bridge: +{int(out.sum() - ink.sum())}px")
+    return out
 
 
 def drop_thin_lines(ink):
@@ -444,7 +494,8 @@ def main(in_png, outdir, min_area=1500, _tile_escalations=0, _drop_thin=False):
             print(f"  rejected {dropped} -- over {INK_RATIO_CAP}x the "
                   f"lightest candidate's ink (shading, not line art)")
     open(os.path.join(outdir, "threshold.txt"), "w").write(str(t))
-    np.save(os.path.join(outdir, "ink.npy"), ink)   # cleaned ink for tracing
+    # cleaned ink for tracing; segmentation below keeps the unbridged cut
+    np.save(os.path.join(outdir, "ink.npy"), bridge_faint_lines(a, ink, t))
 
     # Surface stitching (quilt lattice, rib hatching) encloses regions exactly
     # like a seam does. When the pass below has flagged this sketch as a

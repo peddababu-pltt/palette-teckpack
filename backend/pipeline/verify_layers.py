@@ -219,7 +219,7 @@ def render_sheet(svg_path, out_png, width=1400):
     # hundreds) aren't part of the region-grouping this review checks -- they
     # come from global fine-detail extraction, not groups.json's parts, so
     # skip them here instead of building a contact sheet with hundreds of tiles.
-    groups = [(g, name) for g, name in groups if not re.fullmatch(r"(button|stitch)_\d+(_2)?", name)]
+    groups = [(g, name) for g, name in groups if not re.fullmatch(r"(button|stitch|text)_(\d+|label)(_2)?", name)]
     tiles = []
     for g, name in groups:
         one = head + g + "</svg>"

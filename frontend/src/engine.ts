@@ -18,6 +18,7 @@ import {
   startStage5,
   watchJob,
   type Job,
+  type PatternParams,
 } from "./api"
 
 export type StageKind = "parts" | "pattern"
@@ -83,7 +84,7 @@ export class StageEngine {
 
   // Joins an already-running stage for this job+kind, or starts a new one.
   // Never starts a second run for a stage already going.
-  queue(job: Job, kind: StageKind): Promise<void> {
+  queue(job: Job, kind: StageKind, params?: PatternParams): Promise<void> {
     const key = StageEngine.key(job.job_id, kind)
     const existing = this.live.get(key)
     if (existing) return Promise.resolve()
@@ -101,7 +102,7 @@ export class StageEngine {
     this.live.set(key, live)
     this.emit()
 
-    return this.run(job, kind, live)
+    return this.run(job, kind, live, params)
   }
 
   // Clears a failed run's stuck entry so queue() sees no `existing` and
@@ -112,11 +113,22 @@ export class StageEngine {
     return this.queue(job, kind)
   }
 
-  private async run(job: Job, kind: StageKind, live: LiveStage): Promise<void> {
+  // Redrafts the sewing pattern at a chosen size / with edited measurements.
+  // A no-op while a pattern draft is already running for this job.
+  redraftPattern(job: Job, params: PatternParams): Promise<void> {
+    const key = StageEngine.key(job.job_id, "pattern")
+    const existing = this.live.get(key)
+    if (existing && !existing.error) return Promise.resolve()
+    this.live.delete(key)
+    return this.queue(job, "pattern", params)
+  }
+
+  private async run(job: Job, kind: StageKind, live: LiveStage, params?: PatternParams): Promise<void> {
     live.started = true
     this.emit()
 
-    const startRes = kind === "parts" ? await startStage4(this.pluginId, job.job_id) : await startStage5(this.pluginId, job.job_id)
+    const startRes =
+      kind === "parts" ? await startStage4(this.pluginId, job.job_id) : await startStage5(this.pluginId, job.job_id, params)
     if (startRes.error) {
       live.error = startRes.error
       this.emit()
@@ -150,6 +162,7 @@ export class StageEngine {
                 ...current.outputs,
                 [spec.outKey]: payload.file,
                 ...(payload.pages_file ? { pattern_pages: payload.pages_file } : {}),
+                ...(payload.pieces_file ? { pattern_pieces: payload.pieces_file } : {}),
               },
             }))
           }

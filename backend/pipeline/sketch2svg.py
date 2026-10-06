@@ -16,14 +16,13 @@ import re
 import sys
 
 import anthropic
+from PIL import Image
 
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
-
-from PIL import Image
 
 
 SYSTEM_PROMPT = """You are an expert Fashion Technical Illustration SVG Reconstruction AI.

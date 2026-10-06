@@ -184,6 +184,14 @@ Group ALL region ids into named garment parts. Rules:
   x-range to the placket's x-position: regions closer to center are
   body/torso, regions farther out (near the garment's left/right
   silhouette edge) are sleeve. Do not swap these two labels.
+- RAGLAN SLEEVES: when a diagonal seam runs from the neckline (beside the
+  collar) down and out to the underarm, the sleeve starts AT THE NECK.
+  Everything outboard of that diagonal seam -- the top shoulder wedge and
+  every band below it down the outer arm to the cuff -- is the SLEEVE; the
+  regions INBOARD of the diagonal (between it and the placket/centre) are the
+  body panel, even the top ones under the collar. On a raglan coat the
+  sleeve column is diagonal, so its bands do not share one x-range: follow
+  the arm's own outline from the neck to the cuff instead.
 - A quilted/paneled sleeve is cut into SEVERAL regions stacked from
   shoulder to cuff, all sharing nearly the SAME bbox x-range (only y
   differs, band after band down the arm). Once you identify ONE band
@@ -2232,6 +2240,9 @@ def merge_seam_line_parts(parts: dict, info: dict, segdir: str) -> dict:
 
 
 RIB_TICK_MIN_SHARE = 0.005  # notch-ink this far below a rib band's is blank
+RIB_VIEW_MEAN_MAX = 0.015   # ...or a view's hems AVERAGE below this: real rib
+                            # bands read ~0.04 each, so a mean this low means
+                            # blank strips with one noisy reading among them
 RIB_CLOSE_RADIUS = 6        # tick width to bridge when closing the band
 MERGE_BLANK_HEM = os.environ.get("MERGE_BLANK_HEM", "1") != "0"
 
@@ -2296,10 +2307,17 @@ def merge_blank_hem_bands(parts: dict, info: dict, segdir: str) -> dict:
         notch = ndimage.binary_closing(m, disk) & ~m
         share[nm] = float((notch & ink).sum()) / float(m.sum())
 
+    #
+    # "Every sibling under RIB_TICK_MIN_SHARE" was too strict, though: one noisy
+    # strip kept the whole view's phantom hems (97f18fad's back read .0111 /
+    # .0001 and both back hems survived, on a puffer with no hem band at all).
+    # A real rib band reads ~0.04 on EVERY sibling, so the view mean separates
+    # the two cleanly: 97f18fad back .0056, 23fcf01d .0091, rib cuffs .039+.
     blank_views = set()
     for view in {nm.split("_", 1)[0] for nm in share}:
         sibs = [s for nm, s in share.items() if nm.split("_", 1)[0] == view]
-        if sibs and max(sibs) < RIB_TICK_MIN_SHARE:
+        if sibs and (max(sibs) < RIB_TICK_MIN_SHARE
+                     or sum(sibs) / len(sibs) < RIB_VIEW_MEAN_MAX):
             blank_views.add(view)
 
     for nm in hems:
@@ -2329,6 +2347,69 @@ def merge_blank_hem_bands(parts: dict, info: dict, segdir: str) -> dict:
             if p.get("regions") or p.get("grab_box")}
 
 
+def ribs_are_not_buttons(parts: dict, info: dict) -> dict:
+    """A rib cuff's slices are never buttons.
+
+    Vertical rib lines cut a ribbed cuff into a row of tall thin slivers. Each
+    sliver is button-sized by area, so a vision pass can file the row as
+    buttons -- measured on b36b2d80ccb6: the review pass moved a front cuff's
+    nine 12x56px slices into button_front_placket and the cuff vanished. A
+    button is roughly round; a sliver twice as tall as it is wide is not one.
+    Slivers lifted out of a button part become a cuff when three or more sit
+    side by side (named by the view and side of the nearest part), else join
+    the nearest part.
+    """
+    def box(r):
+        return info[str(r)]["bbox"]
+
+    def thin(r):
+        x0, y0, x1, y1 = box(r)
+        w, h = max(1, x1 - x0), max(1, y1 - y0)
+        return max(w, h) / min(w, h) >= 2.5
+
+    def centre(r):
+        x0, y0, x1, y1 = box(r)
+        return ((x0 + x1) / 2, (y0 + y1) / 2)
+
+    def nearest(c, names):
+        best, bd = None, float("inf")
+        for nm in names:
+            for r in parts[nm]["regions"]:
+                rc = centre(r)
+                d = (rc[0] - c[0]) ** 2 + (rc[1] - c[1]) ** 2
+                if d < bd:
+                    best, bd = nm, d
+        return best
+
+    for nm in [n for n in parts if "button" in n]:
+        slivers = [r for r in parts[nm].get("regions", []) if thin(r)]
+        if not slivers:
+            continue
+        parts[nm]["regions"] = [r for r in parts[nm]["regions"] if r not in slivers]
+        cx = sum(centre(r)[0] for r in slivers) / len(slivers)
+        cy = sum(centre(r)[1] for r in slivers) / len(slivers)
+        others = [n for n in parts if n != nm and parts[n].get("regions") and "button" not in n]
+        if len(slivers) >= 3:
+            # view + side from whatever part sits closest (sleeve, pocket or
+            # panel): a mis-grouped sleeve must not send a front cuff to the back
+            near = nearest((cx, cy), others) or ""
+            view = next((v for v in ("front", "back") if v in near), "front")
+            side = next((sd for sd in ("left", "right") if sd in near), "")
+            target = "_".join(x for x in (view, side, "cuff") if x)
+            if target not in parts:
+                parts[target] = {"regions": []}
+            parts[target]["regions"] = sorted(set(parts[target]["regions"]) | set(slivers))
+            print(f"  rib slices {slivers} were filed as buttons ({nm}) -> {target}")
+        else:
+            for r in slivers:
+                t = nearest(centre(r), others)
+                if t:
+                    parts[t]["regions"].append(r)
+        if not parts[nm]["regions"]:
+            del parts[nm]
+    return parts
+
+
 def deterministic_repairs(parts: dict, all_ids: set, info: dict,
                           segdir: str) -> dict:
     """Every post-naming repair, in the order they have to run.
@@ -2338,6 +2419,7 @@ def deterministic_repairs(parts: dict, all_ids: set, info: dict,
     undone the moment the reviewer returns corrections.
     """
     parts = repair_parts(parts, all_ids, info)
+    parts = ribs_are_not_buttons(parts, info)
     # before anything geometric: a run of print cells masquerading as panels
     # skews every span the later repairs measure against.
     parts = merge_numbered_sibling_panels(parts)

@@ -1,6 +1,6 @@
 [project]
 name = "techpack"
-version = "1.0.18"
+version = "1.1.7"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.129.0",
@@ -27,6 +27,8 @@ dependencies = [
   "svgpathtools==1.7.2",
   "cairosvg==2.9.0",
   "pymupdf==1.27.2",
+  # cv2 — backend/pipeline/white_bg.py (imported by variations.py)
+  "opencv-python-headless==4.14.0.94",
 ]
 
 [dependency-groups]
@@ -40,6 +42,12 @@ line-length = 115
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# SYSTEM_PROMPT is a verbatim model prompt inside a triple-quoted string;
+# its lines cannot be rewrapped without changing the prompt text sent to the model.
+"backend/pipeline/sketch2svg.py" = ["E501"]
+
 [tool.setuptools.packages.find]
 include = ["backend*"]
 exclude = ["frontend*", "node_modules*"]

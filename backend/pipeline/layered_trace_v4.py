@@ -80,6 +80,9 @@ POTRACE_BIN = _resolve_potrace()
 # this stays on vtracer (better for long smooth seam curves).
 FINE_DETAIL_AREA = 400
 FINE_DETAIL_DIM = 40
+STITCH_DARK_T = int(os.environ.get("STITCH_DARK_T", "40"))
+                   # a stitch-shaped mark whose darkest pixel is under this is
+                   # black ink, traced into its part's layer (0 disables)
 BUTTON_SIZE_MULT = 3.0   # a fine mark with no hole in it counts as a button
                          # only if it is this many times the MEDIAN fine-mark
                          # area in the same sketch (see classify_fine_detail)
@@ -161,7 +164,7 @@ DASH_KEEPOUT = int(os.environ.get("DASH_KEEPOUT", "2"))
                        # a center-back seam the sketch draws as dashes alone
                        # then renders as a solid line with dashes on top of it.
                        # Faithfulness to the sketch wins: default stays 2.
-THIN = 0.45      # shave this many px off EACH SIDE of the captured ink before
+THIN = 0.0       # shave this many px off EACH SIDE of the captured ink before
                  # tracing -> thinner black outline in the SVG. Fractional on
                  # purpose: sketch strokes here are only ~2-3px wide, so a full
                  # 1px-per-side erosion eats them down to fragments that
@@ -192,6 +195,12 @@ THIN = 0.45      # shave this many px off EACH SIDE of the captured ink before
                  # weight if broken seams matter more than line weight.
                  # Env THIN overrides; ignored when THICKEN > 0; THIN=0 gives
                  # the old full-weight lines.
+                 #
+                 # Default now 0: the SVG must reproduce the sketch line for
+                 # line. Measured on the bomber flat, 0.45 broke every thin
+                 # seam (back panel, sleeve, yoke) into dashes and erased the
+                 # rib lines on the hem band and cuffs; 0.25 still lost the
+                 # ribs. At 0 the render covers 99.7% of the source ink.
 TRIM_SS = 4   # grab_box trim (zip teeth, guard stitching) is thresholded and
               # traced at this multiple of native resolution -- see the
               # grab_box branch in main()
@@ -332,6 +341,10 @@ RING_PX = int(os.environ.get("RING_PX", "1"))
                    # or over-weight edge compounds. The invisible
                    # complete-boundary copy keeps the measured stroke width
                    # (outline_px) so it stays solid for extraction.
+TRIM_STUBS = os.environ.get("TRIM_STUBS", "1") != "0"
+                   # cut the ticks other lines leave where they meet a piece's
+                   # edge from outside (see the trim before tracing in main()).
+                   # 0 keeps them, as before.
 RING_SEAL = int(os.environ.get("RING_SEAL", "4"))
                    # px the region union is closed by before REGION_OUTLINE
                    # rings it, welding shut the hairline slits left by the
@@ -1498,6 +1511,18 @@ def main(in_png, labels_npy, groups_json, out_svg):
         reg2 = np.isin(labels, p2["regions"])
         prelim_owned |= ndimage.binary_dilation(reg2, dil, iterations=BAND)
         owned_region |= reg2
+    def boxed_strip(box, min_inside=0.9):
+        """Label regions with at least `min_inside` of their area inside `box`."""
+        ids = np.unique(labels[box])
+        ids = ids[ids != 0]
+        if not len(ids):
+            return np.zeros((H, W), bool)
+        inside = ndimage.sum_labels(box, labels, ids)
+        area = ndimage.sum_labels(np.ones((H, W), bool), labels, ids)
+        keep = ids[inside >= area * min_inside]
+        return np.isin(labels, keep) if len(keep) else np.zeros((H, W), bool)
+
+    boxed_strips = np.zeros((H, W), bool)  # every box's strip regions (see below)
     for nm, p in cfg["parts"].items():
         gb = p.get("grab_box")
         if not gb:
@@ -1524,8 +1549,17 @@ def main(in_png, labels_npy, groups_json, out_svg):
         # strip, clear of either neighbour, and is still grabbed.
         own_reg = np.isin(labels, p["regions"]) if p["regions"] \
             else np.zeros((H, W), bool)
+        # A region lying (almost) wholly inside the box is the strip's own
+        # interior -- the space between a zip's two tape lines -- whatever
+        # part the naming model filed it under. Its rim is the zip's content,
+        # not a neighbour's edge: counted as one, it kept the zip's slider and
+        # pull tab out of the zip (measured on 47c7a16a44d2: region 10, 100%
+        # inside the zip box but named front_right_body_panel, handed that
+        # panel the whole puller).
+        strip = boxed_strip(box)
+        boxed_strips |= strip
         neighbour_edge = ndimage.binary_dilation(
-            owned_region & ~own_reg, dil, iterations=BOX_EDGE_KEEP)
+            owned_region & ~own_reg & ~strip, dil, iterations=BOX_EDGE_KEEP)
         extra = ink & box & ~owned_region & ~grabbed_union & ~neighbour_edge
         # ...and a line that only CROSSES the box is not the box's either.
         # neighbour_edge above covers a line running ALONGSIDE the strip (a
@@ -1632,6 +1666,38 @@ def main(in_png, labels_npy, groups_json, out_svg):
     # single part contains >=80% of it (interior details: creases, dashes,
     # stitching). Unowned strokes are shared seams / big outlines. ----
     part_regs = {nm: np.isin(labels, p["regions"]) for nm, p in cfg["parts"].items()}
+    # A zip's strip region (see boxed_strip) belongs to no neighbour: left in a
+    # panel's region, that panel's outline repair traced round the slider and
+    # pull tab the zip now draws, notching a box into the panel's edge.
+    if boxed_strips.any():
+        for nm in part_regs:
+            if not cfg["parts"][nm].get("grab_box"):
+                part_regs[nm] &= ~boxed_strips
+
+    # Black has priority over gray. The dash detector judges by SHAPE only,
+    # so short marks the sketch draws in solid black (zip ticks, black dash
+    # bits, breaks in a black lattice line) were filed as stitching and
+    # printed gray in a separate stitch layer. A mark whose darkest pixel is
+    # black is black ink: hand it back to the outline ink so it is traced
+    # black inside its own part's layer and extracted with that part. Only
+    # marks the sketch draws in gray stay stitching (measured: the puffer's
+    # gray baffle dashes bottom out at 66-105, black marks at ~0). Marks off
+    # the garment (caption letters) are left for the text layer.
+    if stitches_mask.any() and STITCH_DARK_T > 0:
+        _zone = np.zeros((H, W), bool)
+        for _r in part_regs.values():
+            _zone |= _r
+        _zone = ndimage.binary_dilation(_zone, dil, iterations=BAND)
+        _slab, _sn = ndimage.label(stitches_mask, structure=np.ones((3, 3)))
+        _idx = np.arange(1, _sn + 1)
+        _dark = np.asarray(ndimage.minimum(a, _slab, _idx)) < STITCH_DARK_T
+        _on = np.asarray(ndimage.maximum(_zone, _slab, _idx), bool)
+        black_marks = np.concatenate([[False], _dark & _on])[_slab]
+        if black_marks.any():
+            stitches_mask &= ~black_marks
+            fine_all &= ~black_marks
+            print(f"  black marks moved to their part layers: "
+                  f"{int((_dark & _on).sum())} of {_sn}")
     part_regs_d2 = {nm: ndimage.binary_dilation(r, dil, iterations=2)
                     for nm, r in part_regs.items()}
 
@@ -1709,6 +1775,27 @@ def main(in_png, labels_npy, groups_json, out_svg):
         if bf >= 0.80:
             owner[cid] = best
 
+    # An applied piece's own outline hugs it from the outside, so most of the
+    # stroke sits in the CONTAINER's 2px halo and the vote above hands it to
+    # the panel. The panel then strips every applied piece's drawing out of
+    # its own cap (drawn_by_applied, in the part loop) and the outline ends up
+    # in no layer at all -- the bomber's welt pockets came out as a hairline
+    # closure only. A stroke lying wholly in the applied piece's band is that
+    # piece's drawing: give it to the piece.
+    applied_bands = {small: ndimage.binary_dilation(part_regs[small], dil,
+                                                    iterations=BAND)
+                     for small, bigs in contained_in.items()
+                     if bigs and small in part_regs
+                     and not cfg["parts"][small].get("grab_box")}
+    for cid, onm in list(owner.items()):
+        sl = sobjs[cid - 1]
+        cm = slab[sl] == cid
+        tot = cm.sum()
+        for small, ab in applied_bands.items():
+            if onm in contained_in[small] and (cm & ab[sl]).sum() / tot >= 0.95:
+                owner[cid] = small
+                break
+
     # Footprint of every OTHER part, per part: where a synthesized closure for
     # this piece would be covered by a neighbouring piece in the composed
     # drawing (see the guide split at the end of the loop).
@@ -1757,6 +1844,16 @@ def main(in_png, labels_npy, groups_json, out_svg):
         # independently extractable. Coincident strokes on a shared seam are
         # the accepted cost of that.
         cap |= ink & band & ~others
+        # 3) unowned ink INSIDE this part's own region: surface lines the
+        #    segmentation deliberately did not cut on (quilt lattice, rib
+        #    hatching -- see seg_parts' lattice collapse). Joined to the
+        #    outlines they form one component spanning several parts, so no
+        #    part wins the ownership vote and, lying outside every boundary
+        #    band, the lattice was traced into no layer at all (measured on
+        #    the quilted bomber: every interior diamond line on the sleeves).
+        #    The region interior is exclusive to this part, so nothing is
+        #    duplicated.
+        cap |= ink & reg & ~others
         cap &= ~grabbed_union
         if nm in grabbed:
             cap |= grabbed[nm]
@@ -1779,7 +1876,8 @@ def main(in_png, labels_npy, groups_json, out_svg):
             others_box &= ~grab_mask(p, H, W)
         if box_interior.any():
             if others_box.any():
-                own_edge = ndimage.binary_dilation(reg, dil,
+                # a strip region inside the box is the boxed part's, not ours
+                own_edge = ndimage.binary_dilation(reg & ~boxed_strips, dil,
                                                    iterations=BOX_EDGE_KEEP)
                 cap &= ~(others_box & ~own_edge)
         # An applied piece (pocket welt+flap, badge, ...) contained on this
@@ -1865,6 +1963,19 @@ def main(in_png, labels_npy, groups_json, out_svg):
             # The fabric is continuous under an applied piece; its contour has
             # to be too.
             contour_reg = (reg | bridge_regs[nm]) if nm in bridge_regs else reg
+            if nm in bridge_regs:
+                # Weld the applied piece's own stroke into the silhouette.
+                # reg | pocket leaves the pocket's drawn outline as a hairline
+                # slit (its pixels belong to neither region), and the contour
+                # walked down both sides of it -- the panel layer then printed
+                # the pocket as a hollow double line (measured on the bomber:
+                # 1876px of "closure under another piece" tracing both edges of
+                # each welt). Sealed only near the applied piece, so the rest of
+                # the panel's contour is untouched.
+                near_applied = ndimage.binary_dilation(
+                    bridge_regs[nm], dil, iterations=BAND)
+                contour_reg = contour_reg | (ndimage.binary_closing(
+                    contour_reg, dil, iterations=max(1, RING_SEAL)) & near_applied)
             contour = contour_reg & ~ndimage.binary_erosion(contour_reg, dil, iterations=2)
             # Closure fills a gap in the OUTLINE. Dashes count as cover even
             # though they are not part of this piece's outline and live in
@@ -1940,6 +2051,16 @@ def main(in_png, labels_npy, groups_json, out_svg):
         # is cut as -- so it too extracts as a closed shape.
         if p.get("grab_box") and REGION_OUTLINE:
             strip = grab_mask(p, H, W)
+            if not reg.any() and cap.any():
+                # No region of its own (a button drawn on a placket, a zip
+                # strip): close it along its OWN ink silhouette, filled -- a
+                # button's circle, a zip's tape edges. The box is only where
+                # to look; ringing the box drew a rectangle round every button
+                # and across the top of the zip, since nothing inks the box.
+                own = ndimage.binary_fill_holes(
+                    ndimage.binary_closing(cap & strip, dil, iterations=2))
+                if own.any():
+                    strip = own
             if reg.any():
                 # prefer the piece's own silhouette when seg found one; the box
                 # is a hand/model-placed rectangle around it, always coarser
@@ -2076,6 +2197,25 @@ def main(in_png, labels_npy, groups_json, out_svg):
                       f"(dropped where its own ink already draws the edge)")
             cap |= ring
             ring_protect = ring
+
+        # Trim edge stubs. A piece takes the ink within BAND px around its
+        # region, so every line that MEETS its edge from outside -- a quilting
+        # line, the neighbouring panel's seam, a cuff's rib -- came along for
+        # its first few px and stuck out of the extracted piece as a tick.
+        # Keep the piece's own silhouette plus its edge stroke (a stroke's
+        # width outside the region); drop what lies beyond it inside the
+        # band. Ink further out is not a stub (a strap, a drawcord tail the
+        # stray rescue handed this part) and stays.
+        if TRIM_STUBS and reg.any() and not p.get("grab_box"):
+            body = reg | bridge_regs[nm] if nm in bridge_regs else reg
+            sil = ndimage.binary_fill_holes(ndimage.binary_closing(
+                body, dil, iterations=max(1, RING_SEAL)))
+            keep = ndimage.binary_dilation(sil, dil, iterations=2 * outline_px + 1)
+            near = ndimage.binary_dilation(sil, dil, iterations=BAND + 2)
+            stubs = cap & near & ~keep
+            if stubs.any():
+                cap &= ~stubs
+                print(f"  [{nm}] trimmed {int(stubs.sum())}px of edge stubs")
 
         if not cap.any() and not synth_mask.any():
             continue
@@ -2256,6 +2396,16 @@ def main(in_png, labels_npy, groups_json, out_svg):
             # actually left open).
             missing = ring_full[nm] & ~ndimage.binary_dilation(
                 cap, dil, iterations=max(1, outline_px))
+            # Never along a dash run: the stitching already draws that side.
+            # The copy is filled black (BOUNDARY_FILL), so a seam the sketch
+            # draws as dashes alone came out as a solid line on each side of
+            # the dashes -- hidden only while THIN eroded the 1-2px copy away
+            # (measured on 91c50872's back panels at THIN=0: two solid
+            # diagonals the sketch draws as dashes).
+            if fine_all.any():
+                missing &= ~ndimage.binary_dilation(
+                    fine_all, dil,
+                    iterations=max(1, dash_keepout_px) + max(1, outline_px))
             if missing.sum() >= MIN_SYNTH_AREA:
                 # Trace only the MISSING arc, not the whole ring_full silhouette.
                 # Tracing the full ring stacked a second, independently-eroded
@@ -2315,14 +2465,38 @@ def main(in_png, labels_npy, groups_json, out_svg):
     # run rendered gray reads as a smudge where the sketch has a hard black
     # ladder. Judged by the part the mark sits on (mark_owner_of), which is
     # the only thing that separates a tooth from the topstitch beside it.
+    # "label" too: a FRONT/BACK caption's letters are small compact marks the
+    # detector files as dashes, and grayed they printed as half-gray words.
     HARDWARE_OWNER_KEYWORDS = ("zip", "placket", "fly", "button", "snap",
-                               "eyelet", "buckle", "rivet", "grommet")
+                               "eyelet", "buckle", "rivet", "grommet", "label")
     NO_STITCH_OWNER_KEYWORDS = ("pocket", "welt", "hem", "neck", "collar", "yoke")
     dark_marks = set()
+    # Marks off the garment entirely -- the FRONT/BACK caption letters, which
+    # the fine-detail detector files as dashes. Nearest-part ownership handed
+    # them to whatever piece sat closest (a cuff, a hem), so they were grayed
+    # as that piece's stitching and printed as half-gray words.
+    # Split per component, before tracing: potrace returns multi-subpath
+    # paths, so a per-path bbox test mixes letters with garment dashes. The
+    # zone is regions + grab boxes, not grabbed_union: the stray-ink rescue
+    # files the caption into grabbed_union under its nearest part.
+    garment_zone = ndimage.binary_dilation(all_regs, dil, iterations=BAND)
+    for _nm, _p in cfg["parts"].items():
+        if _p.get("grab_box"):
+            garment_zone |= grab_mask(_p, H, W)
+    marks_all = buttons_mask | stitches_mask
+    text_mask = np.zeros_like(marks_all)
+    mlab, mn = ndimage.label(marks_all, structure=np.ones((3, 3)))
+    if mn:
+        off = ~np.asarray(ndimage.maximum(garment_zone, mlab,
+                                          np.arange(1, mn + 1)), bool)
+        text_mask = np.concatenate([[False], off])[mlab]
+        buttons_mask = buttons_mask & ~text_mask
+        stitches_mask = stitches_mask & ~text_mask
 
     mark_owner = {}
     grouped = {}
-    for mask, prefix in ((buttons_mask, "button"), (stitches_mask, "stitch")):
+    for mask, prefix in ((buttons_mask, "button"), (stitches_mask, "stitch"),
+                         (text_mask, "text")):
         if not mask.any():
             continue
         canvas = np.full((H, W), 255, np.uint8)
@@ -2334,25 +2508,26 @@ def main(in_png, labels_npy, groups_json, out_svg):
             xmin, xmax, ymin, ymax = parse_path(d).bbox()
             cy = min(max(int((ymin + ymax) / 2), 0), H - 1)
             cx = min(max(int((xmin + xmax) / 2), 0), W - 1)
-            owner = mark_owner_of(cx, cy)
+            owner = "label" if prefix == "text" else mark_owner_of(cx, cy)
+            kind = prefix
 
             # Pockets, hem, neckline and yoke line carry no topstitching in
             # this house style, so a dash run sitting on one is dropped rather
             # than traced. Buttons are never dropped -- a snap on a pocket flap
             # is real hardware, not stitching.
-            if (prefix == "stitch" and NO_STITCH_ON_PARTS and owner
+            if (kind == "stitch" and NO_STITCH_ON_PARTS and owner
                     and any(k in owner for k in NO_STITCH_OWNER_KEYWORDS)):
                 dropped += 1
                 continue
 
             if GROUP_MARKS:
-                grouped.setdefault((prefix, owner or "unassigned"),
+                grouped.setdefault((kind, owner or "unassigned"),
                                    []).append(path)
                 continue
 
-            name = f"{prefix}_{i}"
+            name = f"{kind}_{i}"
             if name in existing_names:
-                name = f"{prefix}_{i}_2"
+                name = f"{kind}_{i}_2"
             existing_names.add(name)
             layers.append(((10**6, 10**6, i), name, [path], []))
             if owner:
@@ -2419,8 +2594,9 @@ def main(in_png, labels_npy, groups_json, out_svg):
     # Topstitch dashes are real ink, but they are construction detail, not
     # cutlines -- drawn at the same black as the outlines they sit beside,
     # a busy sketch's stitching competes with the seams for read. Gray by
-    # default: still clearly there, clearly secondary. STITCH_FILL=#000000
-    # restores full black, #ffffff hides the stitching entirely.
+    # default: still clearly there, clearly secondary. Black marks never get
+    # here (see STITCH_DARK_T), so gray only ever means gray in the sketch.
+    # STITCH_FILL=#000000 forces full black, #ffffff hides the stitching.
     stitch_fill = os.environ.get("STITCH_FILL", "#808080")
 
     for _, name, paths, guide_paths in layers:
@@ -2530,7 +2706,7 @@ def main(in_png, labels_npy, groups_json, out_svg):
                           r'\g<1>#000000\g<2>', svg_fragment)
 
         for nm, g in groups.items():
-            if nm.startswith(("stitch_", "button_")):
+            if nm.startswith(("stitch_", "button_", "text_")):
                 continue
             # Stitch-dash layers carry real construction detail -- quilting
             # channels and panel topstitch are drawn as gray dashes too, not

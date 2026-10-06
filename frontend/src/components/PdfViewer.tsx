@@ -13,7 +13,22 @@ import { fetchBinary } from "../api"
 
 type PageEntry = { canvas: HTMLCanvasElement; wrap: HTMLDivElement; fit: number }
 
-export default function PdfViewer({ url, downloads }: { url: string; downloads: ReactNode }) {
+// `toolbarRight` sits at the far right of the zoom toolbar; `mainOverride`, when
+// set, takes the pages' place in the same box (the pages stay mounted, hidden, so
+// switching back doesn't re-render the whole PDF).
+export default function PdfViewer({
+  url,
+  downloads,
+  aside,
+  toolbarRight,
+  mainOverride,
+}: {
+  url: string
+  downloads: ReactNode
+  aside?: ReactNode
+  toolbarRight?: ReactNode
+  mainOverride?: ReactNode
+}) {
   const { t } = usePluginTranslations(STRINGS)
   const scrollRef = useRef<HTMLDivElement>(null)
   const thumbsRef = useRef<HTMLDivElement>(null)
@@ -60,7 +75,10 @@ export default function PdfViewer({ url, downloads }: { url: string; downloads: 
       // CSS ease-out glide crawls for seconds before visibly moving.
       p.canvas.scrollIntoView({ block: "start" })
     }
-    async function renderAll(scale: number) {
+    // `zoom` multiplies each page's OWN fit-to-width scale: a portrait cover and the
+    // landscape piece pages differ in width, so one shared scale made the wider pages
+    // run off the right edge
+    async function renderAll(zoomF: number) {
       const seq = ++renderSeq
       setHint(t("pdfViewer.renderingPages"))
       let next = 0
@@ -69,7 +87,7 @@ export default function PdfViewer({ url, downloads }: { url: string; downloads: 
         for (;;) {
           const i = next++
           if (i >= docPages.length || seq !== renderSeq) return
-          const vp = docPages[i].getViewport({ scale: scale * dpr })
+          const vp = docPages[i].getViewport({ scale: pages[i].fit * zoomF * dpr })
           const canvas = pages[i].canvas
           canvas.width = vp.width
           canvas.height = vp.height
@@ -98,7 +116,7 @@ export default function PdfViewer({ url, downloads }: { url: string; downloads: 
         setZoomPct(Math.round(zoom * 100))
         window.clearTimeout(zoomTimer)
         zoomTimer = window.setTimeout(() => {
-          if (pages[0]) void renderAll(pages[0].fit * zoom)
+          if (pages[0]) void renderAll(zoom)
         }, 120)
       },
     }
@@ -165,7 +183,7 @@ export default function PdfViewer({ url, downloads }: { url: string; downloads: 
         }),
       )
       if (destroyed) return
-      await renderAll(pages[0].fit)
+      await renderAll(1)
       markActive(0)
 
       // The page column no longer scrolls itself — the overlay panel around
@@ -200,33 +218,42 @@ export default function PdfViewer({ url, downloads }: { url: string; downloads: 
       <div className="tp-viewer-main">
         <div className="tp-pdf-viewer">
           <div className="tp-svg-controls">
-            <button type="button" className="tp-ctrl-btn" title={t("pdfViewer.zoomOut")} aria-label={t("pdfViewer.zoomOut")} onClick={() => controllerRef.current?.zoom("out")}>
-              &minus;
-            </button>
-            <span className="tp-svg-zoom-level">{zoomPct}%</span>
-            <button type="button" className="tp-ctrl-btn" title={t("pdfViewer.zoomIn")} aria-label={t("pdfViewer.zoomIn")} onClick={() => controllerRef.current?.zoom("in")}>
-              +
-            </button>
-            <button type="button" className="tp-ctrl-btn" onClick={() => controllerRef.current?.zoom("reset")}>
-              {t("pdfViewer.reset")}
-            </button>
-            <span className="tp-layer-toggle">{hint}</span>
+            {!mainOverride && (
+              <>
+                <button type="button" className="tp-ctrl-btn" title={t("pdfViewer.zoomOut")} aria-label={t("pdfViewer.zoomOut")} onClick={() => controllerRef.current?.zoom("out")}>
+                  &minus;
+                </button>
+                <span className="tp-svg-zoom-level">{zoomPct}%</span>
+                <button type="button" className="tp-ctrl-btn" title={t("pdfViewer.zoomIn")} aria-label={t("pdfViewer.zoomIn")} onClick={() => controllerRef.current?.zoom("in")}>
+                  +
+                </button>
+                <button type="button" className="tp-ctrl-btn" onClick={() => controllerRef.current?.zoom("reset")}>
+                  {t("pdfViewer.reset")}
+                </button>
+                <span className="tp-layer-toggle">{hint}</span>
+              </>
+            )}
+            {toolbarRight && <span className="tp-toolbar-right">{toolbarRight}</span>}
           </div>
-          <div className="tp-pdf-scroll" ref={scrollRef} />
-          {error && <p className="panel-loading err">{t("pdfViewer.couldNotLoad", { error })}</p>}
+          <div className="tp-pdf-scroll" ref={scrollRef} hidden={!!mainOverride} />
+          {mainOverride}
+          {error && !mainOverride && <p className="panel-loading err">{t("pdfViewer.couldNotLoad", { error })}</p>}
         </div>
         <div className="tp-modal-actions" style={{ marginTop: 12 }}>
           {downloads}
         </div>
       </div>
-      <aside className="tp-parts-card tp-pdf-pages-card">
-        <div className="tp-parts-head">
-          <h3>
-            {t("pdfViewer.pages")} <span className="tp-parts-count">{pageCount || ""}</span>
-          </h3>
-        </div>
-        <div className="tp-parts-list" ref={thumbsRef} />
-      </aside>
+      <div className={aside ? "tp-pdf-side" : undefined} style={aside ? undefined : { display: "contents" }}>
+        <aside className="tp-parts-card tp-pdf-pages-card">
+          <div className="tp-parts-head">
+            <h3>
+              {t("pdfViewer.pages")} <span className="tp-parts-count">{pageCount || ""}</span>
+            </h3>
+          </div>
+          <div className="tp-parts-list" ref={thumbsRef} />
+        </aside>
+        {aside}
+      </div>
     </div>
   )
 }

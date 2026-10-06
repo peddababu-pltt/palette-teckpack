@@ -212,7 +212,17 @@ export const BASE_M = {
   head: 57, crotchDepth: 28, heel: 34,
 }
 export const GIRTHS = new Set(['chest', 'waist', 'hips', 'seat', 'neck', 'biceps', 'wrist', 'ankle', 'knee', 'highBust', 'underbust', 'bustSpan', 'upperLeg', 'waistBack', 'seatBack', 'bustFront', 'head', 'heel'])
-export const SIZE_FACTOR = { XS: 0.88, S: 0.94, M: 1.0, L: 1.06, XL: 1.13, XXL: 1.2, unknown: 1.0 }
+export const SIZE_FACTOR = { XS: 0.88, S: 0.94, M: 1.0, L: 1.06, XL: 1.13, XXL: 1.2, '2XL': 1.2, '3XL': 1.27, '4XL': 1.34, unknown: 1.0 }
+// The sizes the UI offers (frontend api.ts SIZES) — vision's "XXL" is the same as "2XL".
+export const SIZE_KEYS = ['XS', 'S', 'M', 'L', 'XL', '2XL', '3XL', '4XL']
+
+// hpsToWaistBack -> "HPS to waist back" (HPS = high point of shoulder)
+export function humanLabel(key) {
+  const words = key.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().split(' ')
+  return words
+    .map((w, i) => (w === 'hps' ? 'HPS' : i === 0 ? w.charAt(0).toUpperCase() + w.slice(1) : w))
+    .join(' ')
+}
 
 export function defaultMeasurements(size) {
   const f = SIZE_FACTOR[size] ?? 1.0

@@ -26,6 +26,7 @@ multi-tenant storage. Every route app.py exposes is ported here, 1:1.
 import asyncio
 import io
 import json
+import re
 import shutil
 import sys
 import uuid
@@ -54,7 +55,16 @@ router = PluginRouter(tags=["techpack"])
 
 REPO_ROOT = PLUGIN_ROOT.parent
 JOBS_DIR = REPO_ROOT / "jobs"
-JOBS_DIR.mkdir(exist_ok=True)
+# The directory above the plugin isn't always writable (the appstore review
+# sandbox mounts it read-only), so fall back to a private temp dir rather than
+# crashing at import time.
+try:
+    JOBS_DIR.mkdir(exist_ok=True)
+except OSError:
+    import tempfile
+
+    JOBS_DIR = Path(tempfile.gettempdir()) / "techpack-jobs"
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 # backend/api/main.py -> backend/api -> backend -> pipeline
 # Copies of the pipeline scripts, vendored here so this plugin doesn't reach
@@ -78,6 +88,11 @@ sys.modules.pop("_bootstrap_node", None)
 sys.path.insert(0, str(PIPELINE_DIR))
 from _bootstrap_node import ensure_node, ensure_npm_packages  # noqa: E402
 
+# Same eviction for the ctx.llm bridge, which lives next to this file.
+sys.modules.pop("llm_bridge", None)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import llm_bridge  # noqa: E402
+
 NODE_PACKAGES = [
     "@freesewing/aaron@^4.10.0", "@freesewing/albert@^4.10.0", "@freesewing/ashley@^4.10.0",
     "@freesewing/bee@^4.10.0", "@freesewing/bella@^4.10.0", "@freesewing/benjamin@^4.10.0",
@@ -97,7 +112,7 @@ NODE_PACKAGES = [
     "@freesewing/tina@^4.10.0", "@freesewing/titan@^4.10.0", "@freesewing/toni@^4.10.0",
     "@freesewing/tristan@^4.10.0", "@freesewing/uma@^4.10.0", "@freesewing/umbra@^4.10.0",
     "@freesewing/wahid@^4.10.0", "@freesewing/yuri@^4.10.0",
-    "@google/genai@^2.10.0", "pdf-lib@^1.17.1", "@resvg/resvg-js@^2.6.2",
+    "@google/genai@^2.16.0", "pdf-lib@^1.17.1", "@resvg/resvg-js@^2.6.2",
 ]
 
 # cairosvg-adjacent native libs some pipeline stages load via ctypes; on
@@ -129,6 +144,9 @@ def subprocess_env(ctx: PluginContext) -> dict:
         value = ctx.secret(key, "")
         if value:
             env[key] = value
+    # Hosted: Claude/Gemini calls go through ctx.llm via the loopback bridge
+    # (see llm_bridge.py); the job's runner releases the session when it ends.
+    env.update(llm_bridge.env_for(ctx))
     return env
 
 JOB_QUEUES: dict[str, asyncio.Queue] = {}
@@ -181,6 +199,7 @@ def job_paths(job_id: str):
         "pattern_svg": job_dir / "pattern.svg",
         "pattern_pages_pdf": job_dir / "pattern-pages.pdf",
         "pattern_design": job_dir / "pattern-design.json",
+        "pattern_pieces_json": job_dir / "pattern-pieces.json",
         "measure_input": job_dir / "measure_input.jpg",
         "measure_out": job_dir / "measurements.json",
         "user_measurements": job_dir / "user-measurements.json",
@@ -255,6 +274,7 @@ async def run_multi_stage(slot: str, steps: list[tuple[str, list[str]]], on_succ
         await queue.put(json.dumps({"event": "error", "message": str(e)}))
     finally:
         CANCELLED.discard(slot)
+        llm_bridge.release(env)
         await queue.put("__END__")
 
 
@@ -278,10 +298,27 @@ async def run_node_stage(slot: str, stage_name: str, cmd: list[str], on_success,
         await asyncio.to_thread(ensure_npm_packages, PIPELINE_DIR, NODE_PACKAGES)
         cmd[0] = ensure_node(PIPELINE_DIR)
     except Exception as e:
+        llm_bridge.release(env)
         await queue.put(json.dumps({"event": "error", "message": str(e)}))
         await queue.put("__END__")
         return
     await run_stage(slot, stage_name, cmd, on_success, env)
+
+
+async def run_node_multi(slot: str, steps: list[tuple[str, list[str]]], on_success, env: dict | None = None):
+    """run_multi_stage for a mix of python + node steps: node is bootstrapped once first."""
+    queue = JOB_QUEUES[slot]
+    try:
+        await queue.put(f"[{steps[0][0]}] preparing Node.js runtime and packages...")
+        await asyncio.to_thread(ensure_npm_packages, PIPELINE_DIR, NODE_PACKAGES)
+        node = ensure_node(PIPELINE_DIR)
+        steps = [(name, [node if c == "node" else c for c in cmd]) for name, cmd in steps]
+    except Exception as e:
+        llm_bridge.release(env)
+        await queue.put(json.dumps({"event": "error", "message": str(e)}))
+        await queue.put("__END__")
+        return
+    await run_multi_stage(slot, steps, on_success, env)
 
 
 def _default_sketch_name(paths) -> str:
@@ -289,7 +326,15 @@ def _default_sketch_name(paths) -> str:
 
 
 def _file_url(job_id: str, rel: str) -> str:
-    return f"/api/v1/plugins/techpack/jobs/{job_id}/file/{rel}"
+    # Versioned by the file's own mtime: job files are rewritten in place
+    # (redrafts, the white-background pass on realistic.png), and an <img>
+    # keeps showing whatever copy the browser cached under the bare URL --
+    # copies cached before job_file sent Cache-Control never revalidate.
+    url = f"/api/v1/plugins/techpack/jobs/{job_id}/file/{rel}"
+    try:
+        return f"{url}?v={int((JOBS_DIR / job_id / rel).stat().st_mtime)}"
+    except OSError:
+        return url
 
 
 def _variations_response(job_id: str, paths) -> list[dict]:
@@ -319,6 +364,7 @@ def _outputs_response(job_id: str, paths) -> dict:
         "pattern_svg": url("pattern_svg", "pattern.svg"),
         "pattern_pages": url("pattern_pages_pdf", "pattern-pages.pdf"),
         "design": url("pattern_design", "pattern-design.json"),
+        "pattern_pieces": url("pattern_pieces_json", "pattern-pieces.json"),
         "measurements": measurements,
         "redraw": url("regen_out", "sketch_regen.png"),
     }
@@ -338,8 +384,41 @@ async def health() -> Response:
 
 @router.get("/assets/pdf.worker.min.mjs")
 async def pdfjs_worker() -> Response:
-    worker_path = Path(__file__).parent.parent.parent / "node_modules" / "pdfjs-dist" / "build" / "pdf.worker.min.mjs"
+    worker_path = (
+        Path(__file__).parent.parent.parent
+        / "node_modules"
+        / "pdfjs-dist"
+        / "build"
+        / "pdf.worker.min.mjs"
+    )
     return FileResponse(str(worker_path), media_type="application/javascript")
+
+
+# Optional realistic body for the sewing pattern's 3D preview: drop a CC0 / licensed
+# A-pose human model at backend/assets/mannequin.glb and the viewer uses it instead
+# of its built-in sized mannequin (404 = use the built-in one).
+MANNEQUIN_GLB = Path(__file__).resolve().parents[1] / "assets" / "mannequin.glb"
+
+
+@router.get("/assets/mannequin.glb", dependencies=[require_permission("resources:read")])
+async def mannequin_model() -> Response:
+    if not MANNEQUIN_GLB.is_file():
+        return JSONResponse({"error": "no mannequin model installed"}, status_code=404)
+    return FileResponse(str(MANNEQUIN_GLB), media_type="model/gltf-binary")
+
+
+# 3D virtual try-on assets (scanned body + pre-fitted garment scans), extracted by
+# scripts/extract-vton-assets.py into backend/assets/vton/.
+VTON_DIR = Path(__file__).resolve().parents[1] / "assets" / "vton"
+VTON_TYPES = {".json": "application/json", ".bin": "application/octet-stream", ".jpg": "image/jpeg"}
+
+
+@router.get("/assets/vton/{name}", dependencies=[require_permission("resources:read")])
+async def vton_asset(name: str) -> Response:
+    path = VTON_DIR / name
+    if not re.fullmatch(r"[a-z0-9_]+\.(json|bin|jpg)", name) or not path.is_file():
+        return JSONResponse({"error": "no such try-on asset"}, status_code=404)
+    return FileResponse(str(path), media_type=VTON_TYPES[path.suffix], headers={"Cache-Control": "public, max-age=86400"})
 
 
 @router.post("/run", dependencies=[require_permission("resources:write")])
@@ -385,12 +464,16 @@ async def analyze(image: UploadFile = File(...), ctx: PluginContext = Depends(ge
     with tempfile.TemporaryDirectory() as tmp:
         tmp_image = Path(tmp) / f"upload{suffix}"
         tmp_image.write_bytes(data)
-        proc = await asyncio.create_subprocess_exec(
-            ensure_node(PIPELINE_DIR), str(PIPELINE_DIR / "analyze-upload.mjs"), str(tmp_image),
-            cwd=str(REPO_ROOT), env=subprocess_env(ctx),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
+        env = subprocess_env(ctx)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                ensure_node(PIPELINE_DIR), str(PIPELINE_DIR / "analyze-upload.mjs"), str(tmp_image),
+                cwd=str(REPO_ROOT), env=env,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+        finally:
+            llm_bridge.release(env)
 
     if proc.returncode != 0:
         try:
@@ -535,6 +618,47 @@ async def generate(
     return Response(content=json.dumps({"job_id": job_id}), media_type="application/json")
 
 
+@router.post("/jobs/pattern-image", dependencies=[require_permission("resources:write")])
+async def pattern_image(
+    image: UploadFile = File(...),
+    longest_cm: float = Form(70.0),
+    size: str = Form("M"),
+    ctx: PluginContext = Depends(get_plugin_context),
+) -> Response:
+    """An image of sewing-pattern pieces -> a job with pattern-pieces.json (segmented +
+    classified) and pattern-design.json, ready for the 3D garment workspace."""
+    data = await image.read()
+    err = image_error(data)
+    if err:
+        return JSONResponse({"error": f"image {err}"}, status_code=400)
+    if not (5 <= longest_cm <= 300):
+        return JSONResponse({"error": "longest_cm must be between 5 and 300"}, status_code=400)
+    size = size.strip().upper()
+    if size not in PATTERN_SIZES:
+        size = "M"
+    job_id = uuid.uuid4().hex[:12]
+    paths = job_paths(job_id)
+    paths["dir"].mkdir(parents=True)
+    sheet = paths["dir"] / "pattern-sheet.png"
+    save_reference_png(data, sheet)
+
+    def on_success():
+        return {
+            "event": "stage_done", "job_id": job_id, "stage": "pattern-image",
+            "pattern_pieces": _file_url(job_id, "pattern-pieces.json"),
+            "design": _file_url(job_id, "pattern-design.json"),
+        }
+
+    steps = [
+        ("segment", [sys.executable, str(PIPELINE_DIR / "pattern_segment.py"), str(sheet), str(paths["dir"]),
+                     "--longest-cm", str(longest_cm)]),
+        ("classify", ["node", str(PIPELINE_DIR / "pattern-image.mjs"), str(paths["dir"]), size, str(sheet)]),
+    ]
+    JOB_QUEUES[job_id] = asyncio.Queue()
+    asyncio.create_task(run_node_multi(job_id, steps, on_success, subprocess_env(ctx)))
+    return Response(content=json.dumps({"job_id": job_id}), media_type="application/json")
+
+
 @router.post("/jobs/new-with-sketch", dependencies=[require_permission("resources:write")])
 async def new_with_sketch(sketch: UploadFile = File(...)) -> Response:
     if not sketch.filename:
@@ -602,13 +726,16 @@ async def jobs_list() -> Response:
         else:
             continue
         display = job_dir / display_name
+        # the dashboard card shows what the user put in; the sketch and its
+        # variations stay inside the job page
+        card = paths["input"] if paths["input"].is_file() else display
         classification_path = job_dir / "classification.json"
         classification = json.loads(classification_path.read_text()) if classification_path.is_file() else None
         jobs.append({
             "job_id": job_id,
             "sketch": _file_url(job_id, display_name),
-            "thumb": (f"/api/v1/plugins/techpack/jobs/{job_id}/thumb/{display_name}"
-                      f"?v={int(display.stat().st_mtime)}"),
+            "thumb": (f"/api/v1/plugins/techpack/jobs/{job_id}/thumb/{card.name}"
+                      f"?v={int(card.stat().st_mtime)}"),
             "input": _file_url(job_id, "input.jpg") if paths["input"].is_file() else None,
             "size_kb": round(display.stat().st_size / 1024, 1),
             "mtime": display.stat().st_mtime,
@@ -769,11 +896,45 @@ async def stage4(job_id: str, ctx: PluginContext = Depends(get_plugin_context)) 
     return Response(content=json.dumps({"ok": True}), media_type="application/json")
 
 
+PATTERN_SIZES = {"XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL"}
+
+
 @router.post("/jobs/{job_id}/stage5", dependencies=[require_permission("resources:write")])
-async def stage5(job_id: str, ctx: PluginContext = Depends(get_plugin_context)) -> Response:
+async def stage5(
+    job_id: str,
+    size: str = Form(""),
+    measurements: str = Form(""),
+    ctx: PluginContext = Depends(get_plugin_context),
+) -> Response:
+    """Drafts (or redrafts) the sewing pattern. `size` + `measurements` come from the
+    pattern tab's size/measurement editor: when either is sent, they replace the
+    job's user-measurements.json so the redraft uses exactly what's on screen."""
     paths = job_paths(job_id)
     if not paths["sketch"].is_file():
         return JSONResponse({"error": "stage 1 output missing — run stage 1 first"}, status_code=400)
+
+    size = size.strip().upper()
+    if size and size not in PATTERN_SIZES:
+        return JSONResponse({"error": f"unknown size {size}"}, status_code=400)
+    if size or measurements.strip():
+        numeric = {}
+        if measurements.strip():
+            try:
+                parsed = json.loads(measurements)
+            except ValueError:
+                return JSONResponse({"error": "measurements is not valid JSON"}, status_code=400)
+            if not isinstance(parsed, dict):
+                return JSONResponse({"error": "measurements must be an object"}, status_code=400)
+            numeric = {
+                k: v for k, v in parsed.items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v < 400
+            }
+        payload: dict = {"measurements": numeric}
+        if size:
+            payload["size"] = size
+        # A redraft must not race a draft still reading the old file.
+        if job_slot(job_id, "stage5") not in JOB_PROCS:
+            paths["user_measurements"].write_text(json.dumps(payload, indent=2))
 
     cmd = ["node", str(PIPELINE_DIR / "photo-draft.mjs"), str(effective_sketch(paths))]
     if paths["user_measurements"].is_file():
@@ -795,6 +956,48 @@ async def stage5(job_id: str, ctx: PluginContext = Depends(get_plugin_context)) 
             "event": "stage_done", "stage": 5,
             "file": _file_url(job_id, "pattern.svg"),
             "pages_file": _file_url(job_id, "pattern-pages.pdf"),
+            "pieces_file": _file_url(job_id, "pattern-pieces.json"),
+        },
+        subprocess_env(ctx),
+    ))
+    return Response(content=json.dumps({"ok": True}), media_type="application/json")
+
+
+@router.post("/jobs/{job_id}/garment3d", dependencies=[require_permission("resources:write")])
+async def garment3d(
+    job_id: str,
+    colour: str = Form("#2f3b4d"),
+    desc: str = Form(""),
+    region: str = Form("upper"),
+    ctx: PluginContext = Depends(get_plugin_context),
+) -> Response:
+    """Real 3D garment for the try-on: the uploaded cloth photo (else the flat
+    sketch) laid out in a T-pose by nano-banana, front + back, and reconstructed
+    into a GLB by three.ws Forge (garment3d.py). The photos are uploaded to
+    three.ws for this."""
+    paths = job_paths(job_id)
+    sketch = effective_sketch(paths)
+    photo = paths["input"]
+    if not photo.is_file() and not sketch.is_file():
+        return JSONResponse({"error": "this techpack has no input image yet"}, status_code=400)
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", colour):
+        return JSONResponse({"error": "colour must be #rrggbb"}, status_code=400)
+    if region not in ("upper", "lower"):
+        return JSONResponse({"error": "region must be upper or lower"}, status_code=400)
+    slot = job_slot(job_id, "garment3d")
+    if slot in JOB_PROCS:
+        return Response(content=json.dumps({"ok": True}), media_type="application/json")
+    cmd = [sys.executable, str(PIPELINE_DIR / "garment3d.py"), str(sketch if sketch.is_file() else photo),
+           str(paths["dir"]), "--colour", colour, "--desc", desc[:200], "--region", region]
+    if photo.is_file():
+        cmd += ["--photo", str(photo)]
+    JOB_QUEUES[slot] = asyncio.Queue()
+    asyncio.create_task(run_stage(
+        slot, "garment3d", cmd,
+        lambda: {
+            "event": "stage_done", "stage": "garment3d",
+            "file": _file_url(job_id, "garment3d.glb"),
+            "meta": _file_url(job_id, "garment3d.json"),
         },
         subprocess_env(ctx),
     ))
@@ -827,6 +1030,61 @@ async def job_measure(
         subprocess_env(ctx),
     ))
     return Response(content=json.dumps({"ok": True}), media_type="application/json")
+
+
+def _blender_bin() -> str | None:
+    """Blender for the high-quality garment simulation, if this host has it."""
+    import shutil
+    for cand in (_os.environ.get("BLENDER_PATH"), shutil.which("blender"),
+                 "/Applications/Blender.app/Contents/MacOS/Blender"):
+        if cand and Path(cand).is_file():
+            return cand
+    return None
+
+
+@router.get("/simulate/available", dependencies=[require_permission("resources:read")])
+async def simulate_available() -> Response:
+    return Response(content=json.dumps({"available": bool(_blender_bin())}), media_type="application/json")
+
+
+@router.post("/jobs/{job_id}/simulate", dependencies=[require_permission("resources:write")])
+async def simulate_garment(job_id: str, payload: UploadFile = File(...), ctx: PluginContext = Depends(get_plugin_context)) -> Response:
+    """High-quality cloth simulation in Blender: the workspace sends the fitted body +
+    assembled pieces + stitches; the result is garment-sim.json (positions) +
+    garment.glb. Async: progress on the job's "simulate" event stream."""
+    blender = _blender_bin()
+    if not blender:
+        return JSONResponse({"available": False, "error": "Blender is not installed on this server"}, status_code=501)
+    paths = job_paths(job_id)
+    if not paths["dir"].is_dir():
+        return JSONResponse({"error": "no such job"}, status_code=404)
+    raw = await payload.read()
+    try:
+        json.loads(raw)
+    except ValueError:
+        return JSONResponse({"error": "payload is not valid JSON"}, status_code=400)
+    sim_in = paths["dir"] / "garment-sim-input.json"
+    sim_in.write_bytes(raw)
+    slot = job_slot(job_id, "simulate")
+    if slot in JOB_PROCS:
+        return Response(content=json.dumps({"job_id": job_id, "status": "running"}), media_type="application/json")
+
+    def on_success():
+        return {
+            "event": "stage_done", "stage": "simulate",
+            "result": _file_url(job_id, "garment-sim.json"),
+            "glb": _file_url(job_id, "garment.glb"),
+        }
+
+    JOB_QUEUES[slot] = asyncio.Queue()
+    asyncio.create_task(run_stage(
+        slot, "simulate",
+        [blender, "-b", "--factory-startup", "--python", str(PIPELINE_DIR / "blender_sim.py"), "--",
+         str(sim_in), str(paths["dir"] / "garment-sim.json"), str(paths["dir"] / "garment.glb")],
+        on_success,
+        subprocess_env(ctx),
+    ))
+    return Response(content=json.dumps({"job_id": job_id, "status": "queued"}), media_type="application/json")
 
 
 @router.get("/jobs/{job_id}/parts", dependencies=[require_permission("resources:read")])
@@ -902,7 +1160,15 @@ async def job_file(job_id: str, path: str, dl: int = 0) -> Response:
     # which is why this passes filename= either way instead of omitting the
     # header for the inline case.
     disposition = "attachment" if dl else "inline"
-    return FileResponse(file_path, filename=file_path.name, content_disposition_type=disposition)
+    # Job files are rewritten in place by every redraft, while the frontend's
+    # ?v= cache-buster is the job's SKETCH mtime -- unchanged by a redraft. With
+    # no Cache-Control the browser kept heuristically serving stale copies
+    # (measured: a shorts job's pattern-pieces.json came back as its old
+    # 3-piece, polygon-less version, so the try-on's pattern view stayed off).
+    # no-cache = always revalidate; FileResponse's ETag/Last-Modified make an
+    # unchanged file a cheap 304.
+    return FileResponse(file_path, filename=file_path.name, content_disposition_type=disposition,
+                        headers={"Cache-Control": "no-cache"})
 
 
 THUMB_SIZE = (800, 600)
