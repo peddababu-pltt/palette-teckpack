@@ -164,7 +164,7 @@ export async function screenImage(imagePath) {
   const client = new GoogleGenAI({ apiKey })
   const ask = async (extra = '') => {
     const res = await client.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3.8-flash',
       contents: [{
         role: 'user',
         parts: [

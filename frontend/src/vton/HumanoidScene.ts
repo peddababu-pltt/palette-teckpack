@@ -47,12 +47,15 @@ export class HumanoidScene {
   private region: Region = "upper"
   private easeCm = 2
   private garmentScale = 1 // the garment's size over the figure's (size changes grow the garment, not the body)
+  private lengthCm = 0 // the pattern's top length (HPS to hem), when known
+  private fabricRef: FabricRef | null = null // the garment photos' tones, for cleanDarkTexels
   private spin = false
   private pattern: PatternPiece[] | null = null
   private papers = new Map<string, PaperSrc>()
   private patternGroup: THREE.Group | null = null
   private covered: Float32Array[] = [] // the fitted garment's vertices, for tintUnderGarment
   private fabric: THREE.Color | null = null
+  private sideFill: SideFill | null = null // torso sides left bare by raised sleeves
   private mode: ViewMode = "3d"
 
   constructor(private host: HTMLElement) {
@@ -127,7 +130,7 @@ export class HumanoidScene {
     this.mode = mode
     if (this.garment) this.garment.visible = mode === "3d"
     if (this.patternGroup) this.patternGroup.visible = mode === "pattern"
-    if (this.body && this.covered.length) tintUnderGarment(this.body, mode === "3d" ? this.covered : [], this.surface, this.fabric)
+    if (this.body && this.covered.length) tintUnderGarment(this.body, mode === "3d" ? this.covered : [], this.surface, this.fabric, this.sideFill)
     // the rack sits beside the figure: step back and over so all of it is in view
     if (mode === "pattern") {
       this.camera.position.set(0.45, 1.2, 6.2)
@@ -137,10 +140,18 @@ export class HumanoidScene {
   }
 
   /** The reconstructed garment (garment3d.glb's scene); null takes it off. */
-  setGarment(root: THREE.Object3D | null, easeCm = this.easeCm, scale = this.garmentScale) {
+  setGarment(root: THREE.Object3D | null, easeCm = this.easeCm, scale = this.garmentScale, lengthCm = this.lengthCm) {
     this.garmentSrc = root
     this.easeCm = easeCm
     this.garmentScale = scale
+    this.lengthCm = lengthCm
+    this.dressGarment()
+  }
+
+  /** The tones of the photos the garment was reconstructed from: texels darker
+   *  than the photos ever are get the photos' fabric colour (cleanDarkTexels). */
+  setFabricRef(ref: FabricRef | null) {
+    this.fabricRef = ref
     this.dressGarment()
   }
 
@@ -180,10 +191,16 @@ export class HumanoidScene {
   private dropGarment() {
     if (this.body && this.covered.length) tintUnderGarment(this.body, [], null, null)
     this.covered = []
+    this.sideFill = null
     if (!this.garment) return
     this.figure.remove(this.garment)
-    // the GLB's materials stay with its scene for the next fit
-    this.garment.traverse((o) => { if ((o as THREE.Mesh).isMesh) (o as THREE.Mesh).geometry.dispose() })
+    // the GLB's materials stay with its scene for the next fit (side panels own theirs)
+    this.garment.traverse((o) => {
+      const m = o as THREE.Mesh
+      if (!m.isMesh) return
+      m.geometry.dispose()
+      if (m.userData.ownMaterial) (m.material as THREE.Material).dispose()
+    })
     this.garment = null
   }
 
@@ -192,15 +209,27 @@ export class HumanoidScene {
     const src = this.garmentSrc, fit = this.fit, surf = this.surface, body = this.body
     if (!src || !fit || !surf || !body) return
     const gap = Math.max(0.6, this.easeCm * 0.6) / 100
-    const placed = placeOnBody(src, body, fit, surf, this.region, gap, this.garmentScale)
+    const placed = placeOnBody(src, body, fit, surf, this.region, gap, this.garmentScale, this.lengthCm, this.fabricRef)
     if (this.region === "upper") {
       // Arms into the sleeves as the reconstruction actually made them (they
       // droop ~10-15 deg below level even when asked for a T-pose); a level
       // T-pose left the arms bare above the sleeves. Re-bake the skin after,
       // so the push-out below collides with the arms where they now are.
       tPose(body)
-      armsIntoSleeves(body, placed.positions)
+      if (placed.hanging) {
+        // sleeves made hanging: the arms go down into them, the cloth is tied
+        // to the skin's bones there, and rides up with the arms into the T-pose
+        armsDownSleeves(body, placed.positions)
+        const before = placed.positions.map((p) => p.slice())
+        rideIntoTPose(body, placed.positions)
+        placed.pieces.forEach(({ g }, i) => dropTorn(g, before[i], placed.positions[i]))
+      }
+      armsIntoSleeves(body, placed.positions) // and centred in them
       this.surface = bakeSurface(body)
+      if (placed.hanging) {
+        dropFlaps(body, placed, this.surface)
+        this.sideFill = sideFillOf(body, placed.positions)
+      }
     }
     const group = new THREE.Group()
     for (const { geometry, material } of finishFit(placed, this.surface!, gap)) {
@@ -214,7 +243,11 @@ export class HumanoidScene {
     this.figure.add(group)
     this.covered = placed.positions
     this.fabric = fabricColour(group)
-    if (this.mode === "3d") tintUnderGarment(body, this.covered, this.surface, this.fabric)
+    if (this.sideFill && this.fabric) {
+      const panel = sidePanels(this.surface!, placed.positions, this.sideFill, gap, this.fabric)
+      if (panel) group.add(panel)
+    }
+    if (this.mode === "3d") tintUnderGarment(body, this.covered, this.surface, this.fabric, this.sideFill)
 
     // the arms may have moved into the sleeves: the sleeve pieces follow them
     this.layoutPattern()
@@ -372,10 +405,16 @@ function anchorsOf(body: THREE.Object3D, fit: Fit, surf: BodySurface): Anchors {
 interface Placed {
   pieces: { g: THREE.BufferGeometry; material: THREE.Material }[]
   positions: Float32Array[]
+  hanging?: boolean // a top whose sleeves hang down its sides (not a T-pose)
 }
 
+// Asked for a T-pose, the reconstruction still often comes back with the
+// sleeves hanging down the sides like a product shot. Its top quarter is then
+// about as wide as its lower body; in a real T-pose the sleeves make it far wider.
+const HANGING_RATIO = 1.3
+
 /** Scales and places the garment on the figure (no collision yet). */
-function placeOnBody(src: THREE.Object3D, body: THREE.Object3D, fit: Fit, surf: BodySurface, region: Region, gap: number, scale = 1): Placed {
+function placeOnBody(src: THREE.Object3D, body: THREE.Object3D, fit: Fit, surf: BodySurface, region: Region, gap: number, scale = 1, lengthCm = 0, fabricRef: FabricRef | null = null): Placed {
   src.updateMatrixWorld(true)
   const pieces: { g: THREE.BufferGeometry; material: THREE.Material }[] = []
   src.traverse((o) => {
@@ -384,7 +423,7 @@ function placeOnBody(src: THREE.Object3D, body: THREE.Object3D, fit: Fit, surf: 
     const g = m.geometry.clone()
     g.applyMatrix4(m.matrixWorld)
     const mat = (Array.isArray(m.material) ? m.material[0] : m.material) as THREE.Material
-    if (mat instanceof THREE.MeshStandardMaterial) { mat.side = THREE.DoubleSide; mat.metalness = 0 }
+    if (mat instanceof THREE.MeshStandardMaterial) { mat.side = THREE.DoubleSide; mat.metalness = 0; if (fabricRef) cleanDarkTexels(mat, fabricRef) }
     pieces.push({ g, material: mat })
   })
   if (!pieces.length) return { pieces, positions: [] }
@@ -412,7 +451,35 @@ function placeOnBody(src: THREE.Object3D, body: THREE.Object3D, fit: Fit, surf: 
   const armX = Math.abs(arm?.x ?? fit.shoulderX)
 
   let s: number, top: number
+  let hanging = false
   if (region === "upper") {
+    const low = [0.7, 0.8, 0.9].map(widthAt).filter((w) => w > 0).sort((a, b) => a - b)
+    const lowW = low.length ? low[Math.floor(low.length / 2)] : 0
+    hanging = lowW > 0 && widthAt(0.25) < lowW * HANGING_RATIO
+  }
+  if (hanging) {
+    top = neckY + 0.03
+    // the lower bands hold the sleeves too, so width can't size it: its height
+    // can -- the pattern's HPS-to-hem length plus a collar standing over the HPS
+    const chest = torsoBand(surf, fit.chestY, armX * 0.95)
+    const want = lengthCm > 0 ? lengthCm / 100 + 0.05 : 0
+    s = want ? want / size.y : chest ? (chest.half + gap) * 1.1 / (widthAt(0.4) * 0.62) : 0.75 / size.y
+    // a tall (shawl, funnel) collar makes "neck + 3cm" hang it low: rest its
+    // shoulder line on the figure's shoulders instead, over the shoulder joint
+    if (arm) {
+      const X = Math.abs(arm.x)
+      let gTop = -Infinity
+      points((x, y) => { if (Math.abs(Math.abs((x - cx) * s) - X) < 0.01) gTop = Math.max(gTop, y) })
+      let skinTop = -Infinity
+      for (let i = 0; i < surf.verts.length; i += 3) {
+        if (Math.abs(Math.abs(surf.verts[i]) - X) < 0.01 && Math.abs(surf.verts[i + 1] - arm.y) < 0.15) skinTop = Math.max(skinTop, surf.verts[i + 1])
+      }
+      if (gTop > -Infinity && skinTop > -Infinity) {
+        const shoulder = top - (box.max.y - gTop) * s
+        top += Math.min(0.15, Math.max(-0.05, skinTop + gap - shoulder))
+      }
+    }
+  } else if (region === "upper") {
     top = neckY + 0.03 // the collar stands a little above the neck's base
     // in a T-pose the sleeves fill the top third of the garment's height, so its
     // body is read below them (lower bands, median) and wrapped round the chest
@@ -475,7 +542,71 @@ function placeOnBody(src: THREE.Object3D, body: THREE.Object3D, fit: Fit, surf: 
         pos[i + 2] = midZ + (pos[i + 2] - midZ) * k
       }
   }
-  return { pieces, positions }
+  return { pieces, positions, hanging }
+}
+
+/** The reconstruction joins a hanging sleeve to the body with long thin
+ *  triangles across the gap between them; once the sleeve is raised those
+ *  stretch into a web. Triangles the raise stretched are dropped. */
+function dropTorn(g: THREE.BufferGeometry, before: Float32Array, pos: Float32Array) {
+  const idx = g.getIndex()
+  const count = pos.length / 3
+  const src = idx ? (idx.array as ArrayLike<number>) : Uint32Array.from({ length: count }, (_, i) => i)
+  const len2 = (p: Float32Array, a: number, b: number) => (p[a * 3] - p[b * 3]) ** 2 + (p[a * 3 + 1] - p[b * 3 + 1]) ** 2 + (p[a * 3 + 2] - p[b * 3 + 2]) ** 2
+  const torn = (a: number, b: number) => {
+    const now = len2(pos, a, b)
+    return now > 0.03 * 0.03 && now > len2(before, a, b) * 1.8 * 1.8
+  }
+  const keep: number[] = []
+  let dropped = false
+  for (let t = 0; t + 2 < src.length; t += 3) {
+    const a = src[t], b = src[t + 1], c = src[t + 2]
+    if (torn(a, b) || torn(b, c) || torn(a, c)) { dropped = true; continue }
+    keep.push(a, b, c)
+  }
+  if (dropped) g.setIndex(keep)
+}
+
+/** The garment photos' darkest real tone (a low percentile of their
+ *  non-background pixels) and their median fabric colour, 0-255. */
+export interface FabricRef { floor: number; r: number; g: number; b: number }
+
+/** The reconstruction bakes what its photos never showed (under the arms, a
+ *  sleeve cut off at the frame) close to black, and those blotches read as
+ *  holes or burns on the cloth. A texel darker than anything in the photos
+ *  can't be the garment's own colour, so it takes the photos' fabric colour,
+ *  keeping a little of its shading. Measured against the photos, not the
+ *  texture, so a garment that really is black stays black. Done once per
+ *  material: the GLB's materials are reused across refits. */
+function cleanDarkTexels(mat: THREE.MeshStandardMaterial, ref: FabricRef) {
+  const tex = mat.map
+  if (!tex || mat.userData.texelsCleaned) return
+  mat.userData.texelsCleaned = true
+  const img = tex.image as (CanvasImageSource & { width: number; height: number }) | undefined
+  if (!img?.width || !img?.height || ref.floor <= 0) return
+  try {
+    const cv = document.createElement("canvas")
+    cv.width = img.width; cv.height = img.height
+    const ctx = cv.getContext("2d", { willReadFrequently: true })!
+    ctx.drawImage(img, 0, 0)
+    const data = ctx.getImageData(0, 0, cv.width, cv.height)
+    const px = data.data
+    let changed = 0
+    for (let i = 0; i < px.length; i += 4) {
+      if (px[i + 3] < 128) continue
+      const l = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2]
+      if (l >= ref.floor) continue
+      const k = 0.8 + 0.2 * (l / ref.floor) // keep a little shading
+      px[i] = ref.r * k; px[i + 1] = ref.g * k; px[i + 2] = ref.b * k
+      changed++
+    }
+    if (!changed) return
+    ctx.putImageData(data, 0, 0)
+    tex.image = cv
+    tex.needsUpdate = true
+  } catch {
+    // unreadable texture: left as it is
+  }
 }
 
 /** Collides the placed garment with the (posed) skin and builds its meshes. */
@@ -563,7 +694,72 @@ function pushOut(pos: Float32Array, surf: BodySurface, gap: number): boolean[] {
  *  hands past the cuffs keep their colour) with cloth within COVER_M out along
  *  the skin's normal. `positions` empty clears it. */
 const COVER_M = 0.1
-function tintUnderGarment(body: THREE.Object3D, positions: Float32Array[], surf: BodySurface | null, fabric: THREE.Color | null) {
+
+/** Cloth for the jacket's sides where the raised sleeves took it away: per
+ *  side, a half-elliptical shell round the torso from hem to armpit, a little
+ *  inside the garment's own outline (so the real cloth covers it wherever there
+ *  is any) and clear of the skin -- it reads as the jacket's lining. */
+function sidePanels(surf: BodySurface, positions: Float32Array[], fill: SideFill, gap: number, fabric: THREE.Color): THREE.Mesh | null {
+  const STEP = 0.02, SEG = 24, ARC = Math.PI * 0.32
+  const rows = Math.floor((fill.y1 - fill.y0) / STEP) + 1
+  if (rows < 2) return null
+  const verts: number[] = [], index: number[] = []
+  for (const side of [1, -1]) {
+    const base = verts.length / 3
+    let ok = 0
+    for (let r = 0; r < rows; r++) {
+      const y = fill.y0 + r * STEP
+      const body = torsoBand(surf, y, fill.maxX)
+      const cz = body ? body.cz : 0
+      // the garment's outline in this band, this side
+      let gx = 0, gz = 0
+      for (const pos of positions)
+        for (let i = 0; i < pos.length; i += 3) {
+          if (Math.sign(pos[i]) !== side || Math.abs(pos[i + 1] - y) > STEP * 0.75 || Math.abs(pos[i]) > fill.maxX * 1.8) continue
+          gx = Math.max(gx, Math.abs(pos[i])); gz = Math.max(gz, Math.abs(pos[i + 2] - cz))
+        }
+      const minA = (body ? body.half : 0.15) + gap, minB = (body ? body.depth / 2 : 0.1) + gap
+      const a = Math.max(minA, gx - 0.01), b = Math.max(minB, gz - 0.03)
+      if (body) ok++
+      for (let k = 0; k <= SEG; k++) {
+        // front -> side -> back, stopping short of the centre lines: the front
+        // and back are the garment's own cloth
+        const t = ARC * (-1 + (2 * k) / SEG)
+        verts.push(side * a * Math.cos(t), y, cz + b * Math.sin(t))
+      }
+    }
+    if (!ok) { verts.length = base * 3; continue }
+    for (let r = 0; r + 1 < rows; r++)
+      for (let k = 0; k < SEG; k++) {
+        const i0 = base + r * (SEG + 1) + k, i1 = i0 + 1, j0 = i0 + SEG + 1, j1 = j0 + 1
+        index.push(i0, j0, i1, i1, j0, j1)
+      }
+  }
+  if (!index.length) return null
+  const g = new THREE.BufferGeometry()
+  g.setAttribute("position", new THREE.Float32BufferAttribute(verts, 3))
+  g.setIndex(index)
+  g.computeVertexNormals()
+  const mat = new THREE.MeshStandardMaterial({ color: fabric, roughness: 0.9, metalness: 0, side: THREE.DoubleSide })
+  const mesh = new THREE.Mesh(g, mat)
+  mesh.userData.ownMaterial = true
+  mesh.castShadow = true
+  mesh.receiveShadow = true
+  return mesh
+}
+
+/** The torso between the garment's hem and the armpit: with hanging sleeves
+ *  raised, the cloth that made the jacket's sides went up with them. */
+interface SideFill { y0: number; y1: number; maxX: number }
+function sideFillOf(body: THREE.Object3D, positions: Float32Array[]): SideFill | null {
+  body.updateMatrixWorld(true)
+  const arm = boneOf(body, "LeftArm")?.getWorldPosition(new THREE.Vector3())
+  if (!arm) return null
+  let hem = Infinity
+  for (const pos of positions) for (let i = 1; i < pos.length; i += 3) hem = Math.min(hem, pos[i])
+  return hem < arm.y ? { y0: hem + 0.01, y1: arm.y - 0.02, maxX: Math.abs(arm.x) } : null
+}
+function tintUnderGarment(body: THREE.Object3D, positions: Float32Array[], surf: BodySurface | null, fabric: THREE.Color | null, fill: SideFill | null = null) {
   const COL = 0.02, DEPTH = 0.06
   const colKey = (x: number, z: number) => `${Math.floor(x / COL)},${Math.floor(z / DEPTH)}`
   const span = new Map<string, [number, number]>()
@@ -617,8 +813,11 @@ function tintUnderGarment(body: THREE.Object3D, positions: Float32Array[], surf:
         v.applyMatrix4(m.matrixWorld)
         const r = span.get(colKey(v.x, v.z))
         const n = (base + i) * 3
-        if (!r || v.y < r[0] + 0.01 || v.y > r[1] - 0.01) continue
-        if (!near(v.x, v.y, v.z, surf.normals[n], surf.normals[n + 1], surf.normals[n + 2])) continue
+        const filled = !!fill && v.y > fill.y0 && v.y < fill.y1 && Math.abs(v.x) < fill.maxX
+        if (!filled) {
+          if (!r || v.y < r[0] + 0.01 || v.y > r[1] - 0.01) continue
+          if (!near(v.x, v.y, v.z, surf.normals[n], surf.normals[n + 1], surf.normals[n + 2])) continue
+        }
         colors[i * 3] = tint.r; colors[i * 3 + 1] = tint.g; colors[i * 3 + 2] = tint.b
         any = true
       }
@@ -706,6 +905,139 @@ function armsIntoSleeves(body: THREE.Object3D, positions: Float32Array[]) {
     aim(fore, hand, cuff.clone().sub(f).normalize())
   }
   body.updateMatrixWorld(true)
+}
+
+/** For a top with hanging sleeves: each arm aimed straight down its sleeve,
+ *  from the shoulder joint to the cuff -- the centre of the cloth in the outer
+ *  quarter of that side, low down where the sleeve ends. */
+function armsDownSleeves(body: THREE.Object3D, positions: Float32Array[]) {
+  body.updateMatrixWorld(true)
+  let y0 = Infinity, y1 = -Infinity
+  for (const pos of positions) for (let i = 1; i < pos.length; i += 3) { y0 = Math.min(y0, pos[i]); y1 = Math.max(y1, pos[i]) }
+  if (!(y1 > y0)) return
+  for (const name of ["Left", "Right"]) {
+    const arm = boneOf(body, `${name}Arm`), fore = boneOf(body, `${name}ForeArm`), hand = boneOf(body, `${name}Hand`)
+    if (!arm || !fore || !hand) continue
+    const a = arm.getWorldPosition(new THREE.Vector3())
+    const side = Math.sign(a.x) || (name === "Left" ? 1 : -1)
+    let reach = 0
+    for (const pos of positions)
+      for (let i = 0; i < pos.length; i += 3) if (Math.sign(pos[i]) === side) reach = Math.max(reach, Math.abs(pos[i]))
+    const c = new THREE.Vector3()
+    let n = 0
+    for (const pos of positions)
+      for (let i = 0; i < pos.length; i += 3) {
+        if (Math.sign(pos[i]) !== side || Math.abs(pos[i]) < reach * 0.75 || pos[i + 1] > y0 + (y1 - y0) * 0.2) continue
+        c.x += pos[i]; c.y += pos[i + 1]; c.z += pos[i + 2]; n++
+      }
+    if (!n) continue
+    c.divideScalar(n)
+    const dir = c.sub(a).normalize()
+    aim(arm, fore, dir)
+    aim(fore, hand, dir)
+  }
+  body.updateMatrixWorld(true)
+}
+
+/** Moves the cloth with the skeleton from the body's current pose into its
+ *  T-pose: each vertex takes the bone weights of the nearest skin vertex and
+ *  follows those bones' motion (linear blend skinning, transferred). */
+function rideIntoTPose(body: THREE.Object3D, positions: Float32Array[]) {
+  body.updateMatrixWorld(true)
+  const bones: THREE.Bone[] = []
+  const boneId = new Map<THREE.Bone, number>()
+  const verts: number[] = [], skinIdx: number[] = [], skinW: number[] = []
+  const v = new THREE.Vector3()
+  body.traverse((o) => {
+    const m = o as THREE.SkinnedMesh
+    if (!m.isSkinnedMesh || !m.visible || !/body/i.test(m.name)) return
+    const pos = m.geometry.getAttribute("position"), si = m.geometry.getAttribute("skinIndex"), sw = m.geometry.getAttribute("skinWeight")
+    if (!si || !sw) return
+    for (const b of m.skeleton.bones) if (!boneId.has(b)) { boneId.set(b, bones.length); bones.push(b) }
+    for (let i = 0; i < pos.count; i++) {
+      m.getVertexPosition(i, v)
+      v.applyMatrix4(m.matrixWorld)
+      verts.push(v.x, v.y, v.z)
+      for (let k = 0; k < 4; k++) {
+        skinIdx.push(boneId.get(m.skeleton.bones[si.getComponent(i, k)])!)
+        skinW.push(sw.getComponent(i, k))
+      }
+    }
+  })
+  if (!bones.length) return
+  const grid = new Map<string, number[]>()
+  for (let i = 0; i < verts.length / 3; i++) {
+    const k = cellKey(Math.floor(verts[i * 3] / CELL), Math.floor(verts[i * 3 + 1] / CELL), Math.floor(verts[i * 3 + 2] / CELL))
+    let c = grid.get(k)
+    if (!c) grid.set(k, (c = []))
+    c.push(i)
+  }
+  const nearestSkin = (x: number, y: number, z: number) => {
+    const ci = Math.floor(x / CELL), cj = Math.floor(y / CELL), ck = Math.floor(z / CELL)
+    for (let r = 1; r <= 8; r++) {
+      let best = -1, bd = Infinity
+      for (let i = -r; i <= r; i++)
+        for (let j = -r; j <= r; j++)
+          for (let k = -r; k <= r; k++) {
+            if (Math.max(Math.abs(i), Math.abs(j), Math.abs(k)) < r - 1) continue // inner shells already searched
+            for (const b of grid.get(cellKey(ci + i, cj + j, ck + k)) || []) {
+              const d = (verts[b * 3] - x) ** 2 + (verts[b * 3 + 1] - y) ** 2 + (verts[b * 3 + 2] - z) ** 2
+              if (d < bd) { bd = d; best = b }
+            }
+          }
+      if (best >= 0) return best
+    }
+    return -1
+  }
+  const near = positions.map((pos) => {
+    const out = new Int32Array(pos.length / 3)
+    for (let i = 0; i < pos.length; i += 3) out[i / 3] = nearestSkin(pos[i], pos[i + 1], pos[i + 2])
+    return out
+  })
+  const before = bones.map((b) => b.matrixWorld.clone())
+  tPose(body)
+  const delta = bones.map((b, k) => b.matrixWorld.clone().multiply(before[k].clone().invert()))
+  const p = new THREE.Vector3(), acc = new THREE.Vector3(), tmp = new THREE.Vector3()
+  positions.forEach((pos, n) => {
+    for (let i = 0; i < pos.length; i += 3) {
+      const s = near[n][i / 3]
+      if (s < 0) continue
+      p.set(pos[i], pos[i + 1], pos[i + 2])
+      acc.set(0, 0, 0)
+      let wsum = 0
+      for (let k = 0; k < 4; k++) {
+        const w = skinW[s * 4 + k]
+        if (!w) continue
+        acc.addScaledVector(tmp.copy(p).applyMatrix4(delta[skinIdx[s * 4 + k]]), w)
+        wsum += w
+      }
+      if (wsum > 0) { acc.divideScalar(wsum); pos[i] = acc.x; pos[i + 1] = acc.y; pos[i + 2] = acc.z }
+    }
+  })
+}
+
+/** Body-side cloth near the armpit that rode up with an arm hangs under the
+ *  sleeve as a loose flap, far from any skin: out past the shoulder, below
+ *  the arm and more than FLAP_M from the skin. Those triangles are dropped. */
+const FLAP_M = 0.09
+function dropFlaps(body: THREE.Object3D, { pieces, positions }: Placed, surf: BodySurface) {
+  body.updateMatrixWorld(true)
+  const arm = boneOf(body, "LeftArm")?.getWorldPosition(new THREE.Vector3())
+  if (!arm) return
+  const armX = Math.abs(arm.x), armY = arm.y
+  pieces.forEach(({ g }, n) => {
+    const pos = positions[n]
+    const flap = new Array<boolean>(pos.length / 3).fill(false)
+    let any = false
+    for (let i = 0; i < pos.length; i += 3) {
+      const x = pos[i], y = pos[i + 1], z = pos[i + 2]
+      if (Math.abs(x) < armX + 0.03 || y > armY - 0.03) continue
+      const b = nearest(surf, x, y, z, Math.ceil(FLAP_M / CELL))
+      const far = b < 0 || (surf.verts[b * 3] - x) ** 2 + (surf.verts[b * 3 + 1] - y) ** 2 + (surf.verts[b * 3 + 2] - z) ** 2 > FLAP_M * FLAP_M
+      if (far) { flap[i / 3] = true; any = true }
+    }
+    if (any) dropBuried(g, flap, pos.length / 3)
+  })
 }
 
 function disposeTree(root: THREE.Object3D) {

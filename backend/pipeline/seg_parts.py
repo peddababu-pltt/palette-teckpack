@@ -58,6 +58,16 @@ DETAIL_MAX_LEN = 300   # long side; keeps a whole placket/seam strip out
 # than line art, which traces as solid black (see the pick in main()).
 INK_RATIO_CAP = 1.7
 
+# Tracing ink is cut at each line's own half-darkness edge (see trace_edge_ink):
+# a pixel stays ink only if darker than halfway between the darkest pixel
+# near it (the stroke's core) and the paper. The cut picked above is for
+# ENCLOSING regions and often lands high (227 on the bomber), which takes in
+# every stroke's anti-aliased halo: lines traced ~2x their drawn width and rib
+# hatching closed up into solid black bands. Both the paper tone and the
+# search window are measured per image, so any sketch -- any garment, any
+# resolution, any line weight or paper tint -- gets its own edge.
+TRACE_EDGE = os.environ.get("TRACE_EDGE", "1") != "0"
+
 # Faint-line bridge for the saved tracing ink (see bridge_faint_lines).
 BRIDGE_WEAK_T = int(os.environ.get("BRIDGE_WEAK_T", "215"))  # 0 disables
 BRIDGE_BODY_T = 200   # grey kept at full width along a bridged hairline
@@ -120,6 +130,28 @@ def stroke_width_map(ink):
     idx = ndimage.distance_transform_edt(~sk, return_distances=False,
                                          return_indices=True)
     return np.where(ink, 2.0 * dt[idx[0], idx[1]], 0.0), sk
+
+
+def trace_edge_ink(a, ink):
+    """`ink` trimmed to each stroke's 50%-darkness edge: a black outline loses
+    its grey halo, a faint grey line keeps its own (higher) halfway level.
+
+    paper  -- the image's own background: the median of the pixels outside
+              the ink (a cream or grey scan is not 255).
+    window -- wide enough to reach a stroke's core from its outer halo: twice
+              the stroke's half-width (distance-transform ridge, 95th
+              percentile so the heaviest outlines are covered), plus a margin.
+    """
+    if not TRACE_EDGE or not ink.any() or ink.all():
+        return ink
+    paper = int(np.median(a[~ink]))
+    dt = ndimage.distance_transform_edt(ink)
+    ridge = dt[(dt > 0) & (dt >= ndimage.maximum_filter(dt, size=3))]
+    half = float(np.percentile(ridge, 95)) if ridge.size else 2.0
+    win = int(min(31, max(5, 2 * round(half) + 3))) | 1
+    core = ndimage.minimum_filter(a.astype(np.int16), size=win)
+    # a pixel only as dark as the paper (no stroke near it) never counts
+    return ink & (a < (core + paper) // 2) & (core < paper - 8)
 
 
 def bridge_faint_lines(a, ink, t):
@@ -228,6 +260,76 @@ def load_gray(path):
         bg.alpha_composite(im)
         im = bg
     return im.convert("L")
+
+
+# Grey surface-design layer (see TWO_TONE_RULE in warp_pattern.py): prints,
+# stripes, texture and quilting are drawn as their own flat light grey
+# (~#A6A6A6) strokes that never touch the black line art. They must not become
+# parts or SVG layers, so they are removed before anything is segmented. A
+# stroke is judged as a whole: every connected mark whose DARKEST pixel is
+# still lighter than GREY_DESIGN_MIN is grey design and goes; a black line,
+# however faint its anti-aliased hairline gets, is connected to a near-black
+# core and stays. GREY_DESIGN_MIN=0 disables.
+GREY_DESIGN_MIN = int(os.environ.get("GREY_DESIGN_MIN", "130"))
+GREY_DESIGN_INK = 228  # what still counts as a mark at all (paper is ~255)
+
+
+GREY_SPECK_MAX = 40   # px: a mark this small touching grey design is part of it
+GREY_PIXEL_MIN = 100  # a pixel at least this light can be grey design...
+GREY_CORE_T = 90      # ...unless within GREY_CORE_EDGE px of a pixel darker
+GREY_CORE_EDGE = 2    # than this (a black stroke's own anti-aliased edge)
+GREY_RUN_MIN = int(os.environ.get("GREY_RUN_MIN", "40"))  # px: shortest grey run kept
+
+
+def strip_grey_design(img):
+    """-> (black-only image, grey-design mask). The mask is kept, not thrown
+    away: layered_trace_v4 paints it back in grey inside each part's own
+    layer, so the SVG shows the texture without it ever becoming a part."""
+    a = np.array(img)
+    none = np.zeros(a.shape, bool)
+    if not GREY_DESIGN_MIN:
+        return img, none
+    lab, n = ndimage.label(a < GREY_DESIGN_INK, structure=np.ones((3, 3)))
+    if not n:
+        return img, none
+    idx = np.arange(1, n + 1)
+    darkest = ndimage.minimum(a, lab, idx)
+    is_grey = darkest >= GREY_DESIGN_MIN
+    grey = np.concatenate([[False], is_grey])[lab]
+    # Pixel rule on top of the whole-mark rule: the redraw does not always
+    # keep its grey lines clear of the black ones, and one quilting lattice
+    # touching the outline makes the whole lattice a single mark with a black
+    # pixel in it (measured: quilt line centres at ~198, all of it kept as
+    # black ink). A pixel that is clearly grey AND farther than a black
+    # stroke's own anti-aliased edge from any near-black core is design ink.
+    core = a < GREY_CORE_T
+    near_core = ndimage.binary_dilation(core, iterations=GREY_CORE_EDGE)
+    cand = (a < GREY_DESIGN_INK) & (a >= GREY_PIXEL_MIN) & ~near_core
+    # Only long runs: a thin BLACK line's faint edge pixels pass the test too,
+    # in short broken bits along it, and pulling those out split sleeve
+    # stripes and rib ticks into scribbly black+grey fragments. Real grey
+    # design (a quilting line, a stripe) is one long run of its own.
+    cl, cn = ndimage.label(cand, structure=np.ones((3, 3)))
+    if cn:
+        sizes = ndimage.sum_labels(cand, cl, np.arange(1, cn + 1))
+        grey |= np.concatenate([[False], sizes >= GREY_RUN_MIN])[cl]
+    # Where two grey lines cross, or a grey line clips another, the overlap
+    # prints darker than either line and splits off as its own tiny mark that
+    # passes the darkness test -- it was traced as a black dot at every
+    # quilting crossing. A speck that small sitting on grey design is grey.
+    areas = ndimage.sum_labels(np.ones_like(a), lab, idx)
+    near = ndimage.binary_dilation(grey, iterations=2)
+    touches = ndimage.maximum(near, lab, idx).astype(bool)
+    speck = (~is_grey) & (areas <= GREY_SPECK_MAX) & touches
+    grey |= np.concatenate([[False], speck])[lab]
+    out = a.copy()
+    out[grey] = 255
+    if not grey.any():
+        return img, none
+    print(f"grey design: {int(is_grey.sum())} grey marks + {int(speck.sum())} "
+          f"crossing specks ({grey.mean() * 100:.2f}% of canvas) -> grey.png, "
+          f"black line art only for segmentation")
+    return Image.fromarray(out), grey
 
 
 def validate_input(src):
@@ -347,11 +449,46 @@ def split_dangling_seams(ink, final, min_area, gap_tol=25):
     return final
 
 
+FILL_GAP_MAX = 30  # px: farthest an enclosed unlabeled pixel may sit from a region
+
+
+def fill_enclosed_gaps(ink, final):
+    """Hand enclosed white the segmentation left unlabeled to the nearest region.
+
+    The barrier closing that seals hairline breaks also fills tight gaps
+    between rib lines, so the white at the ends of a rib cuff/hem band
+    becomes no region at all. The band's region then stops short of its own
+    end ribs and edge, the tracer's boundary band never reaches that ink, and
+    the cuff came out of the SVG with its ends and bottom edge missing. White
+    that the RAW ink fully encloses (not connected to the page background) is
+    garment interior by definition, so it joins the closest region.
+    """
+    white = ~ink
+    wl, _ = ndimage.label(white)
+    border = np.unique(np.concatenate([wl[0], wl[-1], wl[:, 0], wl[:, -1]]))
+    gaps = white & ~np.isin(wl, border) & (final == 0)
+    if not gaps.any() or not final.any():
+        return final
+    dist, (iy, ix) = ndimage.distance_transform_edt(final == 0, return_indices=True)
+    take = gaps & (dist <= FILL_GAP_MAX)
+    out = final.copy()
+    out[take] = final[iy[take], ix[take]]
+    print(f"enclosed gaps: {int(take.sum())}px of unlabeled interior joined "
+          f"to the nearest region")
+    return out
+
+
 def main(in_png, outdir, min_area=1500, _tile_escalations=0, _drop_thin=False):
     min_area_arg = int(min_area)
     os.makedirs(outdir, exist_ok=True)
     src = load_gray(in_png)
     validate_input(src)
+    src, grey = strip_grey_design(src)
+    # Grey design at the input's own resolution; layered_trace_v4 resizes it
+    # onto work.png (which is this image at most upscaled and edge-trimmed).
+    grey_img = np.full(grey.shape, 255, np.uint8)
+    grey_img[grey] = np.array(load_gray(in_png))[grey]
+    Image.fromarray(grey_img).save(os.path.join(outdir, "grey.png"))
     # thin-line sketches trace badly at low res: upscale small images 2x
     if max(src.size) < 1400:
         src = src.resize((src.width * 2, src.height * 2), Image.LANCZOS)
@@ -495,7 +632,7 @@ def main(in_png, outdir, min_area=1500, _tile_escalations=0, _drop_thin=False):
                   f"lightest candidate's ink (shading, not line art)")
     open(os.path.join(outdir, "threshold.txt"), "w").write(str(t))
     # cleaned ink for tracing; segmentation below keeps the unbridged cut
-    np.save(os.path.join(outdir, "ink.npy"), bridge_faint_lines(a, ink, t))
+    np.save(os.path.join(outdir, "ink.npy"), trace_edge_ink(a, bridge_faint_lines(a, ink, t)))
 
     # Surface stitching (quilt lattice, rib hatching) encloses regions exactly
     # like a seam does. When the pass below has flagged this sketch as a
@@ -647,6 +784,7 @@ def main(in_png, outdir, min_area=1500, _tile_escalations=0, _drop_thin=False):
         final[lab == i] = remap[r]
 
     final = split_dangling_seams(seg_ink, final, min_area)
+    final = fill_enclosed_gaps(ink, final)
     next_id = int(final.max()) + 1
 
     np.save(os.path.join(outdir, "labels.npy"), final)

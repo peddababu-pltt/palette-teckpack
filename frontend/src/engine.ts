@@ -137,15 +137,34 @@ export class StageEngine {
     }
 
     const onLine = makeLogProgress((p) => {
-      live.pct = p
+      live.pct = Math.max(live.pct, p)
       this.emit()
     }, kind)
 
-    await new Promise<void>((resolve) => {
+    // A stage reports few milestones (and on the hosted app its log lines may
+    // not arrive at all), so the bar sat at 0% for the whole draft. Estimate
+    // from elapsed time -- quick at first, easing toward 90% -- and let real
+    // milestones push it further; it never moves backwards, and reaches 100%
+    // only when the stage is done.
+    const t0 = Date.now()
+    const tau = kind === "parts" ? 35 : 50 // seconds to ~63%
+    const ticker = window.setInterval(() => {
+      const est = Math.round(90 * (1 - Math.exp(-(Date.now() - t0) / 1000 / tau)))
+      if (est > live.pct) {
+        live.pct = est
+        this.emit()
+      }
+    }, 1000)
+
+    await new Promise<void>((done) => {
+      const resolve = () => {
+        window.clearInterval(ticker)
+        done()
+      }
       let payload: any = null
       watchJob(this.pluginId, job.job_id, {
         onProgress: (d) => {
-          live.pct = d.percent
+          live.pct = Math.max(live.pct, d.percent)
           this.emit()
         },
         onLine,
@@ -164,6 +183,8 @@ export class StageEngine {
                 [spec.outKey]: payload.file,
                 ...(payload.pages_file ? { pattern_pages: payload.pages_file } : {}),
                 ...(payload.pieces_file ? { pattern_pieces: payload.pieces_file } : {}),
+                // the 3D try-on reads the garment type / sizes from it
+                ...(payload.design_file ? { design: payload.design_file } : {}),
               },
             }))
             // the pattern pages PDF also goes into the org's Data Room
@@ -195,7 +216,10 @@ export class StageEngine {
   // nobody has to ask for them, and by the time the card is opened they are
   // usually done.
   autoTrace(job: Job) {
-    if (!job.has_sketch) return
+    // not while its sketch is still being made: the parts and pattern would
+    // trace the raw flat instead of the final "Default" image. The generate
+    // run's own onDone calls this again once it finishes.
+    if (!job.has_sketch || job.generating) return
     ;(["parts", "pattern"] as const).forEach((kind) => {
       if (!job.outputs[SVG_KINDS[kind].outKey]) this.queue(job, kind)
     })

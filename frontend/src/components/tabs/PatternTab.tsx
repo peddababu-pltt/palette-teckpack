@@ -112,6 +112,7 @@ export default function PatternTab({ job, pluginId, engine }: { job: Job; plugin
 // the user pauses -- no separate button. Only fields that differ from the size's
 // defaults are sent, so the draft log / design.json can tell which were the user's.
 const EDIT_REDRAFT_DELAY_MS = 900
+const PREVIEW_SIZE = "L" // the 3D try-on's starting size
 
 // Same wording as designs.mjs humanLabel -- applied here too so patterns drafted
 // before that changed ("Hps To Waist Back") read the same as new ones.
@@ -143,8 +144,13 @@ function PatternSizePanel({ job, engine, onValues, preview }: {
     void fetchJson<PatternDesign>(designUrl).then((d) => {
       if (cancelled || !d) return
       setDesign(d)
-      setSize(d.size && (SIZES as readonly string[]).includes(d.size) ? d.size : "M")
-      setValues(Object.fromEntries((d.measurements || []).map((m) => [m.key, m.cm == null ? "" : String(m.cm)])))
+      // the 3D try-on opens on size L, filled from that size's table
+      const tableL = preview ? d.sizeTable?.[PREVIEW_SIZE] : undefined
+      setSize(tableL ? PREVIEW_SIZE : d.size && (SIZES as readonly string[]).includes(d.size) ? d.size : "M")
+      setValues(Object.fromEntries((d.measurements || []).map((m) => {
+        const cm = tableL ? tableL[m.key] ?? m.cm : m.cm
+        return [m.key, cm == null ? "" : String(cm)]
+      })))
     })
     return () => {
       cancelled = true

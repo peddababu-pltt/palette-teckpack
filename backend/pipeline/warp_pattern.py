@@ -12,6 +12,7 @@ import mimetypes
 import os
 import random
 import sys
+import time
 from pathlib import Path
 
 import anthropic
@@ -24,6 +25,60 @@ load_dotenv()
 API_KEY = os.getenv("LLM_ROUTER_API_KEY")
 BASE_URL = os.getenv("LLM_ROUTER_BASE_URL", "https://api.your-router.com/v1/images/edit")
 UPSCALE_URL = os.getenv("LLM_ROUTER_UPSCALE_URL", "https://router-api.pltt.ai/image/upscale")
+
+# Two inks, two jobs, and no stitching. The flat used to be pure black only
+# with every print and fabric texture deleted, so a striped or embroidered
+# garment came back as a blank shell. Part outlines and construction stay
+# black; surface design (including quilting) is kept in a flat light grey that
+# never touches the black, and seg_parts.strip_grey_design() removes it before
+# segmentation, so the parts SVG and every vision step see black line art only.
+# Stitch / topstitch dashes are not drawn at all. regen_sketch.py and the
+# design variants reuse this same rule.
+TWO_TONE_RULE = (
+    "TWO INK COLORS — BLACK FOR PARTS, GREY FOR SURFACE DESIGN. Every mark in the drawing belongs "
+    "to exactly one of two layers. "
+    "BLACK LAYER (pure black #000000): the outer silhouette, the outline of EVERY garment part "
+    "(body panels, collar, yoke, sleeves, cuffs, waistband, plackets, pockets, flaps, tabs, belt "
+    "loops, hood, badges/patches as shapes), every construction seam, dart, pleat, fold and gather "
+    "line, zips, buttons, snaps and other hardware, and rib-knit ticks. "
+    "NO STITCHING AT ALL: do not draw any stitch line, topstitch line, dashed line, edge-stitch, "
+    "bartack or stitch mark anywhere on the garment — not along seams, pockets, hems, plackets, "
+    "flies, waistbands, cuffs, collars or zips — even where the photo or input clearly shows "
+    "stitching. Every edge and seam is ONE solid line with nothing running beside it. "
+    "ONE exception: a dashed line that runs ACROSS a panel or sleeve from one edge to the other "
+    "(a puffer baffle / quilting channel line, a quilting grid) is not edge stitching -- it marks "
+    "the quilting. Redraw it as ONE thin SOLID GREY line in the grey layer below, at the same "
+    "position: never delete it, never draw it black. "
+    "Removing stitching NEVER changes what a part is. A button or snap PLACKET -- two parallel "
+    "lines down the center front with buttons/snaps between them and topstitch dashes along its "
+    "edges -- stays a plain placket strip with exactly those buttons/snaps once the dashes are "
+    "gone. Never fill a placket strip with zipper teeth, never add a zip pull, never turn it into "
+    "a zip. "
+    "BUTTONS, SNAPS AND HARDWARE ARE COPIED, NOT REDESIGNED: same count, same positions, same "
+    "shape as the input -- a ring with a hole stays a ring with a hole, a snap with a small tab "
+    "keeps its tab, drawn as hollow black outlines (never solid black dots). "
+    "GREY LAYER (one flat light-medium grey, about #A6A6A6, the same grey everywhere): the surface "
+    "DESIGN that sits on the fabric rather than being cut and sewn — prints, graphics, logos, "
+    "lettering, embroidery, appliqué motifs, stripes, plaid/check, florals, camo, jacquard or knit "
+    "motifs (cable, argyle, fair-isle), and visible fabric texture such as corduroy wales, twill, "
+    "denim, or a boucle/terry surface — plus quilting / baffle / channel lines across a padded "
+    "panel (drawn as SOLID grey lines, never dashed) and the interior artwork inside a badge or "
+    "patch. Draw the "
+    "grey layer as thin clean line art that copies the photo's design faithfully: same motif, same "
+    "position, same scale, same direction, same repeat spacing, clipped neatly to the part it sits "
+    "on and kept INSIDE that part's black outline. Stripes are grey lines, plaid is a grey line "
+    "grid, a print is its grey outline drawing, a texture is a light, evenly spaced grey line "
+    "pattern suggesting it. Ignore the photo's COLORS (no color, no tint, no hue), but never drop "
+    "its DESIGN: a printed, striped, embroidered or textured garment must not come back as a blank "
+    "white shell. "
+    "Keep the two layers cleanly apart: grey never replaces a black construction line, never "
+    "touches or runs over a black outline or seam (stop each grey line a small white gap short of "
+    "any black line it would meet — "
+    "never touching), and is never used for a part boundary. Grey is LINES only — no grey fill, no grey "
+    "shading, no gradients, no shadows, no solid grey blocks. A plain fabric with no print, "
+    "pattern or visible texture gets NO grey at all; do not invent a design the photo does not "
+    "show. "
+)
 
 FLAT_SKETCH_PROMPT = (
     "Redraw THIS EXACT garment as a fashion flat technical sketch. "
@@ -39,8 +94,9 @@ FLAT_SKETCH_PROMPT = (
     "topstitch representations and both are FORBIDDEN here. A pocket edge is ONE line, not two lines "
     "close together. A hem is ONE line. A neckline is ONE line. A yoke seam is ONE line. Draw it that "
     "way even when the photo clearly shows topstitching there. This overrides the feature-for-feature "
-    "matching rule below for these four parts only; topstitch dashes elsewhere on the garment "
-    "(princess seam, fly, quilting/baffle lines across a panel) are unaffected. "
+    "matching rule below. And it is not limited to these four parts: NO stitching or topstitch "
+    "line is drawn ANYWHERE on the garment (see the NO STITCHING rule); quilting/baffle lines are "
+    "drawn as solid grey surface lines, not stitches. "
     "THE BOTTOM EDGE, SPECIFICALLY. Unless the garment truly has a rib-knit band there — a real band "
     "carrying visible vertical rib ticks, like the cuffs do — the body simply ENDS at its bottom "
     "edge, drawn as ONE line. Do NOT draw a second line running parallel a short distance above that "
@@ -57,12 +113,13 @@ FLAT_SKETCH_PROMPT = (
     "do not resolve a feature you cannot see clearly by inventing a definite one, and do not upgrade a "
     "plain detail into a fancier one (no flap added to a plain pocket, no button added to a plain tab). "
     "An area of the garment the photo shows as empty stays empty. "
-    "IGNORE any color, print, plaid, stripes, or fabric pattern in the input — render the fabric "
-    "as plain solid white with no texture, no hatching, no gray fill, no pattern of any kind. "
+    "IGNORE the color of the input — render the fabric as white. Its print, plaid, stripes, "
+    "graphics, embroidery and fabric texture are NOT ignored: they are drawn as the grey surface "
+    "layer described in the TWO INK COLORS rule, never as black lines and never as fill. "
     "Show TWO views side by side: FRONT view on the left, BACK view on the right "
     "(back view inferred from the same garment). "
-    "Only pure black outline lines on a pure white background, flat 2D, no body, no mannequin, "
-    "no shadows, no shading, no fill of any kind — white fabric with black lines only. "
+    "Only pure black construction lines (plus the grey surface-design lines) on a pure white "
+    "background, flat 2D, no body, no mannequin, no shadows, no shading, no fill of any kind. "
     "The outer silhouette outline must be solid, fully opaque pure black (#000000), drawn as thin a "
     "hairline as it can be while staying fully opaque and unbroken, and hold ONE "
     "constant width along its ENTIRE length, all the way around the garment — never tapering from "
@@ -78,17 +135,18 @@ FLAT_SKETCH_PROMPT = (
     "taper to a point, never fade out, thin down, or lighten toward gray as it approaches its tip. "
     "A line that trails off or loses ink at the end (common at shoulder seams, yoke seams, dart tips, "
     "and other line endpoints) is a defect — cut it off with a blunt, full-strength end instead. "
-    "EVERY line in the image — including pleat/fold lines, gather lines, dart lines, and any other "
-    "secondary or interior lines — must be drawn in the exact same pure black ink as the main outline. "
+    "EVERY construction line in the image — including pleat/fold lines, gather lines, dart lines, and "
+    "any other secondary or interior construction lines — must be drawn in the exact same pure black "
+    "ink as the main outline. "
     "NEVER render pleat/fold/gather lines (or any other 'secondary' line) in gray or any lighter tone "
-    "to suggest depth or softness — there is only ONE ink color in this drawing: pure black. If a line "
+    "to suggest depth or softness — construction has only ONE ink color: pure black. If a line "
     "is thinner or lighter-weight than another, that must come from stroke width alone, never from a "
     "gray/lighter color value. "
     "If the input photo shows the garment being worn by a person, or any person, skin, face, "
     "hands, hair, or body parts elsewhere in the frame, COMPLETELY REMOVE them — extract and "
     "flatten only the garment itself, as if it were laid flat with nothing inside or around it. "
     "The output must contain the garment ONLY: no humans, no mannequins, no body silhouette. "
-    "Include all construction details visible in the input: seams, stitching, darts, "
+    "Include all construction details visible in the input (but never stitching): seams, darts, "
     "collar, cuffs, plackets, pockets, closures, hems. "
     "FUR/SHEARLING/FAUX-FUR TRIM: if the input shows a fur, shearling, or faux-fur collar, cuff, or "
     "hood trim, draw its edge as a gentle, open, evenly-spaced scalloped or wavy border — like a "
@@ -122,7 +180,7 @@ FLAT_SKETCH_PROMPT = (
     "DRAW A ZIP ONLY IF THE PHOTO SHOWS ONE. Look at the garment first and decide: are zipper TEETH "
     "actually visible in the photo? If they are not, this garment has no exposed zip and you must not "
     "draw one. A concealed fly — the ordinary front of jeans, chinos, corduroys and most trousers and "
-    "skirts — is drawn as a fly seam with its curved topstitching line and whatever waistband button or "
+    "skirts — is drawn as a fly seam with its curved solid fly-front line and whatever waistband button or "
     "hook the photo shows, and NOTHING else: no rails, no teeth, no slider, no pull. The same holds "
     "everywhere else on the garment: a seam is not a zip, a placket is not a zip, and a pocket opening "
     "with no visible teeth is not a zip. Inventing a zip changes what the factory builds, so when in "
@@ -153,7 +211,7 @@ FLAT_SKETCH_PROMPT = (
     "the top of the "
     "strip. A single plain or dashed line with no tick marks, or teeth on only one side, is NOT an "
     "acceptable zip, it reads as ordinary topstitching and must not be used for a zip. EVERY line in the "
-    "drawing — outer silhouette, seams, darts, topstitching, "
+    "drawing — outer silhouette, seams, darts, "
     "AND every closure/hardware piece (zipper rails, zipper pull/slider, snaps, buttons, "
     "hooks) — must be drawn as a single hairline-thin stroke of the SAME light weight, all the way "
     "through. NEVER render any of them as a solid/thick black fill, a bold heavy stroke, or a dense "
@@ -176,7 +234,7 @@ FLAT_SKETCH_PROMPT = (
     "like every other panel on the garment. Color and material differences are not drawn at all in this "
     "flat sketch; only construction lines are. A solid black waistband, collar facing, belt loop, or "
     "pull tab copied from a dark-colored photo is exactly the defect to avoid. "
-    "NO STITCH DASHES ON THESE PARTS. Pockets, hem, neckline and yoke line are drawn with SOLID "
+    "NO STITCH DASHES, ESPECIALLY ON THESE PARTS. Pockets, hem, neckline and yoke line are drawn with SOLID "
     "outlines only — never with dashed topstitch marks, and never with a dashed line running "
     "parallel to them, even if the input photo clearly shows topstitching there. Specifically: "
     "  pockets — all edges, flap, opening, sides, bottom; "
@@ -186,15 +244,38 @@ FLAT_SKETCH_PROMPT = (
     "  neckline — the neck opening edge, neckline seam, neckband/binding edges, and any neck "
     "facing line, on both front and back views; "
     "  yoke line — the front yoke seam and the back yoke seam, across their full width. "
-    "Draw each of these as a single clean solid line. Topstitch dashes elsewhere on the garment "
-    "(e.g. along a princess seam or a fly) are still allowed and unaffected by this rule. "
-    "To be unambiguous: outline, seams, darts, pleat/fold/gather lines, topstitch dashes, buttons, "
+    "Draw each of these as a single clean solid line. The same no-stitch rule applies everywhere "
+    "else on the garment too (princess seam, fly, side seams, sleeves) — no topstitch dashes "
+    "anywhere. "
+    "To be unambiguous: outline, seams, darts, pleat/fold/gather lines, buttons, "
     "snaps, zip rails and pull, badges, patches, and labels — every single mark anywhere in this "
     "drawing, front and back, with no exception besides the zip teeth rule above — is drawn in the "
-    "same pure black hairline ink. Nothing in the image is gray, faded, dim, or any color other than "
-    "pure black on pure white. "
-    "The sketch must be recognizable as the same garment shape as the input photo, but with blank white fabric."
+    "same pure black hairline ink. The ONLY grey in the image is the surface-design layer (print, "
+    "pattern, texture, graphic, badge artwork); nothing structural is grey, faded or dim, and "
+    "nothing is any color. "
+    + TWO_TONE_RULE +
+    "The sketch must be recognizable as the same garment shape AND the same surface design as the "
+    "input photo, drawn on white fabric."
 )
+
+
+# fal's Nano Banana edit picks its own frame on "auto" and can return a wide
+# image for a 4:3 flat, cropping the legs off; pin the input's shape instead.
+FAL_ASPECTS = ("21:9", "16:9", "3:2", "4:3", "5:4", "1:1", "4:5", "3:4", "2:3", "9:16")
+
+
+def keep_aspect_options(path: str) -> dict:
+    """provider_options that keep an edit's output at the input image's aspect ratio."""
+    import math
+
+    with Image.open(path) as im:
+        ratio = im.width / im.height
+
+    def dist(a: str) -> float:
+        w, h = a.split(":")
+        return abs(math.log(ratio * int(h) / int(w)))
+
+    return {"fal": {"aspect_ratio": min(FAL_ASPECTS, key=dist)}}
 
 
 def upload_image(path: str) -> str:
@@ -352,6 +433,39 @@ def build_payload(image_url: str, seed: int, reference_urls: list[str] | None = 
     }
 
 
+class RouterBusy(Exception):
+    """The router said try again later (a provider rate limit, an overload)."""
+
+
+# waits between tries of a busy image edit: about 3.5 minutes in all
+ROUTER_BACKOFF_S = (15, 30, 60, 90)
+
+
+def router_failed(msg, prefix: str = "router error: "):
+    """An error event from the router: RouterBusy when it is retryable, else exit."""
+    if isinstance(msg, dict) and msg.get("retryable", msg.get("status") in (429, 502, 503)):
+        raise RouterBusy(msg)
+    sys.exit(f"{prefix}{msg}")
+
+
+def with_router_retry(fn, *args, **kwargs):
+    """fn(*args, **kwargs), tried again after a pause while the router is busy
+    (retryable error events and HTTP 429/502/503)."""
+    for n, wait in enumerate((*ROUTER_BACKOFF_S, None)):
+        try:
+            return fn(*args, **kwargs)
+        except RouterBusy as e:
+            err = e.args[0]
+        except requests.HTTPError as e:
+            if e.response is None or e.response.status_code not in (429, 502, 503):
+                raise
+            err = f"HTTP {e.response.status_code}"
+        if wait is None:
+            sys.exit(f"router still busy after {n + 1} tries: {err}")
+        print(f"router busy ({err}) -> waiting {wait}s, then retry {n + 2}/{len(ROUTER_BACKOFF_S) + 1}", flush=True)
+        time.sleep(wait)
+
+
 def iter_sse_events(resp: requests.Response):
     """yield parsed JSON payload of each `data:` line in an SSE stream"""
     for raw_line in resp.iter_lines(decode_unicode=True):
@@ -373,6 +487,11 @@ def extract_outputs(data: dict):
 
 def _generate(image_url: str, seed: int, extra_prompt: str = "",
               reference_urls: list[str] | None = None) -> bytes:
+    return with_router_retry(_generate_once, image_url, seed, extra_prompt, reference_urls)
+
+
+def _generate_once(image_url: str, seed: int, extra_prompt: str = "",
+                   reference_urls: list[str] | None = None) -> bytes:
     """One image-gen call: builds the payload (with an optional correction
     appended to the prompt), posts it, and returns the resulting image bytes."""
     payload = build_payload(image_url, seed, reference_urls)
@@ -397,8 +516,7 @@ def _generate(image_url: str, seed: int, extra_prompt: str = "",
         last_event = event
         etype = event.get("event")
         if etype == "error":
-            msg = event.get("data", {}).get("error", event.get("data", {}))
-            sys.exit(f"router error: {msg}")
+            router_failed(event.get("data", {}).get("error", event.get("data", {})))
         found = extract_outputs(event.get("data", event))
         if found:
             out = found
@@ -407,6 +525,71 @@ def _generate(image_url: str, seed: int, extra_prompt: str = "",
         sys.exit(f"no image in stream; last event: {last_event}")
 
     return download_output(out[0])
+
+
+FIDELITY_RETRIES = int(os.environ.get("FIDELITY_RETRIES", "2"))
+
+
+def _check_input_fidelity(input_path: str, output_bytes: bytes) -> str | None:
+    """Compare the drawn flat against the INPUT and name anything invented or
+    changed. Returns None when faithful (or the judge is unavailable), else a
+    correction note for a retry.
+
+    The prompt alone does not stop it: a snap-placket puffer whose placket
+    topstitching the no-stitch rule removed came back with zipper teeth filling
+    the placket and the snaps redrawn as solid dots -- the long zip section of
+    the prompt reads as "draw a zip" to the image model. A text model reading
+    both images catches that reliably."""
+    def _png_b64(data: bytes) -> str:
+        buf = io.BytesIO()
+        img = Image.open(io.BytesIO(data))
+        (img.convert("RGB") if img.mode in ("CMYK", "P", "LA") else img).save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+
+    content = [
+        {"type": "text", "text": "INPUT (the garment to reproduce):"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+         "data": _png_b64(Path(input_path).read_bytes())}},
+        {"type": "text", "text": "OUTPUT (the technical flat drawn from it):"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+         "data": _png_b64(output_bytes)}},
+        {"type": "text", "text": (
+            "OUTPUT must reproduce INPUT's design exactly, with only these intended changes: color "
+            "removed, stitch/topstitch dashes removed, prints/textures/quilting lines shown as grey "
+            "lines, and a BACK view added if INPUT shows only the front. Judge only the FRONT view "
+            "against INPUT (plus anything INPUT's back view shows, if it has one). "
+            "Check, part by part: (1) closure TYPE -- zip vs buttons vs snaps vs placket: did "
+            "OUTPUT add a zip, zipper teeth or a zip pull INPUT does not have, or change the closure "
+            "type? (2) button/snap COUNT and shape on the front, the pockets, the sleeves. (3) "
+            "pockets, flaps, tabs, badges: same count, type and position? (4) any panel, seam, "
+            "collar or cuff added, removed or changed? (5) quilting/baffle lines that INPUT shows "
+            "dropped from OUTPUT? Ignore line weight, color, dash removal and drawing style. "
+            "Reply with ONLY a JSON object, no markdown fence: "
+            '{"ok": true} if OUTPUT is faithful, or '
+            '{"ok": false, "problems": ["<what OUTPUT got wrong, and what INPUT actually shows>", ...]}'
+        )},
+    ]
+    try:
+        msg = anthropic.Anthropic().messages.create(
+            model="claude-sonnet-4-6", max_tokens=1024,
+            messages=[{"role": "user", "content": content}])
+    except anthropic.APIError as e:
+        print(f"fidelity check: judge call failed ({e}) -- skipping check")
+        return None
+    text = "".join(b.text for b in msg.content if b.type == "text").strip()
+    text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        print(f"fidelity check: judge reply wasn't JSON ({text[:120]!r}) -- skipping check")
+        return None
+    problems = result.get("problems") or []
+    if result.get("ok", True) or not problems:
+        return None
+    return ("CORRECTION FROM THE PREVIOUS ATTEMPT -- it did not match the input garment: "
+            + "; ".join(problems)
+            + ". Redraw matching the input exactly: same closure type, same button/snap count and "
+            "shape, nothing added that the input does not show.")
 
 
 def photo_to_flat(input_path: str, output_path: str, seed: int | None,
@@ -429,6 +612,17 @@ def photo_to_flat(input_path: str, output_path: str, seed: int | None,
         print(f"reference compliance check flagged a miss -> retrying once: {feedback}")
         img_bytes = _generate(image_url, seed, extra_prompt=feedback,
                               reference_urls=reference_urls)
+
+    # References deliberately graft parts the input does not have, so the
+    # "nothing added" check only runs without them.
+    if not reference_urls:
+        for attempt in range(1, FIDELITY_RETRIES + 1):
+            note = _check_input_fidelity(input_path, img_bytes)
+            if not note:
+                print("fidelity check: output matches the input")
+                break
+            print(f"fidelity check flagged a mismatch -> retry {attempt}/{FIDELITY_RETRIES}: {note}")
+            img_bytes = _generate(image_url, random.randint(0, 2**31 - 1), extra_prompt=note)
 
     Path(output_path).write_bytes(img_bytes)
     print(f"saved → {output_path}")

@@ -163,6 +163,31 @@ export default function VtonViewer({ job, pluginId, onClose, measurePanel, liveC
   // the progress stream is single-reader server-side: a closed viewer lets go of it
   const genStream = useRef<EventSource | null>(null)
   useEffect(() => () => genStream.current?.close(), [])
+  // Don't depend on the progress stream to learn the garment is ready: on the
+  // hosted app it can drop (an EventSource carries no auth headers; proxies cut
+  // long connections), and the viewer then never looked again -- the figure
+  // stood bare until the 3D view was reopened. While a build runs, look for
+  // garment3d.json / .glb every 8s (re-reading genMetaUrl) for up to ~12 min.
+  const [polling, setPolling] = useState(false)
+  useEffect(() => {
+    if (!polling || hasGen) return
+    let ticks = 0
+    const id = window.setInterval(() => {
+      if (++ticks > 90) {
+        window.clearInterval(id)
+        setPolling(false)
+        setGen((g) => ({ ...g, busy: false, err: true, msg: t("vton.genTimeout") }))
+        return
+      }
+      setGenStamp(Date.now() / 1000)
+    }, 8000)
+    return () => window.clearInterval(id)
+  }, [polling, hasGen])
+  useEffect(() => {
+    if (!hasGen) return
+    setPolling(false)
+    setGen((g) => (g.busy ? { busy: false, pct: 100, msg: "", err: false, confirm: false } : g))
+  }, [hasGen])
 
   useEffect(() => {
     sceneRef.current?.setGenerated(hasGen && useGen ? genRoot.current : null)
@@ -194,14 +219,14 @@ export default function VtonViewer({ job, pluginId, onClose, measurePanel, liveC
       void loadBody(modelUrlFrom(fileUrl), JSON.parse(humanCm), String(design?.designKey || ""), mode as Gender).then(({ root, fit }) => {
         if (dead) return
         scene.setBody(root, fit, region)
-        scene.setGarment(hasGen && useGen ? genRoot.current : null, easeCm, garmentScale)
+        scene.setGarment(hasGen && useGen ? genRoot.current : null, easeCm, garmentScale, plan?.top?.lengthCm || 0)
         setHumanReady(true)
       }).catch((e) => { if (!dead) setError(e?.message || String(e)) })
     }, 250)
     return () => { dead = true; clearTimeout(timer) }
   }, [human, mode, region, humanCm, fileUrl, !!plan])
   useEffect(() => {
-    if (human && humanReady) humanRef.current?.setGarment(hasGen && useGen ? genRoot.current : null, easeCm, garmentScale)
+    if (human && humanReady) humanRef.current?.setGarment(hasGen && useGen ? genRoot.current : null, easeCm, garmentScale, plan?.top?.lengthCm || 0)
   }, [human, humanReady, hasGen, useGen, easeCm, genStamp, garmentScale])
   useEffect(() => { humanRef.current?.setSpin(spin && human) }, [spin, human])
   // ---- pattern view: the drafted pieces where they're worn, again after every redraft ----
@@ -285,6 +310,7 @@ export default function VtonViewer({ job, pluginId, onClose, measurePanel, liveC
     const desc = [job.classification?.subcategory, job.classification?.category, plan?.label].filter(Boolean).join(", ")
     const res = await startGarment3D(pluginId, job.job_id, colour, desc, plan?.top ? "upper" : "lower")
     if (res.error) { setGen({ busy: false, pct: 0, msg: res.error, err: true, confirm: false }); return }
+    setPolling(true)
     genStream.current?.close()
     genStream.current = watchJob(pluginId, job.job_id, {
       onLine: (l) => {
@@ -295,10 +321,18 @@ export default function VtonViewer({ job, pluginId, onClose, measurePanel, liveC
         else if (/garment3d:/.test(l)) setGen((g) => ({ ...g, msg: l.replace(/^.*garment3d:\s*/, "") }))
       },
       onDone: () => {
-        setGen({ busy: false, pct: 100, msg: "", err: false, confirm: false }); setUseGen(true); setGenStamp(Date.now() / 1000)
+        // the stream can also end early on the hosted app: keep "building" up
+        // and let the polling above pick the garment up when it lands
+        setGen((g) => ({ ...g, busy: true, pct: Math.max(g.pct, 95), err: false }))
+        setUseGen(true); setGenStamp(Date.now() / 1000)
         void saveToDataRoom(pluginId, job.job_id) // the 3D garment goes into the org's Data Room too
       },
-      onError: (msg) => setGen((g) => ({ ...g, busy: false, msg: g.msg ? `${msg} — ${g.msg}` : msg, err: true })),
+      onError: (msg) => {
+        // a dropped stream is not a failed build: keep waiting via the polling
+        if (msg === "lost connection to the server") { setGen((g) => ({ ...g, busy: true, err: false })); return }
+        setPolling(false)
+        setGen((g) => ({ ...g, busy: false, msg: g.msg ? `${msg} — ${g.msg}` : msg, err: true }))
+      },
       onCancelled: () => setGen({ busy: false, pct: 0, msg: "", err: false, confirm: false }),
     }, "garment3d")
   }
@@ -521,14 +555,19 @@ export default function VtonViewer({ job, pluginId, onClose, measurePanel, liveC
           )}
           {humanReady && viewMode === "pattern" && <p className="vt-pattern-note">{t("vton.patternNote")}</p>}
           {error && <div className="vt-msg err">{error}</div>}
-          {!error && !humanReady && <div className="vt-msg"><span className="tp-spinner" /> {t("vton.loading")}</div>}
-          {!error && humanReady && viewMode === "3d" && !(hasGen && useGen) && !genImages.length && <div className={`vt-badge${gen.err ? " err" : ""}`}>{gen.err ? gen.msg : <>{gen.busy && <span className="tp-spinner" />} {t("vton.humanNoGarment")}</>}</div>}
-          {!error && humanReady && viewMode === "3d" && !hasGen && genImages.length > 0 && (
-            <figure className="vt-tpose-card">
-              <img src={genImages[0]} alt={t("vton.genTpose")} />
-              <figcaption>{gen.busy ? <><span className="tp-spinner" /> {t("vton.genBuilding")} {gen.pct}%</> : t("vton.genTpose")}</figcaption>
-            </figure>
-          )}
+          {!error && !humanReady && <div className="vt-msg vt-dressing"><span className="tp-spinner" /> {t("vton.loading")}</div>}
+          {/* never a bare figure: it only shows once it is wearing the garment */}
+          {!error && humanReady && viewMode === "3d" && !hasGen && (gen.err ? (
+            <div className="vt-msg vt-dressing err">
+              {gen.msg}
+              <button type="button" className="tp-modal-btn" disabled={!canGen} onClick={() => void generateReal(false)}>{t("vton.genAgain")}</button>
+            </div>
+          ) : (
+            <div className="vt-msg vt-dressing">
+              <span className="tp-spinner" /> {t("vton.dressing")}{gen.busy && gen.pct ? ` ${gen.pct}%` : ""}
+              {gen.busy && <div className="vt-progress"><div style={{ width: `${gen.pct}%` }} /></div>}
+            </div>
+          ))}
           <span className="vt-hint">{t("vton.hint")}</span>
         </div>
         <div className="vt-canvas-host" ref={hostRef} style={human ? { display: "none" } : undefined}>

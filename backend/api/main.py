@@ -43,7 +43,7 @@ from PIL import Image
 # backend/api/main.py -> backend/api -> backend -> palette-app
 PLUGIN_ROOT = Path(__file__).resolve().parents[2]
 
-# Secrets (LLM_ROUTER_API_KEY, ANTHROPIC_API_KEY, ...) live in this plugin's
+# Secrets (LLM_ROUTER_API_KEY, PALETTE_API_KEY, ...) live in this plugin's
 # own .palette/.env.local -- the same file `pltt publish` reads to sync
 # staging/production plugin secrets -- not in any directory above palette-app.
 # Loading it explicitly (rather than a bare load_dotenv() upward search)
@@ -133,8 +133,11 @@ SUBPROCESS_ENV["DYLD_LIBRARY_PATH"] = "/opt/homebrew/lib:" + SUBPROCESS_ENV.get(
 # layer them onto SUBPROCESS_ENV per call -- there's no way to load them once
 # at import time the way SUBPROCESS_ENV itself is built above.
 PLUGIN_SECRET_KEYS = (
-    "LLM_ROUTER_API_KEY", "LLM_ROUTER_BASE_URL", "LLM_ROUTER_UPSCALE_URL",
-    "ANTHROPIC_API_KEY", "GOOGLE_AI_API_KEY",
+    "LLM_ROUTER_API_KEY", "LLM_ROUTER_BASE_URL", "LLM_ROUTER_UPSCALE_URL", "LLM_ROUTER_IMAGE_MODEL",
+    "PALETTE_API_KEY", "PALETTE_LLM_BASE_URL",
+    # `pltt publish` skips every PALETTE_* key as reserved, so the hosted app
+    # only ever sees the gateway key under these names.
+    "TECHPACK_LLM_API_KEY", "TECHPACK_LLM_BASE_URL",
 )
 
 
@@ -144,16 +147,22 @@ def subprocess_env(ctx: PluginContext) -> dict:
         value = ctx.secret(key, "")
         if value:
             env[key] = value
-    # The pipeline runs on after the route returns, and a request's ctx.llm is
-    # request-scoped: called from the bridge minutes later it fails with
-    # `billing_context_missing`. With the app's own provider keys set, the
-    # scripts call Anthropic / Google directly (as under `pltt dev`); the
-    # ctx.llm bridge (llm_bridge.py) is only the fallback when no key is.
-    if not (env.get("ANTHROPIC_API_KEY") and env.get("GOOGLE_AI_API_KEY")):
-        env.update(llm_bridge.env_for(ctx))
+    # Every Claude / Gemini call in the pipeline goes through the loopback
+    # bridge (llm_bridge.py) to the Palette LLM gateway, authenticated with
+    # PALETTE_API_KEY -- no Anthropic / Google key is used. Without that key
+    # the bridge falls back to ctx.llm, which is request-scoped: called from
+    # the bridge minutes later it fails with `billing_context_missing`.
+    # LLM_ROUTER_* (image edit / upscale) is untouched by this.
+    env.update(llm_bridge.env_for(ctx, llm_bridge.gateway_from(env)))
     return env
 
 JOB_QUEUES: dict[str, asyncio.Queue] = {}
+# Jobs whose generate pipeline (sketch -> redraw -> variations -> classify) is
+# still running. Parts SVG and the pattern must not start before it ends: they
+# trace effective_sketch(), and mid-run that is still the raw flat -- the redraw
+# (the "Default" image the job shows) lands a few seconds later, so the SVG and
+# pattern came out of a different image than the one on screen.
+GENERATING: set[str] = set()
 JOB_PROCS: dict[str, asyncio.subprocess.Process] = {}
 CANCELLED: set[str] = set()
 
@@ -213,8 +222,43 @@ def job_paths(job_id: str):
     }
 
 
+_DRAWING_CACHE: dict[tuple[str, float], bool] = {}
+
+
+def input_is_drawing(path: Path) -> bool:
+    """True when an upload is a drawing (sketch / flat / hand drawing), not a
+    photo of the garment: mostly blank paper and almost no colour. A drawing is
+    never used as-is downstream -- the clean flat made from it is -- while a
+    real photo still gives the 3D garment its fabric. Cached per file version:
+    the dashboard asks for every job on each refresh."""
+    try:
+        key = (str(path), path.stat().st_mtime)
+    except OSError:
+        return False
+    if key not in _DRAWING_CACHE:
+        _DRAWING_CACHE[key] = _looks_like_drawing(path)
+    return _DRAWING_CACHE[key]
+
+
+def _looks_like_drawing(path: Path) -> bool:
+    try:
+        im = Image.open(path).convert("RGB")
+        im.thumbnail((256, 256))
+        px = np.asarray(im, dtype=np.int16)
+    except (OSError, ValueError):
+        return False
+    paper = (px.min(axis=2) > 225).mean()
+    chroma = float((px.max(axis=2) - px.min(axis=2)).mean())
+    return paper > 0.6 and chroma < 12
+
+
 def effective_sketch(paths) -> Path:
-    for key in ("regen_out", "sketch_upscaled"):
+    """The flat everything downstream is built from (parts SVG, pattern, 3D):
+    the clean redraw (sketch_regen.png) first. Tracing the stage-1 flat
+    directly was tried and reverted -- it carries the input's stitch dashes
+    into the SVG, where the redraw keeps the same garment with clean neckline,
+    waistband, cuff and sleeve lines and no dashes."""
+    for key in ("regen_out", "sketch_upscaled", "sketch"):
         if paths[key].is_file():
             return paths[key]
     return paths["sketch"]
@@ -258,9 +302,12 @@ async def stream_subprocess(cmd: list[str], cwd: Path, queue: asyncio.Queue, sta
         raise RuntimeError("\n".join(tail) if tail else f"{stage} exited {code}")
 
 
-async def run_multi_stage(slot: str, steps: list[tuple[str, list[str]]], on_success, env: dict | None = None):
+async def run_multi_stage(slot: str, steps: list[tuple[str, list[str]]], on_success, env: dict | None = None,
+                          generating: bool = False):
     queue = JOB_QUEUES[slot]
     total = len(steps)
+    if generating:
+        GENERATING.add(slot)
     try:
         for i, (stage_name, cmd) in enumerate(steps):
             await queue.put(json.dumps({
@@ -277,6 +324,7 @@ async def run_multi_stage(slot: str, steps: list[tuple[str, list[str]]], on_succ
     except Exception as e:
         await queue.put(json.dumps({"event": "error", "message": str(e)}))
     finally:
+        GENERATING.discard(slot)
         CANCELLED.discard(slot)
         llm_bridge.release(env)
         await queue.put("__END__")
@@ -624,7 +672,8 @@ async def generate(
         }
 
     JOB_QUEUES[job_id] = asyncio.Queue()
-    asyncio.create_task(run_multi_stage(job_id, steps, on_success, subprocess_env(ctx)))
+    GENERATING.add(job_id)  # before the task starts: a list refresh can land first
+    asyncio.create_task(run_multi_stage(job_id, steps, on_success, subprocess_env(ctx), generating=True))
     return Response(content=json.dumps({"job_id": job_id}), media_type="application/json")
 
 
@@ -736,9 +785,9 @@ async def jobs_list() -> Response:
         else:
             continue
         display = job_dir / display_name
-        # the dashboard card shows what the user put in; the sketch and its
-        # variations stay inside the job page
-        card = paths["input"] if paths["input"].is_file() else display
+        # The dashboard card shows the clean redraw the SVG and pattern are built
+        # from (not the raw upload). Variations stay inside the job page.
+        card = display
         classification_path = job_dir / "classification.json"
         classification = json.loads(classification_path.read_text()) if classification_path.is_file() else None
         jobs.append({
@@ -751,6 +800,7 @@ async def jobs_list() -> Response:
             "mtime": display.stat().st_mtime,
             "classification": classification,
             "has_sketch": paths["sketch"].is_file(),
+            "generating": job_id in GENERATING,
             "variations": _variations_response(job_id, paths) if paths["sketch"].is_file() else [],
             "references": _reference_images_response(job_id, paths),
             "outputs": _outputs_response(job_id, paths),
@@ -882,6 +932,9 @@ async def job_redraw(
 @router.post("/jobs/{job_id}/stage4", dependencies=[require_permission("resources:write")])
 async def stage4(job_id: str, ctx: PluginContext = Depends(get_plugin_context)) -> Response:
     paths = job_paths(job_id)
+    if job_id in GENERATING:
+        return JSONResponse({"error": "still generating this techpack's sketch -- try again when it finishes",
+                             "generating": True}, status_code=409)
     if not paths["sketch"].is_file():
         return JSONResponse({"error": "stage 1 output missing — run stage 1 first"}, status_code=400)
 
@@ -920,6 +973,9 @@ async def stage5(
     pattern tab's size/measurement editor: when either is sent, they replace the
     job's user-measurements.json so the redraft uses exactly what's on screen."""
     paths = job_paths(job_id)
+    if job_id in GENERATING:
+        return JSONResponse({"error": "still generating this techpack's sketch -- try again when it finishes",
+                             "generating": True}, status_code=409)
     if not paths["sketch"].is_file():
         return JSONResponse({"error": "stage 1 output missing — run stage 1 first"}, status_code=400)
 
@@ -950,8 +1006,9 @@ async def stage5(
     if paths["user_measurements"].is_file():
         cmd.append(str(paths["user_measurements"]))
     cmd.append(str(paths["pattern_svg"]))
-    if paths["input"].is_file():
-        cmd.append(str(paths["input"]))
+    # No cover-photo argument: the pattern pages' cover then shows the same clean
+    # flat the pattern was drafted from (photo-draft falls back to it), not the
+    # raw upload -- a rough hand drawing on the cover read as the deliverable.
 
     slot = job_slot(job_id, "stage5")
     # See the matching check in stage4() above: without it, a post-reload
@@ -967,6 +1024,7 @@ async def stage5(
             "file": _file_url(job_id, "pattern.svg"),
             "pages_file": _file_url(job_id, "pattern-pages.pdf"),
             "pieces_file": _file_url(job_id, "pattern-pieces.json"),
+            "design_file": _file_url(job_id, "pattern-design.json"),
         },
         subprocess_env(ctx),
     ))
@@ -1046,7 +1104,7 @@ async def garment3d(
         return Response(content=json.dumps({"ok": True}), media_type="application/json")
     cmd = [sys.executable, str(PIPELINE_DIR / "garment3d.py"), str(sketch if sketch.is_file() else photo),
            str(paths["dir"]), "--colour", colour, "--desc", desc[:200], "--region", region]
-    if photo.is_file():
+    if photo.is_file() and not input_is_drawing(photo):
         cmd += ["--photo", str(photo)]
     JOB_QUEUES[slot] = asyncio.Queue()
     asyncio.create_task(run_stage(
@@ -1066,7 +1124,9 @@ async def job_measure(
     job_id: str, size: str = Form("M"), ctx: PluginContext = Depends(get_plugin_context)
 ) -> Response:
     paths = job_paths(job_id)
-    source = paths["input"] if paths["input"].is_file() else effective_sketch(paths)
+    source = paths["input"]
+    if not source.is_file() or input_is_drawing(source):
+        source = effective_sketch(paths)
     if not source.is_file():
         return JSONResponse({"error": "this job has no image to measure"}, status_code=400)
 
@@ -1147,8 +1207,12 @@ async def simulate_garment(job_id: str, payload: UploadFile = File(...), ctx: Pl
 @router.get("/jobs/{job_id}/parts", dependencies=[require_permission("resources:read")])
 async def job_parts(job_id: str) -> Response:
     paths = job_paths(job_id)
-    candidates = [paths["dir"] / f"{s.stem}_seg" for s in (effective_sketch(paths), paths["sketch"])]
-    seg_dir = next((d for d in candidates if (d / "parts_png").is_dir()), None)
+    # Every flat a job may have been traced from: jobs traced before the switch
+    # to the input's own flat keep their parts under sketch_regen_seg/, and
+    # looking only at the current source lost their parts list. The newest wins.
+    sources = (effective_sketch(paths), paths["sketch"], paths["sketch_upscaled"], paths["regen_out"])
+    candidates = [d for d in {paths["dir"] / f"{s.stem}_seg" for s in sources} if (d / "parts_png").is_dir()]
+    seg_dir = max(candidates, key=lambda d: (d / "parts_png").stat().st_mtime, default=None)
     if seg_dir is None:
         return JSONResponse({"error": "no traced parts for this job"}, status_code=404)
 
@@ -1179,6 +1243,10 @@ async def job_parts(job_id: str) -> Response:
             "name": n,
             "label": n.replace("_", " "),
             "image": _file_url(job_id, f"{rel}/{n}.png"),
+            # the part as it sits in parts.svg, for stacking into the full view;
+            # jobs traced before _layers/ existed fall back to `image`
+            "layer": (_file_url(job_id, f"{rel}/_layers/{n}.png")
+                      if (parts_dir / "_layers" / f"{n}.png").is_file() else None),
             "bbox": bbox_of(available[n]),
         } for n in ordered],
     }

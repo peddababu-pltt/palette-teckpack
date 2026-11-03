@@ -117,7 +117,7 @@ export async function addPiecePlacement(piecesJsonPath, { designLabel, attrs, sh
       const client = new GoogleGenAI({ apiKey })
       const ask = async (extra = '') => {
         const res = await client.models.generateContent({
-          model: 'gemini-2.5-flash',
+          model: 'gemini-3.8-flash',
           contents: [{ role: 'user', parts: extra ? [...parts, { text: extra }] : parts }],
         })
         return JSON.parse((res.text || '').replace(/```json|```/g, '').trim())

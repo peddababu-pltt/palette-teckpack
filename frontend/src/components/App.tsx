@@ -19,6 +19,7 @@ import Sidebar, { type GenerateSubmission } from "./Sidebar"
 import Gallery from "./Gallery"
 import Overlay from "./Overlay"
 import TopBar from "./TopBar"
+import { ConfirmProvider, useConfirm } from "./ConfirmDialog"
 
 // Measures the sticky sidebar's real usable height: it sits ~92px down until
 // the page header scrolls away, so its available height changes as the page
@@ -51,10 +52,22 @@ function useSidebarSizing() {
   }, [])
 }
 
-export default function App(_props: PluginComponentProps) {
+// The confirmation dialog lives above everything that asks for one (see
+// ConfirmDialog: the browser's own confirm() does not show inside the hosted app).
+export default function App(props: PluginComponentProps) {
+  const { t } = usePluginTranslations(STRINGS)
+  return (
+    <ConfirmProvider labels={{ confirm: t("app.confirmOk"), cancel: t("app.confirmCancel") }}>
+      <AppInner {...props} />
+    </ConfirmProvider>
+  )
+}
+
+function AppInner(_props: PluginComponentProps) {
   const platform = usePlatform()
   const pluginId = platform.pluginId || "techpack"
   const { t } = usePluginTranslations(STRINGS)
+  const confirm = useConfirm()
   useSidebarSizing()
 
   // style.css keys dark mode off `:root.dark`, but the real Palette host
@@ -118,6 +131,18 @@ export default function App(_props: PluginComponentProps) {
     if (baseReady) void reloadJobs()
   }, [baseReady, reloadJobs])
 
+  // A job still generating gets its parts SVG + pattern only once its final
+  // sketch exists (engine.autoTrace skips it until then). The generate run's
+  // own onDone normally starts them, but that listener is gone after a page
+  // reload -- so while any job is generating, look again every 8s; the reload
+  // that finds it finished starts both.
+  const anyGenerating = jobs.some((j) => j.generating)
+  useEffect(() => {
+    if (!anyGenerating) return
+    const id = window.setInterval(() => void reloadJobs(), 8000)
+    return () => window.clearInterval(id)
+  }, [anyGenerating, reloadJobs])
+
   const handleGenerate = useCallback(
     async (sub: GenerateSubmission) => {
       setGenerating(true)
@@ -135,7 +160,7 @@ export default function App(_props: PluginComponentProps) {
       })
       if ("error" in res) {
         setGenerating(false)
-        window.alert(res.error)
+        void confirm({ title: t("app.generateFailed"), message: res.error, confirmLabel: t("app.confirmOk"), cancelLabel: "" })
         return
       }
       const jobId = res.job_id
@@ -161,12 +186,16 @@ export default function App(_props: PluginComponentProps) {
         },
         onError: (msg) => {
           setGenerating(false)
-          window.alert(msg)
+          // A reload or a dropped connection ends this listener, not the run:
+          // the job keeps going on the server and the list polling (below)
+          // picks it up. Only a real failure is worth interrupting for.
+          if (msg === "lost connection to the server") { void reloadJobs(); return }
+          void confirm({ title: t("app.generateFailed"), message: msg, confirmLabel: t("app.confirmOk"), cancelLabel: "" })
         },
         onCancelled: () => setGenerating(false),
       })
     },
-    [pluginId, engine, reloadJobs],
+    [pluginId, engine, reloadJobs, confirm, t],
   )
 
   const handleCancelGenerate = useCallback(() => {
@@ -184,21 +213,29 @@ export default function App(_props: PluginComponentProps) {
       const extras = (job.variations || []).length
       const what =
         extras > 1 ? t("app.confirmDeleteJobMulti", { count: extras }) : t("app.confirmDeleteJobSingle")
-      if (!window.confirm(t("app.confirmDelete", { what }))) return
+      const ok = await confirm({
+        title: t("app.confirmDeleteTitle"), message: t("app.confirmDelete", { what }),
+        confirmLabel: t("app.confirmDeleteOk"), danger: true,
+      })
+      if (!ok) return
       await deleteJobApi(pluginId, job.job_id)
       setOverlay((cur) => (cur && cur.jobId === job.job_id ? null : cur))
       await reloadJobs()
     },
-    [pluginId, reloadJobs, t],
+    [pluginId, reloadJobs, t, confirm],
   )
 
   const handleDeleteAll = useCallback(async () => {
     if (jobs.length === 0) return
-    if (!window.confirm(t("app.confirmDeleteAll", { count: jobs.length }))) return
+    const ok = await confirm({
+      title: t("app.confirmDeleteTitle"), message: t("app.confirmDeleteAll", { count: jobs.length }),
+      confirmLabel: t("app.confirmDeleteOk"), danger: true,
+    })
+    if (!ok) return
     await Promise.all(jobs.map((j) => deleteJobApi(pluginId, j.job_id)))
     setOverlay(null)
     await reloadJobs()
-  }, [jobs, pluginId, reloadJobs, t])
+  }, [jobs, pluginId, reloadJobs, t, confirm])
 
   const overlayJob = overlay ? jobs.find((j) => j.job_id === overlay.jobId) : null
 

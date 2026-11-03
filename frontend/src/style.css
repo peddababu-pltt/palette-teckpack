@@ -2925,3 +2925,27 @@ img.result, object.result {
 .tp-gallery:not(.is-list) .tp-card { display: flex; flex-direction: column; }
 .tp-gallery:not(.is-list) .tp-card-foot { margin-top: auto; }
 .tp-card-sub { min-height: 1.35em; line-height: 1.35; }
+
+/* --- in-app confirmation dialog (components/ConfirmDialog) ---------------- */
+.tp-confirm-backdrop {
+  position: fixed; inset: 0; z-index: 2000;
+  display: flex; align-items: center; justify-content: center;
+  padding: var(--sp-4);
+  background: rgba(17, 17, 17, 0.45);
+}
+.tp-confirm {
+  width: min(420px, 100%);
+  padding: var(--sp-4) var(--sp-4) var(--sp-3);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  color: var(--fg);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.25);
+}
+.tp-confirm h3 { margin: 0 0 var(--sp-2); font-size: 16px; }
+.tp-confirm p { margin: 0 0 var(--sp-4); font-size: 14px; line-height: 1.45; color: var(--fg-muted); }
+.tp-confirm-actions { display: flex; justify-content: flex-end; gap: var(--sp-2); }
+.tp-confirm-ok { color: var(--on-primary); background: var(--primary); border-color: transparent; }
+.tp-confirm-ok.is-danger { background: var(--danger); }
+/* covers the bare figure until it is wearing the 3D garment */
+.vt-msg.vt-dressing { z-index: 2; flex-direction: column; background: #e7e9ed; }
+.vt-msg.vt-dressing .vt-progress { width: min(260px, 60%); }

@@ -243,12 +243,25 @@ function writePiece3dTexture(header, piece, suffix, w, h, stackContent, dir, cac
   // placket/fold lines) -- the outline is the one with the biggest box.
   let cut = null
   let polygon = null
-  // lining / interfacing pieces draw their cutline in that class instead of "fabric"
-  for (const m of piece.matchAll(/<path\s+(?:style="[^"]*"\s+)?class="(?:fabric|lining|interfacing|various|contrast|canvas)"[^>]*\bd="([^"]+)"/g)) {
+  // lining / interfacing pieces draw their cutline in that class instead of "fabric",
+  // and some drafts draw the outline with no class at all -- so any path that is a
+  // cut class or unclassed is a candidate, in any attribute order, and only a real
+  // shape (3+ points, some area) counts: a lone placket / fold line drawn in the
+  // lining class once won as a 2-point "outline" and the piece vanished from 3D.
+  for (const m of piece.matchAll(/<path\b[^>]*>/g)) {
+    const tag = m[0]
+    const cls = tag.match(/\bclass="([^"]*)"/)?.[1]
+    if (cls != null && !/^(fabric|lining|interfacing|various|contrast|canvas)$/.test(cls.trim())) continue
+    if (/marker-(start|end)=/.test(tag)) continue
+    const d = tag.match(/\bd="([^"]+)"/)?.[1]
+    if (!d) continue
     // the true cutline: flattened (curves subdivided), in texture mm
-    const sub = flattenPath(m[1]).sort((a, b) => b.length - a.length)[0]
-    if (!sub) continue
+    const sub = flattenPath(d).sort((a, b) => b.length - a.length)[0]
+    if (!sub || sub.length < 3) continue
     const pts = sub.map(([x, y]) => [x + offX, y + offY])
+    let area2 = 0
+    for (let i = 0; i < pts.length; i++) { const [x0, y0] = pts[i], [x1, y1] = pts[(i + 1) % pts.length]; area2 += x0 * y1 - x1 * y0 }
+    if (Math.abs(area2) / 2 < 100) continue // < 1 cm²: a line, not a piece
     const box = { x0: Math.min(...pts.map((q) => q[0])), y0: Math.min(...pts.map((q) => q[1])), x1: Math.max(...pts.map((q) => q[0])), y1: Math.max(...pts.map((q) => q[1])) }
     if (!cut || (box.x1 - box.x0) * (box.y1 - box.y0) > (cut.x1 - cut.x0) * (cut.y1 - cut.y0)) { cut = box; polygon = pts }
   }

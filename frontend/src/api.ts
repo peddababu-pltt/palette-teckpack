@@ -150,6 +150,7 @@ export interface Job {
   mtime: number
   classification: Classification | null
   has_sketch: boolean
+  generating?: boolean // its generate pipeline is still running (sketch not final yet)
   variations: Variation[]
   references: string[]
   outputs: JobOutputs
@@ -206,6 +207,10 @@ export interface PartInfo {
   name: string
   label: string
   image: string
+  /** The part as it sits in parts.svg, for stacking into the full view (`image`
+   *  strokes its full outline, which doubles every shared seam when stacked).
+   *  null for jobs traced before these existed. */
+  layer: string | null
   bbox: { x: number; y: number; w: number; h: number; cw: number; ch: number } | null
 }
 
@@ -495,17 +500,30 @@ export async function generateJob(
     if (params.season) fd.append("season", params.season)
     if (params.fabric) fd.append("fabric", params.fabric)
   }
-  try {
-    const res = await fetchWithRefresh(withPreviewQuery(`${base(pluginId)}/jobs/generate`), {
-      method: "POST",
-      body: fd,
-      credentials: credentialsMode(),
-    })
-    const data = await res.json().catch(() => ({}))
-    if (!res.ok || data.error) return { error: data.error || "request failed" }
-    return data
-  } catch (err: any) {
-    return { error: err?.message || String(err) }
+  // A 502/503/504 without a JSON body is the platform's gateway answering for an
+  // app that is restarting (right after a new version goes live): try once more
+  // after a moment instead of failing the upload with a bare "request failed".
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const res = await fetchWithRefresh(withPreviewQuery(`${base(pluginId)}/jobs/generate`), {
+        method: "POST",
+        body: fd,
+        credentials: credentialsMode(),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (res.ok && !data.error) return data
+      if (!data.error && [502, 503, 504].includes(res.status) && attempt === 0) {
+        await new Promise((r) => setTimeout(r, 4000))
+        continue
+      }
+      return {
+        error: data.error || (res.status >= 500
+          ? `The server is unavailable right now (HTTP ${res.status}). Please try again in a moment.`
+          : `Upload failed (HTTP ${res.status}).`),
+      }
+    } catch (err: any) {
+      return { error: err?.message || String(err) }
+    }
   }
 }
 

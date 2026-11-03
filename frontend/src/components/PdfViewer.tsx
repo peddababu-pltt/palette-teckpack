@@ -7,6 +7,12 @@
 // used — worker is served from the plugin backend to avoid CDN CSP blocks.
 import { useEffect, useRef, useState, type ReactNode } from "react"
 import * as pdfjsLib from "pdfjs-dist"
+// pdf.js's worker ships inside this bundle and runs on the page: loading it from
+// a URL failed on the live app (a module worker is fetched without the app's
+// auth headers -> 401) and needed the preview token on previews.
+// globalThis.pdfjsWorker is pdf.js's own hook for exactly this.
+import * as pdfjsWorker from "pdfjs-dist/build/pdf.worker.min.mjs"
+;(globalThis as { pdfjsWorker?: unknown }).pdfjsWorker = pdfjsWorker
 import { usePluginTranslations } from "@palettelab/sdk"
 import { STRINGS } from "../strings"
 import { fetchBinary } from "../api"
@@ -122,15 +128,6 @@ export default function PdfViewer({
     }
 
     async function load() {
-      // Derive worker URL from the pdf URL so it works in local dev, staging,
-      // and preview environments without needing a separate pluginId prop.
-      // url = "http://host/<prefix>/jobs/<id>/file/pattern-pages.pdf"
-      // Keep the query string: a hosted preview authorises every request with
-      // its ?preview_token=..., and the worker URL without it was refused (401).
-      const workerUrl = new URL(url, window.location.href)
-      workerUrl.pathname = workerUrl.pathname.replace(/\/jobs\/.*$/, "/assets/pdf.worker.min.mjs")
-      workerUrl.searchParams.delete("v")
-      pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl.href
       const data = await fetchBinary(url)
       if (destroyed) return
       doc = await pdfjsLib.getDocument({ data: new Uint8Array(data) }).promise

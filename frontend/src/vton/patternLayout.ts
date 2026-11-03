@@ -36,14 +36,27 @@ export interface PaperSrc {
 }
 
 const GAP = 0.16 // m between a piece and the skin it covers
-const FILL: Record<string, number> = {
-  bodice_front: 0x5b8def, bodice_back: 0x4a78d0, side_panel: 0x6d9bf0, yoke: 0x7aa7f2, shoulder: 0x7aa7f2,
-  sleeve: 0x58b49a, sleeve_left: 0x58b49a, sleeve_right: 0x58b49a, cuff: 0x3f9c82,
-  collar: 0xe0a046, collar_stand: 0xe0a046, hood: 0xe0a046, neckline: 0xe0a046,
-  skirt_front: 0x9b7be0, skirt_back: 0x8466cc, skirt_side: 0xa98ae6, trouser_front: 0x9b7be0, trouser_back: 0x8466cc,
-  waistband: 0xd46a8c, pocket: 0xe07a5f, pocket_flap: 0xe07a5f, placket: 0x9aa3ad,
+// Pieces read as fabric, not white paper: a two-tone check, light pink for an
+// upper garment's pieces and light green for a lower garment's. The paper's
+// own lines and text multiply over it, so they stay as dark as before.
+const CHECK_MM = 50
+const CHECKS = {
+  upper: [new THREE.Color("#f4b6c8"), new THREE.Color("#fde6ee")],
+  lower: [new THREE.Color("#a8dcb5"), new THREE.Color("#e4f5e8")],
 }
-const fillOf = (cat: string) => FILL[cat] ?? 0xb0b6be
+function checkered(mat: THREE.MeshBasicMaterial, tw: number, th: number, lower: boolean) {
+  const [a, b] = CHECKS[lower ? "lower" : "upper"]
+  mat.onBeforeCompile = (sh) => {
+    sh.uniforms.uChecks = { value: new THREE.Vector2(tw / CHECK_MM, th / CHECK_MM) }
+    sh.uniforms.uCheckA = { value: a }
+    sh.uniforms.uCheckB = { value: b }
+    sh.fragmentShader = "uniform vec2 uChecks;\nuniform vec3 uCheckA;\nuniform vec3 uCheckB;\n" + sh.fragmentShader.replace(
+      "#include <map_fragment>",
+      "#include <map_fragment>\n  vec2 ck = floor(vMapUv * uChecks);\n  diffuseColor.rgb *= mix(uCheckA, uCheckB, mod(ck.x + ck.y, 2.0));",
+    )
+  }
+  mat.customProgramCacheKey = () => `checks-${lower ? "lower" : "upper"}`
+}
 
 function ringBox(ring: Pt[]) {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
@@ -103,7 +116,7 @@ function withCentre(w: Work): Work {
 /** One piece in world space, `map` taking its frame (mm, y down) to world. The
  *  paper is a quad over the whole texture (transparent outside the piece), so
  *  seam allowance, marks and text all show; without one, a plain coloured panel. */
-function drawPiece(w: Work, map: (x: number, y: number) => THREE.Vector3, internal: boolean): THREE.Object3D {
+function drawPiece(w: Work, map: (x: number, y: number) => THREE.Vector3, internal: boolean, lower: boolean): THREE.Object3D {
   const grp = new THREE.Group()
   grp.userData.piece = w.p.suffix
   if (w.paper?.tex) {
@@ -124,6 +137,7 @@ function drawPiece(w: Work, map: (x: number, y: number) => THREE.Vector3, intern
       map: w.paper.tex, side: THREE.DoubleSide, transparent: true, alphaTest: 0.04,
       opacity: internal ? 0.75 : 1,
     })
+    checkered(mat, tw, th, lower)
     grp.add(new THREE.Mesh(g, mat))
     return grp
   }
@@ -136,10 +150,11 @@ function drawPiece(w: Work, map: (x: number, y: number) => THREE.Vector3, intern
   g.setIndex(tris.flat())
   g.computeVertexNormals()
   const mat = new THREE.MeshStandardMaterial({
-    color: fillOf(w.p.category), side: THREE.DoubleSide, roughness: 0.85,
+    color: CHECKS[lower ? "lower" : "upper"][0], side: THREE.DoubleSide, roughness: 0.85,
     transparent: true, opacity: internal ? 0.55 : 0.88, depthWrite: !internal,
   })
-  grp.add(new THREE.Mesh(g, mat), new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: 0x1d2733 })))
+  const outline = new THREE.BufferGeometry().setFromPoints(pts)
+  grp.add(new THREE.Mesh(g, mat), new THREE.LineLoop(outline, new THREE.LineBasicMaterial({ color: 0x1d2733 })))
   return grp
 }
 
@@ -218,10 +233,15 @@ export function buildPatternGroup(pieces: PatternPiece[], papers: Map<string, Pa
       v.z += v.z >= 0 ? dz : -dz
       return v
     }
-    root.add(drawPiece(w, map, internal))
+    // trousers / skirts / their waistband and fly: the lower garment's colour
+    // (only when the pattern has a lower garment: a jacket's hip welt pocket was
+    // matched as "waist" and came out green)
+    const lower = /^(skirt_|trouser_)/.test(w.p.category)
+      || (garmentLower && !/^(bodice_|sleeve|collar|cuff|hood)/.test(w.p.category))
+    const piece = drawPiece(w, map, internal, lower)
     const b = ringBox(w.ring)
     const top = map(b.cx, b.y0 - 25) // above the seam allowance
-    root.add(label(tag ? `${w.p.suffix} ${tag}` : w.p.suffix, top.clone().add(new THREE.Vector3(0, 0.02, 0.01 * Math.sign(top.z || 1)))))
+    root.add(piece, label(tag ? `${w.p.suffix} ${tag}` : w.p.suffix, top.clone().add(new THREE.Vector3(0, 0.02, 0.01 * Math.sign(top.z || 1)))))
     placed.add(w.p.id)
   }
 
@@ -231,12 +251,32 @@ export function buildPatternGroup(pieces: PatternPiece[], papers: Map<string, Pa
   // backings (lining / facing / interfacing) are hidden duplicates of the piece
   // they back, whatever category the classifier filed them under
   // (a pocket bag hangs inside the garment the same way)
-  const backing = (p: PatternPiece) => /lining|facing|interfacing|pocketbag|bag\b/i.test(`${p.suffix} ${p.category}`)
-  const isBack = (p: PatternPiece) => /_back$/.test(p.category) || (p.side === "back" && /^(yoke|side_panel|shoulder)$/.test(p.category))
+  const backing = (p: PatternPiece) => /lining|facing|interfacing|pocket_?bag|(^|[_\s])bag([_\s]|$)/i.test(`${p.suffix} ${p.category}`)
+  // Which side a yoke belongs to, from the pieces themselves: the body panel it
+  // sits on is shorter than the other by about the yoke's own height (a back
+  // yoke: back panel + yoke = front panel). The name or the classifier's side
+  // only decides when the heights don't (both panels yoked, or no panels).
+  const panelH = (cat: string) => Math.max(0, ...[...works.values()].filter((w) => w.p.category === cat && !backing(w.p)).map((w) => ringBox(w.ring).h))
+  const frontH = panelH("bodice_front"), backH = panelH("bodice_back")
+  const yokeSide = (p: PatternPiece): "front" | "back" => {
+    if (/back/i.test(p.suffix)) return "back"
+    if (/front/i.test(p.suffix)) return "front"
+    const yh = ringBox(works.get(p.id)!.ring).h
+    if (frontH > 0 && backH > 0 && yh > 0) {
+      const onBack = Math.abs(backH + yh - frontH), onFront = Math.abs(frontH + yh - backH)
+      if (Math.min(onBack, onFront) < yh * 0.6) return onBack <= onFront ? "back" : "front"
+    }
+    return p.side === "front" ? "front" : "back"
+  }
+  const isBack = (p: PatternPiece) => /_back$/.test(p.category)
+    || (p.category === "yoke" ? yokeSide(p) === "back" : p.side === "back" && /^(side_panel|shoulder)$/.test(p.category))
   // A front/back built from several panels: the yoke takes the top, the body
   // panels hang from its lower edge, and side panels sit beside the centre
   // panel -- not every piece hung from the neck on the centre line.
   const yokeH = { front: 0, back: 0 }, centreW = { front: 0, back: 0 }
+  // Trousers / shorts / skirts: their yoke and side panels belong at the waist,
+  // not at the shoulders -- a shorts back yoke was floating at chest height.
+  const garmentLower = [...works.values()].some((w) => /^(skirt_|trouser_)/.test(w.p.category))
   for (const w of works.values()) {
     if (backing(w.p)) continue
     const key = isBack(w.p) ? "back" : "front"
@@ -245,6 +285,13 @@ export function buildPatternGroup(pieces: PatternPiece[], papers: Map<string, Pa
     if (/^bodice_(front|back)$/.test(w.p.category))
       centreW[key] = Math.max(centreW[key], (w.centre.kind === "half" ? b.w : b.w / 2) / 1000)
   }
+  // A pattern can carry a whole front AND its yoke + lower split (a bomber's
+  // "front" 59cm beside frontYoke 19cm + frontLower 42cm). Hanging every panel
+  // under the yoke dropped the whole front 19cm, leaving the shoulders bare.
+  // Only a panel that needs the yoke to reach full length hangs below it.
+  const fullH = Math.max(frontH, backH) / 1000
+  const underYoke = (key: "front" | "back", h: number) =>
+    yokeH[key] > 0 && h + yokeH[key] <= fullH * 1.12 ? yokeH[key] : 0
   // a two-piece sleeve: the under sleeve runs beside the upper one along the arm
   const mainSleeves = [...works.values()].filter((w) => w.p.category === "sleeve" && !/under/i.test(w.p.suffix) && !backing(w.p))
   const sleeveW = Math.max(0, ...mainSleeves.map((w) => ringBox(w.ring).w / 1000))
@@ -262,11 +309,14 @@ export function buildPatternGroup(pieces: PatternPiece[], papers: Map<string, Pa
     const p = w.p, cat = p.category, s = inst.bodySide
     const back = isBack(p)
     if (/^(bodice_front|bodice_back|side_panel|yoke|shoulder|skirt_front|skirt_back|skirt_side|trouser_front|trouser_back)$/.test(cat)) {
-      const lower = /^(skirt_|trouser_)/.test(cat)
+      const lower = /^(skirt_|trouser_)/.test(cat) || (garmentLower && /^(yoke|side_panel)$/.test(cat))
       const key = back ? "back" : "front"
       const z = lower ? (back ? a.hipBackZ - GAP : a.hipFrontZ + GAP) : back ? a.backZ - GAP : a.frontZ + GAP
-      const top = lower ? a.waistY + 0.02 : a.neckY + 0.02 - (cat === "yoke" ? 0 : yokeH[key])
+      // a lower garment hangs from the waist; its panels from the yoke's lower edge
       const b = ringBox(w.ring)
+      const top = lower
+        ? a.waistY + 0.02 - (cat === "yoke" ? 0 : yokeH[key])
+        : a.neckY + 0.02 - (cat === "yoke" ? 0 : underYoke(key, b.h / 1000))
       if (cat === "side_panel" && centreW[key] > 0) {
         // outward from the centre panel's edge, on its own side
         const side = s === 0 ? 1 : s
@@ -291,6 +341,8 @@ export function buildPatternGroup(pieces: PatternPiece[], papers: Map<string, Pa
         start = start.clone().addScaledVector(down, (sleeveW + ringBox(w.ring).w / 1000) / 2 + 0.02)
       }
       add(w, alongArm(w, start, dir, Math.max(arm.shoulder.z, arm.wrist.z) + GAP + (cat === "cuff" ? 0.03 : 0)))
+      // and behind the arm: a sleeve wraps it, and the back view had bare arms
+      add(w, alongArm(w, start, dir, Math.min(arm.shoulder.z, arm.wrist.z) - GAP - (cat === "cuff" ? 0.03 : 0)), "back")
     } else if (/^(collar|collar_stand|hood|neckline)$/.test(cat)) {
       if (!collarRow.includes(w)) collarRow.push(w)
     } else if (cat === "waistband") {
@@ -343,7 +395,15 @@ export function buildPatternGroup(pieces: PatternPiece[], papers: Map<string, Pa
         // a strap / tab after the cuff (beyond the sleeve's end), not on top of it
         const start = cuffStart(arm, dir, b.h / 1000).addScaledVector(dir, cuffLen > 0 ? cuffLen + 0.01 : 0)
         add(w, alongArm(w, start, dir, Math.max(arm.shoulder.z, arm.wrist.z) + GAP))
+        add(w, alongArm(w, start, dir, Math.min(arm.shoulder.z, arm.wrist.z) - GAP), "back")
       }
+    } else if (/loop/.test(n) && garmentLower) {
+      // belt loops on the waistband, two at the front
+      for (const s of [1, -1] as const)
+        add(w, (x, y) => new THREE.Vector3(s * 0.11 + (x - b.cx) / 1000, a.waistY + 0.06 - (y - b.y0) / 1000, a.hipFrontZ + outer + 0.06))
+    } else if (/fly/.test(n)) {
+      // the fly shield down the centre front from the waist
+      add(w, centreHung(w, 1, a.waistY + 0.0, a.hipFrontZ + outer))
     } else if (/hem|casing|band|drawcord/.test(n) && !/waist/.test(n)) {
       add(w, acrossBody(w, hemY + 0.02, a.frontZ + outer)) // along the hem
     } else if (/waist/.test(n)) {

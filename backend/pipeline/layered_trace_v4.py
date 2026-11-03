@@ -164,7 +164,11 @@ DASH_KEEPOUT = int(os.environ.get("DASH_KEEPOUT", "2"))
                        # a center-back seam the sketch draws as dashes alone
                        # then renders as a solid line with dashes on top of it.
                        # Faithfulness to the sketch wins: default stays 2.
-THIN = 0.0       # shave this many px off EACH SIDE of the captured ink before
+# 0.3 (from 0.0): the outlines read too heavy. Measured on a shirt and a puffer:
+# 0.3-0.35 trims ~10% of the ink with every line still in one piece; 0.4+
+# snaps the 2-3px strokes into dashes (ink pieces 10 -> 38, 13 -> 35). The rest
+# of the lighter look comes from INK_FILL (dark grey instead of pure black).
+THIN = 0.3       # shave this many px off EACH SIDE of the captured ink before
                  # tracing -> thinner black outline in the SVG. Fractional on
                  # purpose: sketch strokes here are only ~2-3px wide, so a full
                  # 1px-per-side erosion eats them down to fragments that
@@ -201,6 +205,12 @@ THIN = 0.0       # shave this many px off EACH SIDE of the captured ink before
                  # seam (back panel, sleeve, yoke) into dashes and erased the
                  # rib lines on the hem band and cuffs; 0.25 still lost the
                  # ribs. At 0 the render covers 99.7% of the source ink.
+GREY_DESIGN = os.environ.get("GREY_DESIGN", "1") != "0"   # grey texture in part layers
+GREY_FILL = os.environ.get("GREY_FILL", "#a6a6a6")         # same grey as the sketch's
+GREY_INK_T = 240   # grey.png pixel darker than this is design ink (incl. anti-aliasing)
+KEEP_STITCHES = os.environ.get("KEEP_STITCHES", "0") == "1"  # stitch dashes in the SVG (off by default)
+STITCH_RUN_GAP = int(os.environ.get("STITCH_RUN_GAP", "24"))  # px between dashes of one run
+STITCH_MIN_RUN = int(os.environ.get("STITCH_MIN_RUN", "4"))   # shortest run of dashes kept
 TRIM_SS = 4   # grab_box trim (zip teeth, guard stitching) is thresholded and
               # traced at this multiple of native resolution -- see the
               # grab_box branch in main()
@@ -655,6 +665,13 @@ def snap_box_to_strip(gb, ink, keep=0.45):
         hi += 1
     hi -= gap
     if hi - lo + 1 < 4 or hi - lo + 1 > width:
+        return [x0, y0, x1, y1]
+    # Landed on a single rail, not the strip: a solid tape line out-inks
+    # dotted teeth column for column, so the walk stopped at the rail's own
+    # few px (measured: a 61px zip box snapped to 4px, the teeth fell outside
+    # it and traced as a solid black bar). A real strip is never that much
+    # narrower than the box that was drawn round it -- keep the box.
+    if hi - lo + 1 < max(10, int(width * 0.35)):
         return [x0, y0, x1, y1]
     return ([s0 + lo, y0, s0 + hi + 1, y1] if vertical
             else [x0, s0 + lo, x1, s0 + hi + 1])
@@ -1182,6 +1199,11 @@ ZIP_FUSE_MAX = float(os.environ.get("ZIP_FUSE_MAX", "0.50"))
 ZIP_T_FLOOR = int(os.environ.get("ZIP_T_FLOOR", "80"))
                  # do not chase the cut below this: past it the teeth break
                  # up into a scatter of dots (see the grab_box comment)
+ZIP_DARK_T = int(os.environ.get("ZIP_DARK_T", "70"))
+                 # zip ink darker than this stays black (rail and tooth cores)
+ZIP_TONES = ((215, "#d0d0d0"), (150, "#8c8c8c"))
+                 # grey bands under the black core: (sketch value below which
+                 # the band is drawn, its fill), lightest first
 
 
 def _fused_share(mask):
@@ -1198,34 +1220,31 @@ def _fused_share(mask):
 def zip_trim_threshold(up):
     """Pick the cut that keeps a zip reading as separate teeth, not a bar.
 
-    The grab_box comment above assumes a local Otsu over a zip's own
-    footprint lands near the clip floor (~100), well under the global ink
-    cut that would swallow the tape. On the moto jacket it does the
-    opposite: Otsu returns 168 against a global cut of 159, and the whole
-    tape fills in -- 87% of the strip's ink ends up in ONE blob and the zip
-    renders as a solid black bar with no teeth.
-
-    Otsu is picking the tape/garment split, not the tooth/gap split, so ask
-    the question the defect actually poses: is this still a ladder? Walk the
-    cut down from Otsu and stop at the first one whose largest component
-    holds a minority of the ink. Measured on that zip: T=168 -> 87% in one
-    blob (fused), T=96 -> 43% over ~68 components (teeth resolve).
+    A local Otsu over the zip's footprint can land above the tooth/gap split
+    and fill the whole tape into one blob (moto jacket: Otsu 168, 87% of the
+    strip's ink in ONE blob, no teeth). So test cuts from the strip's own
+    whitest gap down and keep the HIGHEST one that still leaves the teeth
+    apart (largest blob holds at most ZIP_FUSE_MAX of the ink). Walking down
+    from Otsu and stopping at the first unfused cut found the LOWEST such cut
+    instead, which keeps only each tooth's dark core: the teeth came out as a
+    broken chain of thin hooks and dots (parka: cut 100 vs solid teeth at 130).
     """
     t0 = otsu_threshold(up)
-    otsu_share = _fused_share(up < t0)
-    if otsu_share <= ZIP_FUSE_MAX:
-        return t0
-    best_t, best_share = t0, otsu_share
-    for t in range(t0 - 8, ZIP_T_FLOOR - 1, -8):
+    hi = max(t0, 200)
+    best_t, best_share = t0, _fused_share(up < t0)
+    for t in range(hi, ZIP_T_FLOOR - 1, -8):
         share = _fused_share(up < t)
         if share <= ZIP_FUSE_MAX:
-            print(f"  zip trim: otsu {t0} fused ({otsu_share:.0%} in one "
-                  f"blob) -> using {t} ({share:.0%})")
+            # step back toward the fused cut by half a step: as solid as the
+            # teeth can be while still apart
+            t = t + 4 if _fused_share(up < t + 4) <= ZIP_FUSE_MAX + 0.1 else t
+            if t != t0:
+                print(f"  zip trim: cut {t} keeps the teeth apart ({share:.0%} in one blob; otsu {t0})")
             return t
         if share < best_share:
             best_t, best_share = t, share
-    print(f"  zip trim: otsu {t0} fused ({otsu_share:.0%}); no unfused cut "
-          f"down to {ZIP_T_FLOOR}, using best {best_t} ({best_share:.0%})")
+    print(f"  zip trim: no cut keeps the teeth apart down to {ZIP_T_FLOOR}, "
+          f"using best {best_t} ({best_share:.0%})")
     return best_t
 
 
@@ -1660,6 +1679,7 @@ def main(in_png, labels_npy, groups_json, out_svg):
         fine_all &= ~trimmed
 
     layers = []
+    zip_grey = {}   # part -> [(fill, paths)] shading under its black core (ZIP_DARK_T)
     close_parts = os.environ.get("CLOSE_PARTS", "1") == "1"
 
     # ---- stroke ownership: every ink component gets ONE owner part if a
@@ -2286,6 +2306,15 @@ def main(in_png, labels_npy, groups_json, out_svg):
                         if crossers.size:
                             cap = cap & ~np.isin(clab, crossers)
                     cap &= zone
+                    # Claim the ink INSIDE the strip as well. A zip's teeth
+                    # are fused to its rails, so ownership hands the whole run
+                    # to the panel beside it -- and the panel then strips
+                    # everything under the zip's box, so the teeth landed in
+                    # no layer at all (a parka zip came out as two bare rails:
+                    # 0 of 1534 tooth px owned). Only the strip's inner core,
+                    # so a seam that merely clips the edge stays with its panel.
+                    core = ndimage.binary_erosion(zone, dil, iterations=max(1, RAIL_MARGIN))
+                    cap |= ink & core
                     if not cap.any():
                         layers.append((zkey(nm), nm, [], []))
                         print(f"  [{nm}] 0 paths (no ink in its own strip)")
@@ -2312,7 +2341,10 @@ def main(in_png, labels_npy, groups_json, out_svg):
                     # Done in place on the box's own crop: fine_mask is a
                     # full-canvas array at trim resolution (~68MB here), and
                     # thin_canvas would supersample it again on top of that.
-                    if thin > 0 and fine_mask.any():
+                    # Not for the teeth: shaving them on top of the cut left
+                    # each tooth as a hairline hook (the zip read as a broken
+                    # chain). ZIP_THIN=1 restores the shave.
+                    if thin > 0 and fine_mask.any() and os.environ.get("ZIP_THIN") == "1":
                         it = max(1, int(round(thin * zs)))
                         sy0, sy1, sx0, sx1 = gy0 * zs, gy1 * zs, gx0 * zs, gx1 * zs
                         sub = fine_mask[sy0:sy1, sx0:sx1]
@@ -2324,6 +2356,30 @@ def main(in_png, labels_npy, groups_json, out_svg):
                             ndimage.distance_transform_edt(sub), size=2 * it + 1)
                         eroded |= sub & (half_w <= it + KEEP_HALF_W)
                         fine_mask[sy0:sy1, sx0:sx1] = eroded
+                    # Shaded like the sketch. A drawn zip is not flat black:
+                    # its teeth and rails have grey, anti-aliased flanks, and
+                    # one black cut turned all of it into solid #333 shapes, so
+                    # the zip read heavier than every other line (on the
+                    # O-ring zip 1454 of 1961 tooth-zone px are 100-200 grey).
+                    # Only the darkest core stays black; lighter bands of the
+                    # same strip are traced into grey layers stacked under it
+                    # (ZIP_TONES, lightest at the bottom). ZIP_DARK_T=0
+                    # restores the single black cut.
+                    if ZIP_DARK_T > 0 and fine_mask.any():
+                        sy0, sy1, sx0, sx1 = gy0 * zs, gy1 * zs, gx0 * zs, gx1 * zs
+                        own = ndimage.binary_dilation(cap_up[sy0:sy1, sx0:sx1],
+                                                      dil, iterations=zs)
+                        fine_mask[sy0:sy1, sx0:sx1] &= up < ZIP_DARK_T
+                        bands = []
+                        for t, fill in ZIP_TONES:
+                            band = own & (up < t)
+                            if not band.any():
+                                continue
+                            full = np.zeros((H * zs, W * zs), bool)
+                            full[sy0:sy1, sx0:sx1] = band
+                            bands.append((fill, scale_paths(trace_potrace(Image.fromarray(
+                                np.where(full, 0, 255).astype(np.uint8))), 1.0 / zs)))
+                        zip_grey[nm] = bands
                     canvas_fine = Image.fromarray(
                         np.where(fine_mask, 0, 255).astype(np.uint8))
                     fscale = 1.0 / zs
@@ -2476,7 +2532,10 @@ def main(in_png, labels_npy, groups_json, out_svg):
     # the only thing that separates a tooth from the topstitch beside it.
     # "label" too: a FRONT/BACK caption's letters are small compact marks the
     # detector files as dashes, and grayed they printed as half-gray words.
-    HARDWARE_OWNER_KEYWORDS = ("zip", "placket", "fly", "button", "snap",
+    # "placket" is not here: its buttons and snaps already go to button_*
+    # layers, so what remains on a placket is its topstitching -- which drew
+    # black beside the grey quilting on a puffer.
+    HARDWARE_OWNER_KEYWORDS = ("zip", "fly", "button", "snap",
                                "eyelet", "buckle", "rivet", "grommet", "label")
     NO_STITCH_OWNER_KEYWORDS = ("pocket", "welt", "hem", "neck", "collar", "yoke")
     dark_marks = set()
@@ -2492,6 +2551,24 @@ def main(in_png, labels_npy, groups_json, out_svg):
     for _nm, _p in cfg["parts"].items():
         if _p.get("grab_box"):
             garment_zone |= grab_mask(_p, H, W)
+    # Keep stitching only where it runs as a line. A dash with no neighbouring
+    # dashes is noise the detector picked up (a fleck of texture, a tick at a
+    # seam end), and the user's read was "too many stitch dashes -- keep a few
+    # clean runs or none". Dashes within STITCH_RUN_GAP px of each other form a
+    # run; runs shorter than STITCH_MIN_RUN dashes are dropped.
+    if stitches_mask.any() and STITCH_MIN_RUN > 1:
+        slab_, sn_ = ndimage.label(stitches_mask, structure=np.ones((3, 3)))
+        runs = ndimage.binary_dilation(stitches_mask, dil, iterations=STITCH_RUN_GAP // 2)
+        rlab, rn = ndimage.label(runs, structure=np.ones((3, 3)))
+        if sn_ and rn:
+            # one representative pixel per dash -> which run it belongs to
+            rep_run = np.asarray(ndimage.maximum(rlab, slab_, np.arange(1, sn_ + 1)), int)
+            per_run = np.bincount(rep_run, minlength=rn + 1)
+            keep_dash = per_run[rep_run] >= STITCH_MIN_RUN
+            before = int(stitches_mask.sum())
+            stitches_mask = np.concatenate([[False], keep_dash])[slab_]
+            print(f"  stitch runs: kept {int(keep_dash.sum())}/{sn_} dashes "
+                  f"({before - int(stitches_mask.sum())}px of stray marks dropped)")
     marks_all = buttons_mask | stitches_mask
     text_mask = np.zeros_like(marks_all)
     mlab, mn = ndimage.label(marks_all, structure=np.ones((3, 3)))
@@ -2519,6 +2596,16 @@ def main(in_png, labels_npy, groups_json, out_svg):
             cx = min(max(int((xmin + xmax) / 2), 0), W - 1)
             owner = "label" if prefix == "text" else mark_owner_of(cx, cy)
             kind = prefix
+
+            # Stitch dashes are left out of the SVG by default -- the user's
+            # call: keep the garment's lines (neckline, waistband, cuffs,
+            # sleeves), drop the topstitching. Hardware the detector files as
+            # dashes (zip teeth, snap ticks) is not stitching and stays.
+            # KEEP_STITCHES=1 brings the stitch_* layers back.
+            if (kind == "stitch" and not KEEP_STITCHES
+                    and not (owner and any(k in owner for k in HARDWARE_OWNER_KEYWORDS))):
+                dropped += 1
+                continue
 
             # Pockets, hem, neckline and yoke line carry no topstitching in
             # this house style, so a dash run sitting on one is dropped rather
@@ -2587,6 +2674,29 @@ def main(in_png, labels_npy, groups_json, out_svg):
         layers.append(((-1, -1, 0), "unassigned", paths, []))
         print(f"  [unassigned] {len(paths)} paths ({int(left.sum())} px)")
 
+    # Grey surface design (quilting, stripes, prints, texture): seg_parts
+    # strips it before segmenting so it can never become a part, and saves it
+    # as grey.png. Painted back here in grey INSIDE each part's own layer --
+    # the SVG shows the sketch's texture, and the layer list stays parts only.
+    grey_paths = {}
+    grey_png = os.path.join(os.path.dirname(os.path.abspath(labels_npy)), "grey.png")
+    if GREY_DESIGN and os.path.isfile(grey_png):
+        gimg = Image.open(grey_png).convert("L")
+        if gimg.size != (W, H):
+            gimg = gimg.resize((W, H), Image.LANCZOS)
+        gmask = np.asarray(gimg) < GREY_INK_T
+        n_grey = 0
+        for nm, p in cfg["parts"].items():
+            m = gmask & np.isin(labels, p["regions"])
+            if m.sum() < 20:
+                continue
+            canvas = np.full((H, W), 255, np.uint8)
+            canvas[m] = 0
+            grey_paths[nm] = trace(Image.fromarray(canvas))
+            n_grey += int(m.sum())
+        if grey_paths:
+            print(f"  [grey design] {n_grey}px traced into {len(grey_paths)} part layers")
+
     layers.sort(key=lambda t: t[0])
     merge = os.environ.get("MERGE_PATHS", "1") == "1"
     TR_NUM = re.compile(r"translate\(([-\d.]+),([-\d.]+)\)")
@@ -2606,13 +2716,19 @@ def main(in_png, labels_npy, groups_json, out_svg):
     # default: still clearly there, clearly secondary. Black marks never get
     # here (see STITCH_DARK_T), so gray only ever means gray in the sketch.
     # STITCH_FILL=#000000 forces full black, #ffffff hides the stitching.
-    stitch_fill = os.environ.get("STITCH_FILL", "#808080")
+    stitch_fill = os.environ.get("STITCH_FILL", "#a6a6a6")
+    # Cutlines and hardware in a soft black. Pure black was the default, but
+    # with the ink traced at its halo-inclusive cut the lines came out heavy;
+    # now that they trace at the drawn width (seg_parts trace_edge_ink), the
+    # user asked for a lighter black at that thin weight. INK_FILL overrides
+    # (#000000 for the old pure black).
+    ink_fill = os.environ.get("INK_FILL", "#333333")
 
     for _, name, paths, guide_paths in layers:
         # Gray is for stitching ONLY. Every cutline, every hardware mark
         # (zip teeth, snaps, buttons) stays black -- see dark_marks.
         fill = (stitch_fill if name.startswith("stitch_")
-                and name not in dark_marks else "#000000")
+                and name not in dark_marks else ink_fill)
         out.append(f'  <g id="{name}" inkscape:groupmode="layer" '
                    f'inkscape:label="{name}">')
         # Guide (synthesized gap-closure) paths first, underneath the real
@@ -2627,7 +2743,7 @@ def main(in_png, labels_npy, groups_json, out_svg):
         if guide_paths:
             parts_g = [bake(d, tr) for d, tr in guide_paths]
             out.append(f'    <path d="{" ".join(parts_g)}" '
-                       f'fill="{os.environ.get("GUIDE_FILL", "#000000")}" '
+                       f'fill="{os.environ.get("GUIDE_FILL", ink_fill)}" '
                        f'fill-rule="evenodd"/>')
         # The component's own complete closed perimeter, inked BLACK: every
         # part reads as a separate piece with its own outline, which is what a
@@ -2639,12 +2755,27 @@ def main(in_png, labels_npy, groups_json, out_svg):
         # of that landing anywhere the sketch does not already have ink.
         # BOUNDARY_FILL=none makes it invisible geometry again (the old
         # default), BOUNDARY_FILL=off leaves it out of the file entirely.
-        bfill = os.environ.get("BOUNDARY_FILL", "#000000")
+        bfill = os.environ.get("BOUNDARY_FILL", ink_fill)
+        # A boxed part (zip, placket strip) shares both long edges with the
+        # panels beside it, which already draw them: its own copy doubled every
+        # rail into a heavy line (the zip read wider than in the sketch). Keep
+        # it invisible here; the standalone export paints it back
+        # (_visible_boundary), so the extracted zip still has its outline.
+        if cfg["parts"].get(name, {}).get("grab_box") and bfill != "off":
+            bfill = "none"
         if boundary_paths.get(name) and bfill != "off":
             parts_b = [bake(d, tr) for d, tr in boundary_paths[name]]
             out.append(f'    <path class="component-boundary" '
                        f'd="{" ".join(parts_b)}" fill="{bfill}" '
                        f'fill-rule="evenodd"/>')
+        if grey_paths.get(name):
+            parts_g = [bake(d, tr) for d, tr in grey_paths[name]]
+            out.append(f'    <path class="surface-design" d="{" ".join(parts_g)}" '
+                       f'fill="{GREY_FILL}" fill-rule="evenodd"/>')
+        for zfill, zpaths in zip_grey.get(name, []):
+            parts_z = [bake(d, tr) for d, tr in zpaths]
+            out.append(f'    <path class="zip-shade" d="{" ".join(parts_z)}" '
+                       f'fill="{zfill}" fill-rule="evenodd"/>')
         if merge:
             # ONE compound path per part: bake translate into coordinates
             # and join all subpaths (disjoint regions -> evenodd is safe)
@@ -2672,8 +2803,12 @@ def main(in_png, labels_npy, groups_json, out_svg):
     # visual proof pack: each part as PNG + recombined composite
     if os.environ.get("EXPORT_PARTS", "1") == "1":
         try:
+            # The hosted runtime has no PyMuPDF unless it's installed here, and
+            # without it every per-part PNG was skipped -- the parts list (eye
+            # icons) came up empty on the hosted app.
+            ensure(modules=["fitz"], packages=["pymupdf==1.27.2"])
             import fitz  # noqa: F401 -- just probing availability here
-        except (ImportError, OSError) as e:
+        except (ImportError, OSError, RuntimeError) as e:
             print(f"(skipping per-part PNG exports: {e})")
             return
         pdir = os.path.join(os.path.dirname(os.path.abspath(labels_npy)),
@@ -2712,22 +2847,32 @@ def main(in_png, labels_npy, groups_json, out_svg):
         # standalone crop only.
         def _visible_boundary(svg_fragment: str) -> str:
             return re.sub(r'(<path class="component-boundary"[^>]*?fill=")none(")',
-                          r'\g<1>#000000\g<2>', svg_fragment)
+                          rf'\g<1>{ink_fill}\g<2>', svg_fragment)
 
         # Every extracted piece gets one even, closed black outline on all
         # sides: its region's silhouette stroked at the sketch's own outline
         # weight, centred on the region edge (half over the drawn line, half
         # just inside). Only in the standalone crop -- in the composed drawing
         # each neighbour would stroke the shared seam again.
-        outline_w = max(3.0, 1.5 * float(outline_px))
+        outline_w = max(2.0, float(outline_px))
 
         def _with_outline(nm: str, svg_fragment: str) -> str:
             if not outline_paths.get(nm) or os.environ.get("PART_OUTLINE", "1") != "1":
                 return svg_fragment
             d = " ".join(bake(d_, tr) for d_, tr in outline_paths[nm])
-            stroke = (f'<path class="part-outline" d="{d}" fill="none" stroke="#000000" '
+            stroke = (f'<path class="part-outline" d="{d}" fill="none" stroke="{ink_fill}" '
                       f'stroke-width="{outline_w:.1f}" stroke-linejoin="round"/>')
             return svg_fragment.replace("</g>", stroke + "</g>", 1)
+
+        # The standalone PNGs above can't be stacked back into the drawing:
+        # each one strokes its full outline, so where neighbours meet the
+        # seam is drawn two or three times over. On a narrow zip that is the
+        # zip's outline plus both body panels' -- the app's full-garment
+        # view stacked them and the zip read as a solid black bar (measured:
+        # 92% dark in the zip box against 51% in the composed SVG). _layers/
+        # holds each part exactly as it sits in out_svg, for compositing.
+        ldir = os.path.join(pdir, "_layers")
+        os.makedirs(ldir, exist_ok=True)
 
         for nm, g in groups.items():
             if nm.startswith(("stitch_", "button_", "text_")):
@@ -2743,6 +2888,9 @@ def main(in_png, labels_npy, groups_json, out_svg):
                                if m in groups)
             svg2png(svg_bytes=(head + _with_outline(nm, _visible_boundary(g)) + extra_g + "</svg>").encode(),
                     write_to=os.path.join(pdir, nm + ".png"),
+                    output_width=min(W, 1600))
+            svg2png(svg_bytes=(head + g + extra_g + "</svg>").encode(),
+                    write_to=os.path.join(ldir, nm + ".png"),
                     output_width=min(W, 1600))
         svg2png(svg_path=out_svg,
                 write_to=os.path.join(pdir, "_recombined.png"),

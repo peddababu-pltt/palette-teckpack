@@ -5,6 +5,7 @@ import type { StageEngine } from "../../engine"
 import { STRINGS } from "../../strings"
 import SvgViewer, { PartsCanvas, ViewerTaskPanel } from "../SvgViewer"
 import { dlIcon, eyeOffIcon, eyeOnIcon } from "../icons"
+import { useConfirm } from "../ConfirmDialog"
 
 // The part PNG is the full sketch canvas, so a plain thumbnail is a
 // near-empty square. Blow the image up so the part's bbox fills the tile and
@@ -32,6 +33,7 @@ export default function PartsTab({ job, pluginId, engine }: { job: Job; pluginId
   // moving) in the background repaints this tab without restarting anything.
   useSyncExternalStore(engine.subscribe, () => engine.version)
   const { t } = usePluginTranslations(STRINGS)
+  const confirm = useConfirm()
 
   const out = job.outputs
   const [data, setData] = useState<PartsResponse | null>(null)
@@ -58,7 +60,11 @@ export default function PartsTab({ job, pluginId, engine }: { job: Job; pluginId
         // never actually existed.
         const resolved: PartsResponse = {
           ...res,
-          parts: res.parts.map((p) => ({ ...p, image: withCacheBust(resolveUrl(p.image), job.mtime)! })),
+          parts: res.parts.map((p) => ({
+            ...p,
+            image: withCacheBust(resolveUrl(p.image), job.mtime)!,
+            layer: p.layer ? withCacheBust(resolveUrl(p.layer), job.mtime)! : null,
+          })),
         }
         setData(resolved)
         setVisible(resolved.parts.map(() => true))
@@ -86,9 +92,9 @@ export default function PartsTab({ job, pluginId, engine }: { job: Job; pluginId
     })
   }
 
-  function rerun() {
+  async function rerun() {
     if (engine.isLive(job.job_id, "parts")) return
-    if (!window.confirm(t("partsTab.confirmRerun"))) return
+    if (!(await confirm({ message: t("partsTab.confirmRerun"), confirmLabel: t("partsTab.rerun") }))) return
     void engine.queue(job, "parts")
   }
   const rerunSpec = { label: t("partsTab.rerun"), title: t("partsTab.rerunTitle"), onClick: rerun }

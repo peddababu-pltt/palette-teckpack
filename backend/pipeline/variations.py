@@ -18,6 +18,7 @@ import argparse
 import base64
 import io
 import json
+import os
 import random
 import sys
 from pathlib import Path
@@ -33,7 +34,10 @@ from warp_pattern import (
     download_output,
     extract_outputs,
     iter_sse_events,
+    keep_aspect_options,
+    router_failed,
     upload_image,
+    with_router_retry,
 )
 
 # Exactly the two views, closed, front-left/back-right -- matching the flat's own
@@ -474,14 +478,22 @@ def build_realistic_prompt(colors: list[str], season: str, extra_prompt: str,
     return " ".join(parts)
 
 
-def _run_image_edit(label: str, prompt: str, inputs: list[dict], seed: int) -> bytes:
+def _run_image_edit(label: str, prompt: str, inputs: list[dict], seed: int,
+                    provider_options: dict | None = None) -> bytes:
+    return with_router_retry(_run_image_edit_once, label, prompt, inputs, seed, provider_options)
+
+
+def _run_image_edit_once(label: str, prompt: str, inputs: list[dict], seed: int,
+                         provider_options: dict | None = None) -> bytes:
     payload = {
         "prompt": prompt,
-        "model": "image-edit-default",
+        "model": os.environ.get("LLM_ROUTER_IMAGE_MODEL", "image-edit-production"),
         "seed": seed,
         "inputs": inputs,
         "metadata": {"source": "flat2variations", "label": label, "seed": seed},
     }
+    if provider_options:
+        payload["provider_options"] = provider_options
 
     r = requests.post(
         BASE_URL,
@@ -497,8 +509,7 @@ def _run_image_edit(label: str, prompt: str, inputs: list[dict], seed: int) -> b
     for event in iter_sse_events(r):
         last_event = event
         if event.get("event") == "error":
-            msg = event.get("data", {}).get("error", event.get("data", {}))
-            sys.exit(f"'{label}' failed: router error {msg}")
+            router_failed(event.get("data", {}).get("error", event.get("data", {})), f"'{label}' failed: router error ")
         found = extract_outputs(event.get("data", event))
         if found:
             out = found
@@ -522,11 +533,12 @@ def generate_realistic(image_url: str, colors: list[str], season: str, extra_pro
 
 
 def generate_design_variant(image_url: str, recipe: str, extra_prompt: str, seed: int, index: int,
-                             reference_urls: list[str] | None = None) -> bytes:
+                             reference_urls: list[str] | None = None,
+                             provider_options: dict | None = None) -> bytes:
     refs = reference_urls or []
     prompt = build_design_variant_prompt(recipe, extra_prompt, bool(refs))
     inputs = [{"type": "image", "url": image_url, "role": "subject"}] + _reference_inputs(refs)
-    return _run_image_edit(f"variant:{index}", prompt, inputs, seed)
+    return _run_image_edit(f"variant:{index}", prompt, inputs, seed, provider_options)
 
 
 def main():
@@ -568,7 +580,8 @@ def main():
         ideas = generate_variant_ideas(a.sketch, count, a.prompt)
         for i, recipe in enumerate(ideas):
             variant_seed = random.randint(0, 2**31 - 1)
-            sketch_bytes = generate_design_variant(image_url, recipe, a.prompt, variant_seed, i, reference_urls)
+            sketch_bytes = generate_design_variant(image_url, recipe, a.prompt, variant_seed, i, reference_urls,
+                                                   keep_aspect_options(a.sketch))
             sketch_file = f"variant_{i + 1}_sketch.png"
             (out_dir / sketch_file).write_bytes(sketch_bytes)
 

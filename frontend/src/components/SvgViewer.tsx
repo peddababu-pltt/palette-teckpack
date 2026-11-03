@@ -187,7 +187,7 @@ export function PartsCanvas({ parts, visible }: { parts: PartInfo[]; visible: bo
         }
         draw()
       }
-      img.src = p.image
+      img.src = p.layer || p.image
       return img
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps

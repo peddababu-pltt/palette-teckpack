@@ -6,7 +6,7 @@ itself — vendored copies of the pipeline scripts live under `backend/pipeline/
 and are invoked directly as subprocesses. There is no separate service to run
 alongside it; this plugin is self-contained.
 
-Secrets (`ANTHROPIC_API_KEY`, etc.) are read per-request via `ctx.secret(...)`
+Secrets (`PALETTE_API_KEY`, etc.) are read per-request via `ctx.secret(...)`
 from Palette's plugin-config system in production, or from
 `.palette/.env.local` under `pltt dev`.
 
@@ -39,8 +39,10 @@ pip install --group dev .   # from a venv with Python 3.12+, repo root
 cp .palette/.env.example .palette/.env.local
 ```
 
-Edit `.palette/.env.local` and set at least `ANTHROPIC_API_KEY` (the sketch/
-variation pipeline stages call it directly). `.palette/.env.local` is
+Edit `.palette/.env.local` and set at least `PALETTE_API_KEY` (every Claude /
+Gemini call in the pipeline goes to the Palette LLM gateway at
+`PALETTE_LLM_BASE_URL`, default `https://llm.pltt.dev`, via
+`backend/api/llm_bridge.py`) and `LLM_ROUTER_API_KEY` (image models). `.palette/.env.local` is
 gitignored — never commit real keys.
 
 ## 4. Run locally
@@ -96,8 +98,8 @@ npx pltt publish --env production    # asks for confirmation
 ```
 
 `capabilities.external_network` in `palette-plugin.json` must list every
-external host the pipeline calls (currently `api.anthropic.com`,
-`generativelanguage.googleapis.com`) before publishing past local dev.
+external host the pipeline calls (currently `router-api.pltt.ai`,
+`llm.pltt.dev`, `three.ws`) before publishing past local dev.
 
 ## 7. Versioning
 
