@@ -20,6 +20,7 @@ import io
 import json
 import os
 import random
+import tempfile
 import sys
 from pathlib import Path
 
@@ -38,6 +39,44 @@ from warp_pattern import (
     router_failed,
     upload_image,
     with_router_retry,
+)
+from regen_sketch import _check_defect, check_zipper_teeth_defect
+
+# Every generation here is one more image-edit pass over the sketch, and each
+# pass is another chance for the model to melt zipper teeth into a scribble or
+# (in the realistic render) smooth the zip into a plain seam. Verify the
+# raster, retry once with a correction note -- same remedy as regen_sketch.
+ZIP_VERIFY_ATTEMPTS = int(os.environ.get("ZIP_VERIFY_ATTEMPTS", "2"))
+
+# Stated for EVERY zip, not just the centre-front one: short neck zips and
+# pocket zips are the ones the model drops first because they are small.
+_ZIP_TEETH_SKETCH_RULE = (
+    "ZIPPER TEETH: every zipper visible in the reference -- centre-front zip, "
+    "short neck/quarter zip, pocket zips, sleeve or hem zips, any zip at all, "
+    "however small -- keeps its teeth drawn as a clean, regular row of short "
+    "straight ticks between two straight tape rails, evenly spaced and "
+    "unbroken from top stop to bottom stop, with its slider and pull. Never a "
+    "scribble, squiggle, smudge, plain line or solid bar. Never drop a small "
+    "zip because it is small."
+)
+_ZIP_TEETH_REALISTIC_RULE = (
+    "ZIPPER TEETH: every zipper in the sketch -- centre-front zip, short "
+    "neck/quarter zip, pocket zips, sleeve or hem zips, any zip at all, "
+    "however small -- is rendered as a real zipper with its individual teeth "
+    "(metal or coil) clearly visible and evenly spaced along its whole length, "
+    "plus its tape, slider and pull. Do not smooth a zip into a plain seam, "
+    "hide it under fabric, blur its teeth, or leave out a small pocket zip."
+)
+_ZIP_TEETH_REALISTIC_CHECK_PROMPT = (
+    "Look ONLY at the zippers in this photo of a garment (centre-front zip, "
+    "pocket zips, any other zip). If the garment shows no zipper at all, "
+    "there is no defect. The defect is present if any zipper's teeth are not "
+    "clearly visible as individual, evenly spaced teeth along its length -- "
+    "e.g. the zip reads as a plain seam or smooth line, its teeth are blurred "
+    "or smeared together, distorted into irregular blobs, or partly missing. "
+    "Reply with ONLY a JSON object, no markdown fences, no explanation: "
+    '{"defect_found": true or false, "locations": ["short description of '
+    'each spot", ...]}. If there is no defect, "locations" is an empty list.'
 )
 
 # Exactly the two views, closed, front-left/back-right -- matching the flat's own
@@ -330,6 +369,75 @@ Respond with ONLY a valid JSON object, no markdown fences, no explanation:
 {"primary": "#RRGGBB", "secondary": "#RRGGBB", "trim": "#RRGGBB"}"""
 
 
+# The recommender only ever sees a black-and-white sketch, so left to itself it
+# lands on the same "safe" palette (beige / navy / charcoal) for every garment.
+# Each run is instead handed a colour FAMILY to work in -- picked at random, and
+# never one of the last few runs' families -- and the model only chooses the
+# exact shades that suit this garment. Each family's palette is also the fallback
+# when the model call fails. [primary, secondary, trim]
+COLOR_DIRECTIONS = {
+    "burgundy / wine red": ["#6D1A2B", "#8E3A47", "#C9A66B"],
+    "terracotta / rust": ["#B5542D", "#D9895B", "#3B2A20"],
+    "mustard / ochre yellow": ["#C9962B", "#E3C16F", "#3A3326"],
+    "olive / khaki green": ["#6B6B3A", "#A39E6A", "#2F2F1E"],
+    "forest / bottle green": ["#1F4D3A", "#3F7259", "#C8B68A"],
+    "sage / mint green": ["#9DB8A0", "#CFE0CF", "#4E6B57"],
+    "teal / petrol blue": ["#1D5E66", "#4C8C93", "#D6C9A8"],
+    "cobalt / royal blue": ["#2546A8", "#5C7BD6", "#F2F2F2"],
+    "navy / midnight blue": ["#1B2440", "#3A4870", "#B8B8B8"],
+    "sky / powder blue": ["#9EC3E6", "#D3E5F5", "#3D5A80"],
+    "lavender / lilac": ["#B4A2D6", "#DCD2EE", "#5A4A7A"],
+    "plum / aubergine": ["#4E2A4F", "#7B4F7C", "#D9C4A0"],
+    "blush / dusty pink": ["#D9A5A5", "#EFD3D0", "#7A4A4A"],
+    "coral / tomato red": ["#E0503A", "#F08A72", "#2B2B2B"],
+    "fuchsia / magenta": ["#B8277A", "#D9659F", "#1E1E1E"],
+    "emerald green": ["#0F7A55", "#3FA67C", "#E8D9A8"],
+    "camel / tan": ["#B88A5A", "#D8B78E", "#3E2C1C"],
+    "chocolate brown": ["#4A2F22", "#7A5340", "#D2B48C"],
+    "charcoal / graphite grey": ["#3A3C40", "#6B6E73", "#C0C0C0"],
+    "cream / ecru": ["#EDE4D3", "#D8CBB0", "#6E5B3E"],
+    "jet black": ["#141414", "#3A3A3A", "#B0B0B0"],
+    "lemon / bright yellow": ["#F2D43A", "#F7E68A", "#2E2E2E"],
+    "burnt orange": ["#C8591E", "#E58A4C", "#2E2420"],
+    "denim / indigo": ["#2E3F66", "#5A6F99", "#C99A4A"],
+}
+_RECENT_COLORS_FILE = Path(tempfile.gettempdir()) / "techpack-recent-color-directions.json"
+_RECENT_COLORS_KEEP = 8
+
+
+def color_name(hexval: str) -> str:
+    """Nearest colour family name for a #RRGGBB (for the image prompt)."""
+    try:
+        r, g, b = (int(hexval.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return hexval
+    best, dist = hexval, float("inf")
+    for name, pal in COLOR_DIRECTIONS.items():
+        for h in pal[:2]:
+            r2, g2, b2 = (int(h[i:i + 2], 16) for i in (1, 3, 5))
+            d = 2 * (r - r2) ** 2 + 4 * (g - g2) ** 2 + 3 * (b - b2) ** 2
+            if d < dist:
+                best, dist = name, d
+    return best
+
+
+def pick_color_direction() -> str:
+    """A random colour family, avoiding the last few runs' (best effort: a
+    missing or unwritable history file just means a plain random pick)."""
+    try:
+        recent = json.loads(_RECENT_COLORS_FILE.read_text())
+        recent = [r for r in recent if r in COLOR_DIRECTIONS] if isinstance(recent, list) else []
+    except (OSError, ValueError):
+        recent = []
+    choices = [d for d in COLOR_DIRECTIONS if d not in recent] or list(COLOR_DIRECTIONS)
+    pick = random.choice(choices)
+    try:
+        _RECENT_COLORS_FILE.write_text(json.dumps((recent + [pick])[-_RECENT_COLORS_KEEP:]))
+    except OSError:
+        pass
+    return pick
+
+
 def recommend_colors_and_season(sketch_path: str, extra_prompt: str) -> tuple[list[str], str]:
     """Ask Claude to recommend a color palette from the actual garment, used
     whenever the caller didn't supply one (the "AI Recommendation" tabs in the
@@ -341,9 +449,16 @@ def recommend_colors_and_season(sketch_path: str, extra_prompt: str) -> tuple[li
     wants variety run to run on the same garment rather than the AI settling on
     whichever season it judges "correct" every time."""
     season = random.choice(list(SEASONS.keys()))
+    direction = pick_color_direction()
+    fallback = list(COLOR_DIRECTIONS[direction])
+    print(f"color direction for this run: {direction}")
     try:
         b64 = _load_image_b64(sketch_path)
-        prompt = _RECOMMEND_PROMPT
+        prompt = _RECOMMEND_PROMPT + (
+            f"\n\nCOLOR DIRECTION FOR THIS GARMENT: the PRIMARY body color must be in the {direction} family "
+            f"(for example {fallback[0]}). Choose the exact shade of that family that suits this garment, and a "
+            f"secondary and trim that work with it. Do not fall back to beige, grey or navy unless that IS the "
+            f"family given. If the user's instructions below name a color, the user's color wins.")
         if extra_prompt:
             prompt += f"\n\nAlso take into account these additional instructions from the user: {extra_prompt}"
 
@@ -365,12 +480,14 @@ def recommend_colors_and_season(sketch_path: str, extra_prompt: str) -> tuple[li
 
         colors = [result.get(k, "") for k in ("primary", "secondary", "trim")]
         colors = [c for c in colors if isinstance(c, str) and c.startswith("#")]
+        if not colors:
+            colors = fallback
 
-        print(f"recommended: colors={colors or 'none'} season={season} (random)")
+        print(f"recommended: colors={colors} season={season} (random)")
         return colors, season
     except Exception as e:
-        print(f"AI color recommendation failed ({e}) — using generic fallback, season stays random")
-        return [], season
+        print(f"AI color recommendation failed ({e}) — using the {direction} palette, season stays random")
+        return fallback, season
 
 
 def generate_variant_ideas(sketch_path: str, count: int, extra_prompt: str) -> list[str]:
@@ -443,6 +560,7 @@ def build_design_variant_prompt(recipe: str, extra_prompt: str, has_references: 
         # Last in the list, so it is the constraint the model reads immediately
         # after the instruction most likely to break it.
         _WEARABILITY_RULES,
+        _ZIP_TEETH_SKETCH_RULE,
     ]
     if has_references:
         parts.append(_REFERENCE_DETAIL_RULE)
@@ -453,7 +571,7 @@ def build_design_variant_prompt(recipe: str, extra_prompt: str, has_references: 
 
 def build_realistic_prompt(colors: list[str], season: str, extra_prompt: str,
                             has_references: bool = False) -> str:
-    parts = [_REALISTIC_PROMPT_BASE, _OPEN_CLOSED_LAYOUT]
+    parts = [_REALISTIC_PROMPT_BASE, _OPEN_CLOSED_LAYOUT, _ZIP_TEETH_REALISTIC_RULE]
     if has_references:
         parts.append(_REFERENCE_DETAIL_RULE)
     if season and season in SEASONS:
@@ -465,12 +583,17 @@ def build_realistic_prompt(colors: list[str], season: str, extra_prompt: str,
     # would shift trim's hex into secondary's label and drop trim's hint).
     padded = (list(colors) + ["", "", ""])[:3]
     color_parts = [
-        f"{label}: {hexval} - {hint}"
+        f"{label}: {hexval} ({color_name(hexval)}) - {hint}"
         for label, hexval, hint in zip(_COLOR_LABELS, padded, _COLOR_ROLE_HINTS)
         if hexval
     ]
     if color_parts:
         parts.append(f"Apply colors: [{'], ['.join(color_parts)}].")
+        # image models read a hex code loosely and drift back to the same safe
+        # neutrals; the named colour plus this line keeps the body colour honest
+        parts.append(f"The garment's main body fabric MUST visibly be {color_name(padded[0])} "
+                     f"({padded[0]}) -- not beige, grey or navy unless that is the color given."
+                     if padded[0] else "")
     else:
         parts.append("Use natural, realistic fabric colors appropriate for the design.")
     if extra_prompt:
@@ -518,6 +641,35 @@ def _run_image_edit_once(label: str, prompt: str, inputs: list[dict], seed: int,
         sys.exit(f"'{label}' failed: no image in stream (last event: {last_event})")
 
     return download_output(out[0])
+
+
+def _generate_checked(label: str, out_path: Path, generate, check, postprocess=None) -> None:
+    """Run `generate(extra_note)` -> bytes into out_path, re-running with a
+    correction note while `check(out_path)` still finds messy zipper teeth.
+    Keeps the last attempt either way; the check fails open (see _check_defect)."""
+    note = ""
+    for attempt in range(1, ZIP_VERIFY_ATTEMPTS + 1):
+        out_path.write_bytes(generate(note))
+        if postprocess:
+            postprocess(str(out_path))
+        result = check(str(out_path))
+        if not result.get("defect_found"):
+            return
+        locations = result.get("locations") or []
+        print(f"{label} attempt {attempt}: messy zipper teeth: {locations}")
+        note = ("CORRECTION FROM PREVIOUS ATTEMPT: the zipper teeth came out wrong at: "
+                + "; ".join(locations)
+                + ". Every zipper must show its individual teeth clearly, evenly "
+                "spaced, unbroken from top stop to bottom stop.")
+    print(f"{label}: zipper teeth still messy after {ZIP_VERIFY_ATTEMPTS} attempts, keeping last")
+
+
+def check_realistic_zipper_teeth(image_path: str) -> dict:
+    return _check_defect(image_path, _ZIP_TEETH_REALISTIC_CHECK_PROMPT, "realistic-zipper-teeth")
+
+
+def _with_note(extra_prompt: str, note: str) -> str:
+    return f"{extra_prompt} {note}".strip() if note else extra_prompt
 
 
 def _reference_inputs(reference_urls: list[str]) -> list[dict]:
@@ -580,10 +732,15 @@ def main():
         ideas = generate_variant_ideas(a.sketch, count, a.prompt)
         for i, recipe in enumerate(ideas):
             variant_seed = random.randint(0, 2**31 - 1)
-            sketch_bytes = generate_design_variant(image_url, recipe, a.prompt, variant_seed, i, reference_urls,
-                                                   keep_aspect_options(a.sketch))
             sketch_file = f"variant_{i + 1}_sketch.png"
-            (out_dir / sketch_file).write_bytes(sketch_bytes)
+            _generate_checked(
+                f"variant{i + 1}", out_dir / sketch_file,
+                lambda note, i=i, recipe=recipe, variant_seed=variant_seed: generate_design_variant(
+                    image_url, recipe, _with_note(a.prompt, note),
+                    variant_seed if not note else random.randint(0, 2**31 - 1),
+                    i, reference_urls, keep_aspect_options(a.sketch)),
+                check_zipper_teeth_defect,
+            )
 
             manifest.append({
                 "id": f"variant{i + 1}", "label": f"Variant {i + 1}",
@@ -605,13 +762,17 @@ def main():
             if not season:
                 season = rec_season
         # One render, both views: closed row over open row. See _OPEN_CLOSED_LAYOUT.
-        realistic_bytes = generate_realistic(image_url, colors, season, a.prompt, seed,
-                                             reference_urls)
         realistic_file = "realistic.png"
-        (out_dir / realistic_file).write_bytes(realistic_bytes)
         # the model's "white" comes back ~249 grey with a gradient; next to the
         # pure-white sketch in the slider it reads as a grey box (see white_bg.py)
-        whiten_file(str(out_dir / realistic_file))
+        _generate_checked(
+            "realistic", out_dir / realistic_file,
+            lambda note: generate_realistic(
+                image_url, colors, season, _with_note(a.prompt, note),
+                seed if not note else random.randint(0, 2**31 - 1), reference_urls),
+            check_realistic_zipper_teeth,
+            postprocess=whiten_file,
+        )
 
         manifest.append({
             "id": "realistic", "label": "Realistic",

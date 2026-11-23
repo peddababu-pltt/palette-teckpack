@@ -418,8 +418,56 @@ def _check_reference_compliance(output_bytes: bytes, reference_paths: list[str])
             "reference parts -- draw them this time: " + "; ".join(missing))
 
 
-def build_payload(image_url: str, seed: int, reference_urls: list[str] | None = None) -> dict:
-    prompt = FLAT_SKETCH_PROMPT
+# Lower garments: the leg LENGTH alone decides shorts vs trousers. Users kept
+# getting a pair of long-legged trousers back as shorts (and short legs as full
+# trousers) because the waistband, fly and pockets read the same on both.
+LEG_LENGTH_RULE = (
+    "LOWER GARMENTS — LEG LENGTH DECIDES SHORTS VS TROUSERS, AND IT IS KEPT EXACTLY. Measure each leg "
+    "in the input against the garment's own rise (waistband to crotch). SHORT legs — the leg ends "
+    "about one rise-length or less below the crotch, at or above the knee — are SHORTS: draw them as "
+    "shorts with that same short leg. LONG legs — the leg runs well past the knee toward the ankle, "
+    "several rise-lengths long — are TROUSERS/PANTS: draw full-length trouser legs reaching the "
+    "ankle. Never shorten long legs into shorts and never lengthen short legs into trousers; keep "
+    "the input's leg-length-to-rise ratio and leg width (slim, straight, wide, flared). "
+)
+
+# A hand drawing is the user's design, not a photo of a finished product. The
+# image model otherwise "completes" it with what such a garment usually has --
+# front pockets, a fly zip, belt loops, a button placket -- none of which the
+# user drew, and every one of them becomes a cut piece in the pattern.
+DRAWING_RULE = (
+    "THE INPUT IS A HAND DRAWING — THE USER'S OWN DESIGN. Convert exactly what is drawn into a clean "
+    "technical flat and nothing else: the same silhouette, the same length, and only the lines the "
+    "user drew, cleaned up (straighten wobbly strokes, close gaps, make curves smooth and symmetric). "
+    "INTERNAL PARTS ONLY IF DRAWN: pockets, zips, fly, buttons, snaps, plackets, belt loops, yokes, "
+    "darts, panel seams, cuffs, bands, collars, hoods, drawstrings, tabs and labels appear in the "
+    "output ONLY when the drawing shows them. If the user drew a plain body with no pocket, the flat "
+    "has no pocket; no zip drawn means no zip; no fly drawn means a plain front. Do NOT add any detail "
+    "because garments of this kind usually have it. A loose sketch line is read as the simplest thing "
+    "it can be (an outline or a seam), never as an extra feature. The BACK view shows only the "
+    "seams the front implies (side and shoulder seams, a centre-back seam only if needed) — no "
+    "invented back pockets, yokes or vents. "
+)
+
+
+def looks_like_drawing(path: str) -> bool:
+    """Same test as the API's input_is_drawing: mostly blank paper, almost no colour."""
+    try:
+        im = Image.open(path).convert("RGB")
+        im.thumbnail((256, 256))
+        px = list(im.getdata())
+    except (OSError, ValueError):
+        return False
+    paper = sum(1 for p in px if min(p) > 225) / len(px)
+    chroma = sum(max(p) - min(p) for p in px) / len(px)
+    return paper > 0.6 and chroma < 12
+
+
+def build_payload(image_url: str, seed: int, reference_urls: list[str] | None = None,
+                  drawing: bool = False) -> dict:
+    prompt = f"{FLAT_SKETCH_PROMPT} {LEG_LENGTH_RULE}"
+    if drawing:
+        prompt = f"{prompt} {DRAWING_RULE}"
     inputs = [{"type": "image", "url": image_url, "role": "subject"}]
     if reference_urls:
         prompt = f"{prompt} {REFERENCE_DETAIL_RULE}"
@@ -486,15 +534,15 @@ def extract_outputs(data: dict):
 
 
 def _generate(image_url: str, seed: int, extra_prompt: str = "",
-              reference_urls: list[str] | None = None) -> bytes:
-    return with_router_retry(_generate_once, image_url, seed, extra_prompt, reference_urls)
+              reference_urls: list[str] | None = None, drawing: bool = False) -> bytes:
+    return with_router_retry(_generate_once, image_url, seed, extra_prompt, reference_urls, drawing)
 
 
 def _generate_once(image_url: str, seed: int, extra_prompt: str = "",
-                   reference_urls: list[str] | None = None) -> bytes:
+                   reference_urls: list[str] | None = None, drawing: bool = False) -> bytes:
     """One image-gen call: builds the payload (with an optional correction
     appended to the prompt), posts it, and returns the resulting image bytes."""
-    payload = build_payload(image_url, seed, reference_urls)
+    payload = build_payload(image_url, seed, reference_urls, drawing)
     if extra_prompt:
         payload["prompt"] = payload["prompt"] + " " + extra_prompt
 
@@ -530,7 +578,7 @@ def _generate_once(image_url: str, seed: int, extra_prompt: str = "",
 FIDELITY_RETRIES = int(os.environ.get("FIDELITY_RETRIES", "2"))
 
 
-def _check_input_fidelity(input_path: str, output_bytes: bytes) -> str | None:
+def _check_input_fidelity(input_path: str, output_bytes: bytes, drawing: bool = False) -> str | None:
     """Compare the drawn flat against the INPUT and name anything invented or
     changed. Returns None when faithful (or the judge is unavailable), else a
     correction note for a retry.
@@ -563,7 +611,16 @@ def _check_input_fidelity(input_path: str, output_bytes: bytes) -> str | None:
             "type? (2) button/snap COUNT and shape on the front, the pockets, the sleeves. (3) "
             "pockets, flaps, tabs, badges: same count, type and position? (4) any panel, seam, "
             "collar or cuff added, removed or changed? (5) quilting/baffle lines that INPUT shows "
-            "dropped from OUTPUT? Ignore line weight, color, dash removal and drawing style. "
+            "dropped from OUTPUT? (6) LENGTH: is OUTPUT the same length class as INPUT -- for a "
+            "lower garment, short legs (ending at or above the knee, about one rise-length below the "
+            "crotch) must stay SHORTS and long legs (reaching toward the ankle) must stay full-length "
+            "TROUSERS; did OUTPUT turn trousers into shorts or shorts into trousers, or change the "
+            "garment's length? "
+            + ("INPUT IS A HAND DRAWING: it is the user's own design, so ANY pocket, zip, fly, button, "
+               "snap, placket, belt loop, yoke, dart, panel seam, cuff, band, collar, hood or drawstring "
+               "in OUTPUT that is not drawn in INPUT is an invention and is a problem -- list each one. "
+               if drawing else "")
+            + "Ignore line weight, color, dash removal and drawing style. "
             "Reply with ONLY a JSON object, no markdown fence: "
             '{"ok": true} if OUTPUT is faithful, or '
             '{"ok": false, "problems": ["<what OUTPUT got wrong, and what INPUT actually shows>", ...]}'
@@ -602,27 +659,30 @@ def photo_to_flat(input_path: str, output_path: str, seed: int | None,
     print(f"seed: {seed}")
 
     image_url = upload_image(input_path)
+    drawing = looks_like_drawing(input_path)
+    if drawing:
+        print("input is a hand drawing -> converting only what is drawn (no added pockets/zips/details)")
     reference_urls = [upload_image(p) for p in (reference_paths or [])]
     if reference_urls:
         print(f"using {len(reference_urls)} construction reference(s)")
-    img_bytes = _generate(image_url, seed, reference_urls=reference_urls)
+    img_bytes = _generate(image_url, seed, reference_urls=reference_urls, drawing=drawing)
 
     feedback = _check_reference_compliance(img_bytes, reference_paths or [])
     if feedback:
         print(f"reference compliance check flagged a miss -> retrying once: {feedback}")
         img_bytes = _generate(image_url, seed, extra_prompt=feedback,
-                              reference_urls=reference_urls)
+                              reference_urls=reference_urls, drawing=drawing)
 
     # References deliberately graft parts the input does not have, so the
     # "nothing added" check only runs without them.
     if not reference_urls:
         for attempt in range(1, FIDELITY_RETRIES + 1):
-            note = _check_input_fidelity(input_path, img_bytes)
+            note = _check_input_fidelity(input_path, img_bytes, drawing)
             if not note:
                 print("fidelity check: output matches the input")
                 break
             print(f"fidelity check flagged a mismatch -> retry {attempt}/{FIDELITY_RETRIES}: {note}")
-            img_bytes = _generate(image_url, random.randint(0, 2**31 - 1), extra_prompt=note)
+            img_bytes = _generate(image_url, random.randint(0, 2**31 - 1), extra_prompt=note, drawing=drawing)
 
     Path(output_path).write_bytes(img_bytes)
     print(f"saved → {output_path}")

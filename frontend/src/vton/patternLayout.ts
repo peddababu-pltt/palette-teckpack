@@ -247,7 +247,12 @@ export function buildPatternGroup(pieces: PatternPiece[], papers: Map<string, Pa
 
   // ---- body pieces, by their worn place ----
   const collarRow: Work[] = []
-  let hemY = a.hipY - 0.05 // the bodice's hem line, once a front bodice is placed
+  // The bodice's hem line: the LOWEST bottom edge of every placed front/back
+  // body panel. It used to be whichever front piece was placed last, so a
+  // pattern with a short front piece (an upper front, a yoke filed as a front)
+  // put the hem band across the middle of the stomach.
+  let hemY = a.hipY - 0.05
+  let hemSet = false
   // backings (lining / facing / interfacing) are hidden duplicates of the piece
   // they back, whatever category the classifier filed them under
   // (a pocket bag hangs inside the garment the same way)
@@ -326,7 +331,11 @@ export function buildPatternGroup(pieces: PatternPiece[], papers: Map<string, Pa
         const sides: (-1 | 0 | 1)[] = w.foldPair ? [1, -1] : [s]
         for (const side of sides) add(w, centreHung(w, side, top, z))
       }
-      if (cat === "bodice_front") hemY = top - b.h / 1000
+      if (/^(bodice_front|bodice_back|side_panel)$/.test(cat) && !lower) {
+        const bottom = top - b.h / 1000
+        hemY = hemSet ? Math.min(hemY, bottom) : bottom
+        hemSet = true
+      }
     } else if (/^(sleeve|sleeve_left|sleeve_right|cuff)$/.test(cat)) {
       const arm = a.arms.get(s === -1 ? -1 : 1)
       if (!arm) continue
@@ -405,7 +414,9 @@ export function buildPatternGroup(pieces: PatternPiece[], papers: Map<string, Pa
       // the fly shield down the centre front from the waist
       add(w, centreHung(w, 1, a.waistY + 0.0, a.hipFrontZ + outer))
     } else if (/hem|casing|band|drawcord/.test(n) && !/waist/.test(n)) {
-      add(w, acrossBody(w, hemY + 0.02, a.frontZ + outer)) // along the hem
+      // sewn onto the hem: the band hangs BELOW the body's bottom edge (its top
+      // edge on the hem line), not over the panels
+      add(w, acrossBody(w, hemY, a.frontZ + outer))
     } else if (/waist/.test(n)) {
       add(w, acrossBody(w, a.waistY + 0.04, a.hipFrontZ + outer))
     } else if (/pocket|welt/.test(n)) {

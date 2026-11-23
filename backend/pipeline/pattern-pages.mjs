@@ -205,33 +205,9 @@ export function renderPieceThumbs(svg) {
   })
 }
 
-// The 3D preview's texture for one piece: same standalone piece SVG the PDF page uses,
-// minus the grid, dimension marks, seam-allowance line, placement overlays and text, with the cutline's interior filled in fabric colour
-// and a transparent outside -- so a textured plane in three.js shows just the piece's
-// true shape. Inline style beats freesewing's own `.fabric { fill: none }` rule.
-const FABRIC_3D = '#4a78c2'
-function writePiece3dTexture(header, piece, suffix, w, h, stackContent, dir, cache) {
-  let body = piece
-    .replace(/<path\s+class="grid"[^>]*\/>\s*/g, '')
-    .replace(/<path\s+class="mark[^"]*"[^>]*\/>\s*/g, '')
-    .replace(/<path\s+class="fabric sa"[^>]*\/>\s*/g, '')
-    .replace(/<path d="[^"]*"[^>]*\/>/g, '') // class-less = placement overlays (photo-draft.helpers)
-    .replace(/<text\b[\s\S]*?<\/text>\s*/g, '')
-    .replace(/<path(\s+)class="(fabric|various|contrast|lining|canvas|interfacing)"(?=[\s>])/g, `<path$1style="fill:${FABRIC_3D};fill-opacity:1" class="$2"`)
-  const svg = header
-    .replace(/width="[-\d.]+mm"/, `width="${w.toFixed(2)}mm"`)
-    .replace(/height="[-\d.]+mm"/, `height="${h.toFixed(2)}mm"`)
-    .replace(/viewBox="[-\d.]+ [-\d.]+ [-\d.]+ [-\d.]+"/, `viewBox="0 0 ${w.toFixed(2)} ${h.toFixed(2)}"`) +
-    `<g id="fs-container">\n${body}\n</g>\n</svg>`
-  const DPI = 50
-  const px = Math.max(1, Math.round(w * DPI / 25.4))
-  const png = cache.png('texture', svg, px, () => new Resvg(svg, { fitTo: { mode: 'width', value: px } }).render().asPng())
-  fs.mkdirSync(dir, { recursive: true })
-  const file = `${suffix}.png`
-  fs.writeFileSync(`${dir}/${file}`, png)
-  // the same piece as the sewing pattern draws it, for the try-on's pattern view
-  const paperFile = `${suffix}.paper.png`
-  fs.writeFileSync(`${dir}/${paperFile}`, cache.png('paper', header + piece, w, () => renderPaperTexture(header, piece, w, h)))
+// Where a standalone piece's cutline and fold line sit in its own frame (mm from
+// the top-left of the piece page/texture).
+function pieceGeometry(piece, w, h) {
   // Where the cutline itself sits inside the texture (mm from its top-left): the
   // texture's margin also holds dimension/grain marks, so the fold edge and the
   // piece's real width can't be inferred from the margin alone.
@@ -270,13 +246,107 @@ function writePiece3dTexture(header, piece, suffix, w, h, stackContent, dir, cac
   const foldD = piece.match(/<path[^>]*marker-start="url\(#cutonfoldFrom\)"[^>]*\bd="([^"]+)"/)?.[1]
     || piece.match(/<path[^>]*\bd="([^"]+)"[^>]*marker-start="url\(#cutonfoldFrom\)"/)?.[1]
   const foldLine = foldD ? flattenPath(foldD)[0]?.map(([x, y]) => [+(x + offX).toFixed(1), +(y + offY).toFixed(1)]) : null
+  return { cut, polygon, offX, foldLine: foldLine && foldLine.length >= 2 ? [foldLine[0], foldLine[foldLine.length - 1]] : null }
+}
+
+// A cut-on-fold piece (T-shirt front/back...) is drafted as a HALF, which on the
+// page read as the garment cut down the middle. For the PDF it is unfolded: the
+// half is mirrored across its fold edge into the full piece, the fold edge is
+// masked and redrawn as a dashed centre line, and the mirrored half carries no
+// text / dimensions / markers (they'd read backwards and twice). The 3D textures
+// and pattern-pieces.json keep the half piece (writePiece3dTexture).
+// Returns null when the piece has no vertical fold line.
+function unfoldPiece(piece, w, h) {
+  const { cut, polygon, offX, foldLine } = pieceGeometry(piece, w, h)
+  if (!foldLine || !polygon || Math.abs(foldLine[0][0] - foldLine[1][0]) > 1) return null
+  // freesewing draws its fold marker ON the fold edge; ours (extra-pieces.mjs)
+  // draws it 12mm inside -- so the fold is the cut edge nearest the marker, and a
+  // marker far from both edges is not a fold edge at all
+  const mx = (foldLine[0][0] + foldLine[1][0]) / 2
+  const fx = Math.abs(mx - cut.x0) <= Math.abs(mx - cut.x1) ? cut.x0 : cut.x1
+  if (Math.abs(mx - fx) > 25) return null
+  const onEdge = polygon.filter(([x]) => Math.abs(x - fx) < 1).map(([, y]) => y)
+  const ey0 = onEdge.length ? Math.min(...onEdge) : cut.y0
+  const ey1 = onEdge.length ? Math.max(...onEdge) : cut.y1
+
+  // the fold marker (bracket + "Cut on fold" label) goes: the centre line replaces it
+  const foldTag = piece.match(/<path\b[^>]*marker-start="url\(#cutonfoldFrom\)"[^>]*\/?>/)?.[0]
+  const foldId = foldTag?.match(/\bid="([^"]+)"/)?.[1]
+  let half = foldTag ? piece.replace(foldTag, '') : piece
+  if (foldId) half = half.replace(new RegExp(`<text>\\s*<textPath[^>]*href="#${foldId}"[\\s\\S]*?</text>`, 'g'), '')
+  // Dimension marks drawn on the far side of the fold edge (e.g. the centre-front
+  // length) would now sit inside the mirrored half and read as a stray cut line.
+  const side = Math.sign(cut.x0 + cut.x1 - 2 * fx) // +1: the half lies right of the fold
+  for (const tag of half.match(/<path\b[^>]*>/g) || []) {
+    if (!/class="mark|marker-(start|end)=/.test(tag)) continue
+    const d = tag.match(/\bd="([^"]+)"/)?.[1]
+    const pts = d ? flattenPath(d).flat() : []
+    if (!pts.length || !pts.every(([x]) => (x + offX - fx) * side < -0.5)) continue
+    half = half.replace(tag, '')
+    const id = tag.match(/\bid="([^"]+)"/)?.[1]
+    if (id) half = half.replace(new RegExp(`<text>\\s*<textPath[^>]*href="#${id}"[\\s\\S]*?</text>`, 'g'), '')
+  }
+  // "Cut 1 on the fold" -> it is drawn full now
+  half = half.replace(/(<tspan[^>]*>[^<]*?)\s*,?\s*on (the )?fold\s*,?/g, '$1 (full piece),')
+
+  const mirror = half
+    .replace(/<text\b[\s\S]*?<\/text>\s*/g, '')
+    .replace(/<path\b[^>]*class="(mark|note)[^"]*"[^>]*\/?>\s*/g, '')
+    .replace(/<path\b[^>]*marker-(start|end)=[^>]*\/?>\s*/g, '')
+    .replace(/\sid="[^"]*"/g, '')
+
+  const lo = Math.min(0, 2 * fx - w), hi = Math.max(w, 2 * fx)
+  const shift = -lo, W = hi - lo
+  const pad = 12
+  const cy = (ey0 + ey1) / 2
+  const centre =
+    // mask the solid fold edge so the full piece does not look cut in two
+    // inline style, not attributes: the pattern's own CSS restyles plain paths
+    `<path d="M ${fx},${ey0 + 0.6} L ${fx},${ey1 - 0.6}" style="fill:none;stroke:#ffffff;stroke-width:2;stroke-dasharray:none;opacity:1"/>\n` +
+    `<path d="M ${fx},${ey0 - pad} L ${fx},${ey1 + pad}" style="fill:none;stroke:#000000;stroke-width:0.5;stroke-dasharray:6 3 1.5 3;opacity:1"/>\n` +
+    `<text x="${fx}" y="${cy}" transform="rotate(-90 ${fx} ${cy})" text-anchor="middle" dy="-2" ` +
+    `style="font-size:5px;font-family:sans-serif;fill:#000">CENTRE LINE · GRAINLINE (fold here to cut on the fold)</text>\n`
+  return {
+    w: W,
+    piece: `<g transform="translate(${shift}, 0)">\n${half}\n<g transform="translate(${2 * fx}, 0) scale(-1, 1)">\n${mirror}\n</g>\n${centre}</g>`,
+  }
+}
+
+// The 3D preview's texture for one piece: same standalone piece SVG the PDF page uses,
+// minus the grid, dimension marks, seam-allowance line, placement overlays and text, with the cutline's interior filled in fabric colour
+// and a transparent outside -- so a textured plane in three.js shows just the piece's
+// true shape. Inline style beats freesewing's own `.fabric { fill: none }` rule.
+const FABRIC_3D = '#4a78c2'
+function writePiece3dTexture(header, piece, suffix, w, h, stackContent, dir, cache) {
+  let body = piece
+    .replace(/<path\s+class="grid"[^>]*\/>\s*/g, '')
+    .replace(/<path\s+class="mark[^"]*"[^>]*\/>\s*/g, '')
+    .replace(/<path\s+class="fabric sa"[^>]*\/>\s*/g, '')
+    .replace(/<path d="[^"]*"[^>]*\/>/g, '') // class-less = placement overlays (photo-draft.helpers)
+    .replace(/<text\b[\s\S]*?<\/text>\s*/g, '')
+    .replace(/<path(\s+)class="(fabric|various|contrast|lining|canvas|interfacing)"(?=[\s>])/g, `<path$1style="fill:${FABRIC_3D};fill-opacity:1" class="$2"`)
+  const svg = header
+    .replace(/width="[-\d.]+mm"/, `width="${w.toFixed(2)}mm"`)
+    .replace(/height="[-\d.]+mm"/, `height="${h.toFixed(2)}mm"`)
+    .replace(/viewBox="[-\d.]+ [-\d.]+ [-\d.]+ [-\d.]+"/, `viewBox="0 0 ${w.toFixed(2)} ${h.toFixed(2)}"`) +
+    `<g id="fs-container">\n${body}\n</g>\n</svg>`
+  const DPI = 50
+  const px = Math.max(1, Math.round(w * DPI / 25.4))
+  const png = cache.png('texture', svg, px, () => new Resvg(svg, { fitTo: { mode: 'width', value: px } }).render().asPng())
+  fs.mkdirSync(dir, { recursive: true })
+  const file = `${suffix}.png`
+  fs.writeFileSync(`${dir}/${file}`, png)
+  // the same piece as the sewing pattern draws it, for the try-on's pattern view
+  const paperFile = `${suffix}.paper.png`
+  fs.writeFileSync(`${dir}/${paperFile}`, cache.png('paper', header + piece, w, () => renderPaperTexture(header, piece, w, h)))
+  const { cut, polygon, foldLine } = pieceGeometry(piece, w, h)
   const r1 = (n) => +n.toFixed(1)
   return {
     suffix, file, paperFile, wMm: r1(w), hMm: r1(h),
     cutMm: { x: r1(cut.x0), y: r1(cut.y0), w: r1(cut.x1 - cut.x0), h: r1(cut.y1 - cut.y0) },
     // the cutline itself as a polygon (texture mm, y down) for the 3D garment builder
     polygon: polygon ? simplify(polygon).map(([x, y]) => [r1(x), r1(y)]) : null,
-    foldLine: foldLine && foldLine.length >= 2 ? [foldLine[0], foldLine[foldLine.length - 1]] : null,
+    foldLine,
     onFold: /cutonfold/.test(stackContent), extra: stackContent.includes('id="xp-'),
   }
 }
@@ -323,22 +393,25 @@ export async function writePartsPdf(svg, outPath, designLabel, attrs, photoPath,
       `transform="translate(${s.tx}, ${s.ty})"`,
       `transform="translate(${tx}, ${ty})"`
     )
-    let pageSvg = header
-      .replace(/width="[-\d.]+mm"/, `width="${w.toFixed(2)}mm"`)
-      .replace(/height="[-\d.]+mm"/, `height="${h.toFixed(2)}mm"`)
-      .replace(/viewBox="[-\d.]+ [-\d.]+ [-\d.]+ [-\d.]+"/, `viewBox="0 0 ${w.toFixed(2)} ${h.toFixed(2)}"`)
-    pageSvg += `<rect x="0" y="0" width="${w}" height="${h}" fill="#ffffff"/>\n`
-    pageSvg += `<g id="fs-container">\n${piece}\n</g>\n</svg>`
-
     if (pieces3d) pieces3d.push(writePiece3dTexture(header, piece, suffix, w, h, s.full, pieces3d.dir, cache))
 
+    // the printed page shows a cut-on-fold half as the full, unfolded piece
+    const unfolded = unfoldPiece(piece, w, h)
+    const pw = unfolded ? unfolded.w : w
+    let pageSvg = header
+      .replace(/width="[-\d.]+mm"/, `width="${pw.toFixed(2)}mm"`)
+      .replace(/height="[-\d.]+mm"/, `height="${h.toFixed(2)}mm"`)
+      .replace(/viewBox="[-\d.]+ [-\d.]+ [-\d.]+ [-\d.]+"/, `viewBox="0 0 ${pw.toFixed(2)} ${h.toFixed(2)}"`)
+    pageSvg += `<rect x="0" y="0" width="${pw}" height="${h}" fill="#ffffff"/>\n`
+    pageSvg += `<g id="fs-container">\n${unfolded ? unfolded.piece : piece}\n</g>\n</svg>`
+
     const DPI = 200
-    const pagePx = Math.max(1, Math.round(w * DPI / 25.4))
+    const pagePx = Math.max(1, Math.round(pw * DPI / 25.4))
     const png = cache.png('page', pageSvg, pagePx, () => new Resvg(pageSvg, { fitTo: { mode: 'width', value: pagePx } }).render().asPng())
     const pngImage = await pdfDoc.embedPng(png)
     // Fit the piece into the box beside the text, keeping its aspect ratio, and
     // never enlarge a small piece past its true size.
-    const trueWpt = w * MM_TO_PT, trueHpt = h * MM_TO_PT
+    const trueWpt = pw * MM_TO_PT, trueHpt = h * MM_TO_PT
     const fit = Math.min(pieceBoxW / trueWpt, pieceBoxH / trueHpt, 1)
     const pieceWidthPt = trueWpt * fit, pieceHeightPt = trueHpt * fit
     thumbs.push({ suffix, pngImage, w: pieceWidthPt, h: pieceHeightPt })
@@ -356,7 +429,7 @@ export async function writePartsPdf(svg, outPath, designLabel, attrs, photoPath,
     page.drawText(suffix, { x: pieceX, y: Math.min(pieceY + pieceHeightPt + 4, PAGE_H_PT - 14), size: 10, font })
     // The fitted scale differs per piece now, so say what it is on the page --
     // a pattern piece with no stated scale invites someone to cut from it.
-    page.drawText(`shown at ${(fit * 100).toFixed(0)}% of full size (${w.toFixed(0)} x ${h.toFixed(0)} mm) — reference, not for cutting`,
+    page.drawText(`shown at ${(fit * 100).toFixed(0)}% of full size (${pw.toFixed(0)} x ${h.toFixed(0)} mm)${unfolded ? ', full piece unfolded at the centre line' : ''} — reference, not for cutting`,
       { x: pieceBoxX, y: PAGE_MARGIN_PT - SCALE_NOTE_SIZE - 2, size: SCALE_NOTE_SIZE, font })
 
     if (instr) {

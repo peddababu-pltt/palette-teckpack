@@ -22,6 +22,8 @@ import {
   type PatternParams,
 } from "./api"
 
+const GENERATING_RETRY_MS = 8000
+
 export type StageKind = "parts" | "pattern"
 
 export const SVG_KINDS: Record<StageKind, { label: string; outKey: "parts_svg" | "pattern_svg" }> = {
@@ -128,8 +130,16 @@ export class StageEngine {
     live.started = true
     this.emit()
 
-    const startRes =
-      kind === "parts" ? await startStage4(this.pluginId, job.job_id) : await startStage5(this.pluginId, job.job_id, params)
+    const start = () =>
+      kind === "parts" ? startStage4(this.pluginId, job.job_id) : startStage5(this.pluginId, job.job_id, params)
+    let startRes = await start()
+    // Opened while the techpack is still generating: the backend refuses
+    // until the final sketch exists. That is a wait, not a failure -- keep
+    // the loading state up and try again, instead of a red error + Rerun.
+    while (startRes.generating && this.live.get(StageEngine.key(job.job_id, kind)) === live) {
+      await new Promise((r) => setTimeout(r, GENERATING_RETRY_MS))
+      startRes = await start()
+    }
     if (startRes.error) {
       live.error = startRes.error
       this.emit()

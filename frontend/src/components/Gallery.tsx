@@ -7,24 +7,50 @@ import GalleryCard, { garmentLabel } from "./GalleryCard"
 export default function Gallery({
   jobs,
   generating,
+  generatingJobId,
   genPercent,
   search,
   onCancelGenerate,
+  onCancelJob,
   onOpenCard,
   onDeleteJob,
+  onShareJob,
 }: {
   jobs: Job[]
   generating: boolean
+  generatingJobId: string | null
   genPercent: number
   search: string
   onCancelGenerate: () => void
+  onCancelJob: (job: Job) => void
   onOpenCard: (job: Job, tab: "overview" | "parts" | "pattern" | "spec") => void
   onDeleteJob: (job: Job) => void
+  onShareJob: (job: Job) => void
 }) {
   const { t } = usePluginTranslations(STRINGS)
   const [view, setView] = useState<"grid" | "list">("grid")
   const [openMenuJobId, setOpenMenuJobId] = useState<string | null>(null)
   const [scope, setScope] = useState<"recent" | "all">("recent")
+  const [scopeOpen, setScopeOpen] = useState(false)
+  const scopeRef = useRef<HTMLDivElement>(null)
+  const scopeLabel = (v: "recent" | "all") =>
+    v === "recent" ? t("gallery.scopeRecent") : t("gallery.scopeAll", { count: entries.length })
+  // close the scope menu on an outside click or Escape
+  useEffect(() => {
+    if (!scopeOpen) return
+    const onDown = (e: PointerEvent) => {
+      if (!scopeRef.current?.contains(e.target as Node)) setScopeOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setScopeOpen(false)
+    }
+    document.addEventListener("pointerdown", onDown)
+    document.addEventListener("keydown", onKey)
+    return () => {
+      document.removeEventListener("pointerdown", onDown)
+      document.removeEventListener("keydown", onKey)
+    }
+  }, [scopeOpen])
   const [cols, setCols] = useState(1)
   const gridRef = useRef<HTMLDivElement>(null)
 
@@ -67,10 +93,16 @@ export default function Gallery({
   const entries = useMemo(() => {
     const q = search.trim().toLowerCase()
     return jobs
+      // The run in progress already has its skeleton card; the list poll can
+      // pick the job up mid-run (its sketch lands early), which would show it
+      // twice.
+      .filter((job) => job.job_id !== generatingJobId)
       .map((job) => ({ job, img: resolveUrl(job.sketch), thumb: resolveUrl(job.thumb || job.sketch), label: garmentLabel(job, t) }))
-      .filter((e) => e.img)
+      // A job the server still marks as generating shows as a skeleton (see
+      // below), image or not: its sketch on disk is the unfinished first pass.
+      .filter((e) => e.img || e.job.generating)
       .filter((e) => !q || e.label.toLowerCase().includes(q))
-  }, [jobs, search, t])
+  }, [jobs, search, t, generatingJobId])
 
   // "Recent" is three rows; "All" is the whole grid. Past three rows the grid
   // runs several screens tall and the upload column on the left -- the thing
@@ -105,16 +137,50 @@ export default function Gallery({
           </div>
         </div>
         <div className="dash-tools">
-          <select
-            className="tp-units-select dash-scope"
-            id="gallery-scope"
-            aria-label={t("gallery.scopeAria")}
-            value={scope}
-            onChange={(e) => setScope(e.target.value as "recent" | "all")}
-          >
-            <option value="recent">{t("gallery.scopeRecent")}</option>
-            <option value="all">{t("gallery.scopeAll", { count: entries.length })}</option>
-          </select>
+          {/* Not a native <select>: macOS opens its menu ON TOP of the button
+              (the checked row over the control), hiding it. This one drops below. */}
+          <div className="dash-scope-wrap" ref={scopeRef}>
+            <button
+              type="button"
+              className="tp-units-select dash-scope"
+              id="gallery-scope"
+              aria-label={t("gallery.scopeAria")}
+              aria-haspopup="listbox"
+              aria-expanded={scopeOpen}
+              onClick={() => setScopeOpen((o) => !o)}
+              onKeyDown={(e) => {
+                if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                  e.preventDefault()
+                  setScope(scope === "recent" ? "all" : "recent")
+                }
+              }}
+            >
+              <span>{scopeLabel(scope)}</span>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M6 9l6 6 6-6" />
+              </svg>
+            </button>
+            {scopeOpen && (
+              <div className="dash-scope-menu" role="listbox" aria-label={t("gallery.scopeAria")}>
+                {(["recent", "all"] as const).map((value) => (
+                  <button
+                    key={value}
+                    type="button"
+                    role="option"
+                    aria-selected={scope === value}
+                    className={`tp-menu-item${scope === value ? " active" : ""}`}
+                    onClick={() => {
+                      setScope(value)
+                      setScopeOpen(false)
+                    }}
+                  >
+                    <span className="dash-scope-check" aria-hidden="true">{scope === value ? "\u2713" : ""}</span>
+                    {scopeLabel(value)}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
           <div className="toolbar-group" id="view-toolbar" role="group" aria-label={t("gallery.cardLayoutAria")}>
             <button
               type="button"
@@ -153,26 +219,15 @@ export default function Gallery({
       </div>
       <div className="studio-main-scroll">
         <div ref={gridRef} id="gallery" className={`tp-gallery${view === "list" ? " is-list" : ""}`}>
-          {generating && (
-            <div className="tp-card tp-card-skeleton" aria-label={t("gallery.generatingAria")} aria-busy="true">
-              <div className="tp-card-media">
-                <button type="button" className="upload-preview-clear tp-cancel-btn" title={t("gallery.cancelRun")} aria-label={t("gallery.cancelRun")} onClick={onCancelGenerate}>
-                  &times;
-                </button>
-                <span className="tp-spinner" />
-                <span className="tp-skeleton-pct">{genPercent}%</span>
-              </div>
-              <div className="tp-card-caption">
-                <span className="tp-card-cat tp-ph tp-ph-cat" />
-                <span className="tp-card-sub tp-ph tp-ph-sub" />
-              </div>
-              <div className="tp-card-foot">
-                <span className="tp-card-foot-btn tp-ph" />
-                <span className="tp-card-foot-btn tp-ph" />
-              </div>
-            </div>
-          )}
-          {shown.map((e) => (
+          {generating && <SkeletonCard percent={genPercent} onCancel={onCancelGenerate} />}
+          {shown.map((e) =>
+            // Started from another tab, or this tab lost its progress stream
+            // (reload, dropped connection): the job is still running, so it
+            // gets the same loading card -- never the half-made sketch with
+            // Pattern/Spec buttons that only error until the run ends.
+            e.job.generating ? (
+              <SkeletonCard key={e.job.job_id} onCancel={() => onCancelJob(e.job)} />
+            ) : (
             <GalleryCard
               key={e.job.job_id}
               job={e.job}
@@ -182,8 +237,10 @@ export default function Gallery({
               onToggleMenu={() => setOpenMenuJobId((cur) => (cur === e.job.job_id ? null : e.job.job_id))}
               onOpen={(tab) => onOpenCard(e.job, tab)}
               onDelete={() => onDeleteJob(e.job)}
+              onShare={() => onShareJob(e.job)}
             />
-          ))}
+            ),
+          )}
         </div>
         {hidden > 0 && scope === "recent" && (
           <div className="tp-gallery-more">
@@ -193,6 +250,29 @@ export default function Gallery({
         <p className="studio-note" id="gallery-empty" style={{ display: entries.length > 0 || generating ? "none" : "block" }}>
           {t("gallery.emptyState")}
         </p>
+      </div>
+    </div>
+  )
+}
+
+function SkeletonCard({ percent, onCancel }: { percent?: number; onCancel: () => void }) {
+  const { t } = usePluginTranslations(STRINGS)
+  return (
+    <div className="tp-card tp-card-skeleton" aria-label={t("gallery.generatingAria")} aria-busy="true">
+      <div className="tp-card-media">
+        <button type="button" className="upload-preview-clear tp-cancel-btn" title={t("gallery.cancelRun")} aria-label={t("gallery.cancelRun")} onClick={onCancel}>
+          &times;
+        </button>
+        <span className="tp-spinner" />
+        {percent !== undefined && <span className="tp-skeleton-pct">{percent}%</span>}
+      </div>
+      <div className="tp-card-caption">
+        <span className="tp-card-cat tp-ph tp-ph-cat" />
+        <span className="tp-card-sub tp-ph tp-ph-sub" />
+      </div>
+      <div className="tp-card-foot">
+        <span className="tp-card-foot-btn tp-ph" />
+        <span className="tp-card-foot-btn tp-ph" />
       </div>
     </div>
   )

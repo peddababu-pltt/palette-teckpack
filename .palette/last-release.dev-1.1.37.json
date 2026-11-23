@@ -1,0 +1,11 @@
+{
+  "id": 1618,
+  "plugin_id": "techpack",
+  "version": "1.1.37",
+  "env": "dev",
+  "url": "https://dev-api.pltt.ai",
+  "publish_type": "release",
+  "preview_url": null,
+  "preview_expires_at": null,
+  "published_at": "2026-11-23T12:10:40.665Z"
+}

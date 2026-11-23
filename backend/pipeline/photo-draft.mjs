@@ -16,7 +16,7 @@ import {
 } from './photo-draft.helpers.mjs'
 import { pluginTheme } from '@freesewing/plugin-theme'
 import {
-  DESIGNS, CATEGORY_TO_DESIGN, DEDICATED_CATEGORIES,
+  DESIGNS, CATEGORY_TO_DESIGN,
   HOW_TO_MEASURE, defaultMeasurements, SIZE_KEYS, humanLabel,
 } from './designs.mjs'
 import { i18n as annI18n } from '@freesewing/plugin-annotations'
@@ -25,8 +25,9 @@ import { addPiecePlacement } from './piece-placement.mjs'
 import { extractStacks } from './piece-paper.mjs'
 import { writePartsPdf, renderPieceThumbs } from './pattern-pages.mjs'
 import { readLock, writeLock, gradePieces } from './pattern-lock.mjs'
-import { CATALOGUE, CATALOGUE_MATCH_MIN } from './catalogue.mjs'
-import { checkCataloguePattern } from './pattern-check.mjs'
+import { catalogueDesignFor } from './catalogue.mjs'
+import { checkCataloguePattern, checkCustomPattern } from './pattern-check.mjs'
+import { assemblePieces, normalizeConstruction, Brian, Titan } from './custom-block.mjs'
 
 // attribute → option mapping. lo/hi pick within each option's [min,max] range.
 const T = (opt, t) => ({ opt, t }) // t: 0=min .. 1=max, null=skip
@@ -381,12 +382,11 @@ if (attrs.garmentCategory === 'unsupported') {
   console.error(`\nCannot draft this: it does not look like a garment. Recognized types: ${Object.keys(CATEGORY_TO_DESIGN).join(', ')}`)
   process.exit(1)
 }
-// Catalogue first: when vision matched the photo to a catalogue pattern (the designs
-// in the pattern PDF) closely enough, that pattern is used -- details it lacks get
-// their own pieces from extra-pieces.mjs. A garment the catalogue doesn't really
-// have (different length/silhouette, or vision says "other") is drafted from scratch
-// by AI instead of being forced onto the nearest block. Without a catalogueMatch
-// (older mocks) the category table decides, as before.
+// Same garment only: a catalogue pattern (the designs in the pattern PDF) is used
+// ONLY when vision says the garment IS that catalogue garment (catalogueMatch.
+// sameGarment) -- details it lacks then get their own pieces from extra-pieces.mjs.
+// Every other garment, including a close relative of a catalogue entry, is drafted
+// from scratch by the LLM. There is no similarity score and no nearest-block fallback.
 const match = attrs.catalogueMatch
 let catalogueDesign
 let patternCheck = null
@@ -394,20 +394,14 @@ if (lock) {
   catalogueDesign = lock.catalogueDesign
   patternCheck = lock.patternCheck ?? null
 } else {
-if (match) {
-  catalogueDesign = match.design !== 'none' && DESIGNS[match.design] && match.similarity >= CATALOGUE_MATCH_MIN ? match.design : null
-} else {
-  catalogueDesign = attrs.confidence >= 0.5 ? CATEGORY_TO_DESIGN[attrs.garmentCategory] || null : null
-  // the knee-length coat blocks are no stand-in for a hip-length jacket/blazer
-  if ((catalogueDesign === 'carlton' || catalogueDesign === 'carlita') && attrs.garmentCategory !== 'coat' && attrs.garmentLength !== 'long')
-    catalogueDesign = null
-}
-if (match)
-  console.log(`Catalogue match: ${match.design} (similarity ${match.similarity}) → ${catalogueDesign ? 'close enough, checking its pattern construction' : 'not close enough — AI is drafting its cut pieces from scratch'}`)
-// Second gate: similar is not enough -- the catalogue design's own cut pieces must
-// build this garment (same panels, seams, collar, closure...). Draft it at the
-// size's default measurements, show the model its pieces next to the input.
-if (catalogueDesign && match) {
+catalogueDesign = catalogueDesignFor(match)
+if (catalogueDesign && !DESIGNS[catalogueDesign]) catalogueDesign = null
+console.log(`Catalogue: ${catalogueDesign ? `same garment as ${catalogueDesign}` : 'not a catalogue garment'}${match?.reason ? ` (${match.reason})` : ''}` +
+  ` → ${catalogueDesign ? 'checking its pattern pieces' : 'AI is drafting its cut pieces from scratch'}`)
+// Second gate: the catalogue design's own cut pieces must build this garment (same
+// panels, seams, collar, closure...). Draft it at the size's default measurements,
+// show the model its pieces next to the input.
+if (catalogueDesign) {
   try {
     const probeCm = defaultMeasurements(SIZE_KEYS.includes(attrs.apparentSize) ? attrs.apparentSize : 'M')
     const probeMm = Object.fromEntries(Object.entries(probeCm).map(([k, v]) => [k, k === 'shoulderSlope' ? v : v * 10]))
@@ -429,11 +423,8 @@ if (catalogueDesign && match) {
 }
 const isCustom = !catalogueDesign
 const mappedCategory = isCustom ? 'custom' : catalogueDesign
-if (match && !isCustom) console.log(`→ using the ${DESIGNS[mappedCategory].label} pattern`)
-else if (isCustom)
-  console.log(`Note: "${attrs.garmentCategory}" (confidence ${attrs.confidence}) has no matching catalogue pattern — AI is drafting its cut pieces from scratch.`)
-else if (!DEDICATED_CATEGORIES.has(attrs.garmentCategory))
-  console.log(`Note: "${attrs.garmentCategory}" has no dedicated block — using ${DESIGNS[mappedCategory].label} as the closest sloper.`)
+if (!isCustom) console.log(`→ using the ${DESIGNS[mappedCategory].label} pattern`)
+else console.log(`Note: "${attrs.garmentCategory}" is not a catalogue garment — AI is drafting its cut pieces from scratch.`)
 
 const { Design, i18n, label } = isCustom
   ? { Design: null, i18n: null, label: 'Custom AI draft (not in pattern catalogue)' }
@@ -473,27 +464,74 @@ const applied = [], skipped = []
 let svg
 let sleevesRemoved = false
 let extraPieces = []
-if (isCustom) {
+// Builds the pattern SVG for an AI-drafted garment: the body from a real block
+// (custom-block.mjs), never from AI coordinates, plus the AI's other pieces.
+function buildCustomSvg(aiPieces, construction) {
+  applied.length = 0
+  skipped.length = 0
+  const c = normalizeConstruction(construction, attrs)
+  console.log(`Construction: ${Object.entries(c).filter(([, v]) => v && v !== 'none').map(([k, v]) => `${k}=${v}`).join(' ')}`)
   let pieces
+  const strip = (list) => list.filter((p) => p.outline.length > 4 || !/^(front|back|frontYoke|backYoke|sleeve|frontLeg|backLeg|lining:|interfacing:)/.test(p.role || ''))
+    .map(({ role, of, material, cutCount, ...rest }) => rest)
+  if (c.body === 'none') {
+    pieces = strip(aiPieces)
+  } else {
+    const blockDesign = c.body === 'lower' ? Titan : Brian
+    try {
+      const asm = assemblePieces(aiPieces, cm, attrs, c, buildOptions(blockDesign, attrs, applied, skipped))
+      pieces = asm.pieces
+      for (const n of asm.notes) console.log(`Note: ${n}`)
+      for (const p of pieces) console.log(`  ${p.title}: ${{ block: `drafted from the ${c.body === 'lower' ? 'trouser' : 'bodice'} block`, sized: p.sizing, copied: 'copied from its body piece', ai: 'AI outline' }[p.drafted] || ''}`)
+      pieces = pieces.map(({ drafted, sizing, ...rest }) => rest)
+    } catch (e) {
+      console.error(`Note: block draft failed (${e.message}) — falling back to the AI outlines`)
+      pieces = strip(aiPieces)
+    }
+  }
+  // Only borrowed for its freesewing header (theme CSS + grainline/dimension markers).
+  const headerDraft = new DESIGNS.teagan.Design({ measurements, units: 'metric', paperless: true }).use(pluginTheme)
+  headerDraft.draft()
+  return { svg: inlineFillStroke(customPatternSvg(escapeBareAmpersands(headerDraft.render()), pieces)), pieces }
+}
+
+if (isCustom) {
+  let aiPieces, construction
+  let built
   if (lock?.custom?.pieces?.length) {
-    pieces = gradePieces(lock.custom.pieces, lock.custom.cm, cm)
-    console.log(`Custom pieces: the locked ${lock.custom.pieces.length} pieces, graded from size ${lock.custom.size} to ${size}`)
+    // body pieces are re-drafted from the block at the new measurements below;
+    // only the AI-drawn extras are graded
+    aiPieces = gradePieces(lock.custom.pieces, lock.custom.cm, cm)
+    construction = lock.custom.construction
+    console.log(`Custom pieces: the locked ${lock.custom.pieces.length} pieces, re-drafted from size ${lock.custom.size} to ${size}`)
+    built = buildCustomSvg(aiPieces, construction)
   } else {
     try {
-      const ref = match && match.design !== 'none' ? CATALOGUE[match.design] : ''
-      pieces = await draftCustomPieces(photo, attrs, cm, size, ref)
+      ;({ pieces: aiPieces, construction } = await draftCustomPieces(photo, attrs, cm, size))
     } catch (e) {
       console.error(`AI custom draft failed: ${e.message}`)
       process.exit(1)
     }
+    built = buildCustomSvg(aiPieces, construction)
+    // Check the drafted pieces against the garment (sleeve type, missing/extra
+    // pieces, opening, proportions) and redraft once with the mistakes as feedback.
+    const review = await checkCustomPattern(photo, renderPieceThumbs(blackOnWhite(built.svg)), construction, attrs)
+    if (review.checked) console.log(`Pattern check: ${review.ok ? 'pieces build this garment' : `problems found — ${review.problems.join('; ')}`}`)
+    if (review.checked && !review.ok && review.problems.length) {
+      console.log('→ redrafting the cut pieces with those corrections')
+      try {
+        const again = await draftCustomPieces(photo, attrs, cm, size, review.problems.join('\n- '))
+        const rebuilt = buildCustomSvg(again.pieces, again.construction)
+        ;({ pieces: aiPieces, construction } = again)
+        built = rebuilt
+      } catch (e) {
+        console.error(`Note: redraft failed (${e.message}) — keeping the first draft`)
+      }
+    }
+    writeLock(outArg, photo, { attrs, catalogueDesign: null, patternCheck, custom: { pieces: aiPieces, construction, cm, size } })
   }
-  if (!lock?.custom?.pieces?.length) writeLock(outArg, photo, { attrs, catalogueDesign: null, patternCheck, custom: { pieces, cm, size } })
-  // Only borrowed for its freesewing header (theme CSS + grainline/dimension markers).
-  const headerDraft = new DESIGNS.teagan.Design({ measurements, units: 'metric', paperless: true }).use(pluginTheme)
-  headerDraft.draft()
-  svg = customPatternSvg(escapeBareAmpersands(headerDraft.render()), pieces)
-  svg = inlineFillStroke(svg)
-  extraPieces = pieces.map((p) => `${p.title} — ${p.cut}`)
+  svg = built.svg
+  extraPieces = built.pieces.map((p) => `${p.title} — ${p.cut}`)
   svg = layoutFrontBack(svg)
   svg = blackOnWhite(svg)
 } else {

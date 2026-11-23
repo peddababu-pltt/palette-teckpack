@@ -1,11 +1,11 @@
 {
-  "id": 2480,
+  "id": 1242,
   "plugin_id": "techpack",
-  "version": "1.1.26",
-  "env": "staging",
-  "url": "https://apps-api.pltt.xyz",
+  "version": "1.1.37",
+  "env": "production",
+  "url": "https://api.pltt.ai",
   "publish_type": "release",
   "preview_url": null,
   "preview_expires_at": null,
-  "published_at": "2026-11-03T07:58:27.034Z"
+  "published_at": "2026-11-23T12:12:29.431Z"
 }

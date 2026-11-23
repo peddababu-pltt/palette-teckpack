@@ -92,6 +92,25 @@ PHANTOM_HEM_CHECK_PROMPT = (
 )
 
 
+# The HARDWARE AND CLOSURES rule in REGEN_PROMPT asks for individually drawn
+# teeth, yet the redraw still comes back with the zip filled by an irregular
+# scribble (wavy squiggles, smudged marks) instead of a clean row of teeth.
+ZIPPER_TEETH_CHECK_PROMPT = (
+    "Look ONLY at the zippers on this garment technical flat (centre-front "
+    "zip, pocket zips, any other zip). If the garment has no zipper at all, "
+    "there is no defect. For each zipper, zoom in on the strip between its two "
+    "tape rails and decide: is it filled with a CLEAN, REGULAR row of teeth -- "
+    "short, straight, evenly spaced tick marks of the same length, repeating "
+    "uniformly from the top stop to the bottom stop -- or is it something "
+    "else? The defect is present if any zipper strip contains wavy or "
+    "squiggly marks, scribbles, irregular blobs, smudges, letter- or "
+    "text-like marks, uneven or broken ticks, gaps in the run of teeth, or "
+    "teeth fused into a solid bar. "
+    "Reply with ONLY a JSON object, no markdown fences, no explanation: "
+    '{"defect_found": true or false, "locations": ["short description of '
+    'each spot", ...]}. If there is no defect, "locations" is an empty list.'
+)
+
 def _image_b64(path: str) -> str:
     return base64.b64encode(Path(path).read_bytes()).decode()
 
@@ -140,6 +159,11 @@ def check_stitch_dash_defect(image_path: str) -> dict:
 def check_phantom_hem_defect(image_path: str) -> dict:
     """Blank two-line strip at the body's bottom edge (a hem that isn't)."""
     return _check_defect(image_path, PHANTOM_HEM_CHECK_PROMPT, "phantom-hem")
+
+
+def check_zipper_teeth_defect(image_path: str) -> dict:
+    """Zipper strip filled with scribble instead of a clean row of teeth."""
+    return _check_defect(image_path, ZIPPER_TEETH_CHECK_PROMPT, "zipper-teeth")
 
 REGEN_PROMPT = (
     "You are an expert Fashion Technical Illustration Reconstruction AI specialized in garment "
@@ -338,6 +362,10 @@ REGEN_PROMPT = (
     "carries, and do not make a sparse area busier. A cleanly drawn garment that is missing nothing "
     "and has gained nothing is the correct result. "
 
+    "LENGTH IS KEPT: the garment's length and, for a lower garment, its LEG LENGTH stay exactly as in "
+    "the input. Short legs (ending at or above the knee) stay shorts; long legs (reaching toward the "
+    "ankle) stay full-length trousers. Never shorten trousers into shorts or lengthen shorts. "
+
     "FINAL CHECK before you output: compare your drawing against the input side by side and count the "
     "pockets, buttons, zippers, panels, tabs and labels on each view. If any count is higher than the "
     "input's, delete what you added. If any is lower, put it back. Only then output the image. "
@@ -434,8 +462,9 @@ def regenerate(input_path: str, output_path: str, seed: int | None, model: str):
         Path(output_path).write_bytes(img_bytes)
         dashes = check_stitch_dash_defect(output_path)
         phantom = check_phantom_hem_defect(output_path)
-        if not any(c.get("defect_found") for c in (dashes, phantom)):
-            print(f"saved → {output_path} (no stitch lines, no phantom hem)")
+        teeth = check_zipper_teeth_defect(output_path)
+        if not any(c.get("defect_found") for c in (dashes, phantom, teeth)):
+            print(f"saved → {output_path} (no stitch lines, no phantom hem, clean zip teeth)")
             return
 
         notes = []
@@ -460,6 +489,18 @@ def regenerate(input_path: str, output_path: str, seed: int | None, model: str):
                 "torso's bottom edge as ONE single line. Only draw a two-line "
                 "band there if it genuinely carries vertical rib ticks like "
                 "the cuffs do."
+            )
+        if teeth.get("defect_found"):
+            locations = teeth.get("locations") or []
+            print(f"attempt {attempt}: messy zipper teeth: {locations}")
+            notes.append(
+                "the last generation drew the zipper teeth as scribble at: "
+                + "; ".join(locations)
+                + ". Redraw every zipper as two straight parallel tape rails "
+                "with a clean, regular row of short straight teeth between "
+                "them -- identical ticks, evenly spaced, repeating without a "
+                "break from the top stop to the bottom stop. No wavy marks, "
+                "squiggles, blobs or text-like shapes inside the zip."
             )
         extra_note = "CORRECTION FROM PREVIOUS ATTEMPT: " + " ALSO, ".join(notes)
 

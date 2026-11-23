@@ -40,13 +40,15 @@ import tempfile
 
 from _bootstrap_deps import ensure
 
-ensure(modules=["scipy", "vtracer", "svgpathtools"],
-       packages=["scipy==1.18.0", "vtracer==0.6.15", "svgpathtools==1.7.2"])
+ensure(modules=["scipy", "vtracer", "svgpathtools", "skimage"],
+       packages=["scipy==1.18.0", "vtracer==0.6.15", "svgpathtools==1.7.2",
+                 "scikit-image==0.26.0"])
 import numpy as np  # noqa: E402
 import vtracer  # noqa: E402
 from _svg_render import svg2png  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
 from scipy import ndimage  # noqa: E402
+from skimage.morphology import convex_hull_image  # noqa: E402
 from svgpathtools import parse_path  # noqa: E402
 
 
@@ -86,6 +88,9 @@ STITCH_DARK_T = int(os.environ.get("STITCH_DARK_T", "40"))
 BUTTON_SIZE_MULT = 3.0   # a fine mark with no hole in it counts as a button
                          # only if it is this many times the MEDIAN fine-mark
                          # area in the same sketch (see classify_fine_detail)
+BUTTON_MIN_DIM = int(os.environ.get("BUTTON_MIN_DIM", "6"))
+                         # px: a 2-3px ring is a texture speck, not a button
+                         # (real buttons measured 9-24px across sketches)
 
 BAND = 8
 MIN_SYNTH_AREA = 12   # drop synthesized gap-fill blobs smaller than this (px area);
@@ -139,6 +144,19 @@ TURD = float(os.environ.get("TURD", "2.0"))
 MAX_TRACE_DIM = 4096   # vtracer returns NOTHING, silently, on a canvas much
                        # bigger than this -- crop/downscale to fit (see trace)
 TRACE_PAD = 4          # px of white kept around the ink in that crop
+PIECE_SEAL = 4           # px closing that joins a piece's regions across the
+                         # lines drawn between them, for its standalone outline
+BAND_HULL_MAX = 1.2      # a band's hull may add at most this much to its area
+HEM_HULL_MAX = 1.045     # ...and a "hem" only this much (peplums are wavy)
+PIECE_HOLE_MIN = 0.02    # holes under this share of the piece are filled;
+                         # bigger ones (a pocket placed on it) stay outlined
+PIECE_FLAP_AREA = 0.15   # a detached strip under this share of the piece's
+PIECE_FLAP_WIDTH = 35    # main area and this wide (px) is left out of it
+ZIP_CORE_DENSITY = 0.5   # a zip box column inked on at least this share of
+                         # its rows is the zip's own rail/teeth (see zip_core)
+ZIP_RAIL_KEEP = 0        # px of the zip's outer edge a neighbour may still draw (the
+                         # zip draws its own rails; kept by a panel they doubled
+                         # its outline in the extracted piece)
 BOX_EDGE_KEEP = 3      # px around a part's own region that another part's
                        # grab_box may never cut away (its own boundary line)
 RAIL_MARGIN = 16       # how far outside a grab_box that part's own ink still
@@ -217,6 +235,17 @@ TRIM_SS = 4   # grab_box trim (zip teeth, guard stitching) is thresholded and
 KEEP_HALF_W = 0.5  # ink whose local half-width is within this much of the cut
                    # depth is already as light as THIN aims for -> left at full
                    # weight instead of being erased (see thin_canvas)
+KEEP_THIN_W = float(os.environ.get("KEEP_THIN_W", "2.0"))
+                   # NATIVE stroke width (px) at or under which a line is
+                   # never thinned. KEEP_HALF_W alone is measured on the
+                   # bilinear-upscaled canvas, where a 1-2px rib tick is
+                   # already 4-8px wide, so it never protected the hairline
+                   # detail it was meant to: rib-knit cuffs, collar and hem
+                   # bands, fine mesh and stripe texture all traced as broken
+                   # dashes, and 45-degree ribs vanished. 0 restores that.
+KEEP_THIN_MIN_PX = int(os.environ.get("KEEP_THIN_MIN_PX", "8"))
+                   # isolated ink specks under this many native px are dropped
+                   # from the thinned canvas (see the KEEP_THIN_W restore)
 # Canonical layer order, bottom to top: the garment's structural pieces are
 # laid down first -- collar, yoke, sleeves, body panels, waistband -- each one
 # closed on all sides by REGION_OUTLINE below, and only then the applied
@@ -960,7 +989,7 @@ def classify_fine_detail(mask):
         ringed = n_bg > 1
         solid_disc = (aspect <= 1.25 and fill_ratio >= 0.70
                       and m.sum() >= big_mark)
-        if (ringed or solid_disc) and aspect <= 1.8:
+        if (ringed or solid_disc) and aspect <= 1.8 and max(bh, bw) >= BUTTON_MIN_DIM:
             buttons[sl] |= m
         else:
             stitches[sl] |= m
@@ -1056,7 +1085,8 @@ def thin_canvas(mask, dil, thin=None, protect=None):
         # erodes away and drops under vtracer's speckle floor.)
         edt = ndimage.distance_transform_edt(big)
         half_w = ndimage.grey_dilation(edt, size=2 * it + 1)
-        eroded |= big & (half_w <= it + KEEP_HALF_W)
+        keep_thin = big & (half_w <= max(it + KEEP_HALF_W, KEEP_THIN_W * ss / 2))
+        eroded |= keep_thin
         # Knock the 1px stair steps off the upscaled edge, so scaling back down
         # doesn't leave the outline visibly ragged -- and, more importantly,
         # heal any hairline break the erosion just opened.
@@ -1119,6 +1149,22 @@ def thin_canvas(mask, dil, thin=None, protect=None):
             eh, ew = sm.shape
             eroded = (sm.reshape(eh // ss, ss, ew // ss, ss).mean(axis=(1, 3))
                       >= NAT_CUT)
+            # The block cut undoes the thin-stroke guard above: a 1px line
+            # (rib-knit ticks, fine hatching) that straddles two ss blocks
+            # covers under NAT_CUT of each and drops out, so rib bands traced
+            # as broken dashes and diagonal ribs (collar side bands) vanished
+            # entirely. Ink the guard kept at full weight comes back at
+            # native resolution, clipped to the source ink.
+            eroded |= keep_thin.reshape(eh // ss, ss, ew // ss, ss).any(axis=(1, 3)) & sub
+            # That guard also keeps the 1-3px raster noise the erosion used to
+            # eat, which traced as stray dots inside panels. A real stroke is
+            # never that small (buttons/dashes are split off before this).
+            lab, nlab = ndimage.label(sub, np.ones((3, 3), bool))
+            if nlab:
+                sizes = np.bincount(lab.ravel())
+                specks = sizes < KEEP_THIN_MIN_PX
+                specks[0] = False
+                eroded &= ~specks[lab]
             # Heal at native resolution, clipped to the un-thinned ink exactly
             # as CLOSE_BREAKS is at ss. A neck narrower than the block
             # threshold disappears in the downsample, and a boundary held
@@ -1595,6 +1641,63 @@ def main(in_png, labels_npy, groups_json, out_svg):
             grabbed[nm] |= extra
             grabbed_union |= extra
 
+    # The zip's own strip, which no other part may draw. Segmentation can't
+    # seal a zip off: the white gaps between its teeth join the panels on
+    # either side, so their REGIONS run into the strip and they kept the
+    # teeth (and the collar kept the slider) -- every extracted panel came out
+    # with a fuzzy zip edge. Found from the ink itself: the box's columns (or
+    # rows, for a horizontal box) that are inked along most of the zip's
+    # length are its rails and teeth; the zip's own layer draws all of it.
+    zip_core = {}
+    for nm, p in cfg["parts"].items():
+        if not p.get("grab_box") or "zip" not in nm:
+            continue
+        x0, y0, x1, y1 = [int(v) for v in p["grab_box"]]
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(W, x1), min(H, y1)
+        sub = ink[y0:y1, x0:x1]
+        if sub.size == 0:
+            continue
+        vertical = (y1 - y0) >= (x1 - x0)
+        dens = sub.mean(axis=0 if vertical else 1)
+        cols = np.nonzero(dens >= ZIP_CORE_DENSITY)[0]
+        if len(cols) < 2:
+            continue
+        a_, b_ = cols.min() + ZIP_RAIL_KEEP, cols.max() - ZIP_RAIL_KEEP
+        if b_ <= a_:
+            continue
+        span = sub.any(axis=1 if vertical else 0)
+        idx = np.nonzero(span)[0]
+        core = np.zeros((H, W), bool)
+        if vertical:
+            core[y0 + idx.min():y0 + idx.max() + 1, x0 + a_:x0 + b_ + 1] = True
+        else:
+            core[y0 + a_:y0 + b_ + 1, x0 + idx.min():x0 + idx.max() + 1] = True
+        zip_core[nm] = core
+        print(f"  [{nm}] own strip {'x' if vertical else 'y'} "
+              f"{(x0 if vertical else y0) + a_}-{(x0 if vertical else y0) + b_} kept off other parts")
+
+    # A rib cuff or waistband is a near-convex band, but its regions are the
+    # 3-5px strips between rib lines: the thick line it meets eats the strips
+    # at its corners, and a break in that line lets the neighbouring panel's
+    # region run into some of them. Its outline then dipped and broke wherever
+    # that happened. The band's hull is its real shape -- used only when it
+    # adds little (a wavy peplum is not a band for this), and the band's
+    # neighbours give way to it in the export.
+    band_hull = {}
+    for nm, p in cfg["parts"].items():
+        if not p.get("regions") or not any(k in nm for k in ("cuff", "waistband", "hem")):
+            continue
+        m = ndimage.binary_closing(np.isin(labels, p["regions"]), dil, iterations=PIECE_SEAL)
+        if not m.any():
+            continue
+        hull = convex_hull_image(m)
+        # A rib hem band is as straight as a waistband (hull adds <= 3%); a
+        # peplum or flounce is named "hem" too, and its waves add 6-10%.
+        limit = BAND_HULL_MAX if any(k in nm for k in ("cuff", "waistband")) else HEM_HULL_MAX
+        if hull.sum() <= limit * m.sum():
+            band_hull[nm] = hull
+
     # A margin just OUTSIDE every grab_box (e.g. a zip's own tight teeth/tape
     # box) is where flanking attachment lines live -- lines that stitch the
     # zip/placket tape down to the body panel. A tight grab_box deliberately
@@ -1837,6 +1940,7 @@ def main(in_png, labels_npy, groups_json, out_svg):
     ring_full = {}
     boundary_paths = {}
     outline_paths = {}   # part name -> its region's silhouette (standalone export)
+    clip_masks = {}      # part name -> that silhouette grown to hold its outline
 
     for nm, p in cfg["parts"].items():
         reg = part_regs[nm]
@@ -1878,6 +1982,18 @@ def main(in_png, labels_npy, groups_json, out_svg):
         cap &= ~grabbed_union
         if nm in grabbed:
             cap |= grabbed[nm]
+        for znm, zc in zip_core.items():
+            if znm != nm:
+                cap &= ~zc
+        # Ink inside a rib band's own shape is the band's: where the panel's
+        # region ran into some of its strips, the panel drew those ribs and
+        # the band was left with a bald patch. The shared edge line stays
+        # with both.
+        for bnm, bh in band_hull.items():
+            if bnm == nm:
+                cap |= ink & bh
+            else:
+                cap &= ~ndimage.binary_erosion(bh, dil, iterations=3)
         # A grab_box is EXCLUSIVE: no OTHER part may re-draw what is inside it.
         # Without this the strip came out twice -- the zip's own layer carried
         # the clean trace off the 4x re-threshold, while the panel the zip sits
@@ -2463,6 +2579,9 @@ def main(in_png, labels_npy, groups_json, out_svg):
                 missing &= ~ndimage.binary_dilation(
                     fine_all, dil,
                     iterations=max(1, dash_keepout_px) + max(1, outline_px))
+            for znm, zc in zip_core.items():
+                if znm != nm:
+                    missing &= ~ndimage.binary_dilation(zc, iterations=2)
             if missing.sum() >= MIN_SYNTH_AREA:
                 # Trace only the MISSING arc, not the whole ring_full silhouette.
                 # Tracing the full ring stacked a second, independently-eroded
@@ -2483,9 +2602,87 @@ def main(in_png, labels_npy, groups_json, out_svg):
         # as the sketch, so a cuff whose sleeve-side edge is a hairline seam,
         # with notches where neighbouring strokes end, came out of the export
         # thin on one side and open at the corners.
-        if reg.any():
-            canvas_o, oscale = thin_canvas(reg, dil, 0.0)
+        reg_o = reg.copy()
+        for znm, zc in zip_core.items():
+            if znm != nm:
+                reg_o &= ~zc
+        if reg_o.any() and zip_core:
+            # the tooth gaps a leaked region reached into are cut loose by
+            # the line above; stroked, each one drew a little ring
+            # ...and so does the zip tape left between its outer rail and the
+            # strip: a 2-3px sliver that stroked as a thin tab on the piece
+            # Only beside the zip: everywhere else this also erased the 3-5px
+            # strips between a rib band's lines, and cuffs and waistbands came
+            # out broken into jagged blocks.
+            opened = ndimage.binary_opening(reg_o, iterations=2)
+            near_zip = np.zeros_like(reg_o)
+            for znm, zc in zip_core.items():
+                if znm != nm:
+                    near_zip |= ndimage.binary_dilation(zc, dil, iterations=8)
+            reg_o = np.where(near_zip, opened, reg_o) if opened.any() else reg_o
+            rl, rn = ndimage.label(reg_o)
+            if rn > 1:
+                ra = ndimage.sum_labels(reg_o, rl, np.arange(1, rn + 1))
+                reg_o = np.isin(rl, np.nonzero(ra >= 0.02 * ra.max())[0] + 1)
+        if reg_o.any():
+            # A narrow strip cut off from the piece by a drawn line -- the
+            # torso side seen between a hanging sleeve and the side seam --
+            # exported as a loose flap beside it. Only the standalone piece
+            # drops it; the composed drawing keeps every region.
+            rl, rn = ndimage.label(reg_o)
+            if rn > 1:
+                idx = np.arange(1, rn + 1)
+                ra = ndimage.sum_labels(reg_o, rl, idx)
+                rw = 2 * ndimage.maximum(ndimage.distance_transform_edt(reg_o), rl, idx)
+                # Only beside one dominant shape: a rib band or a striped hem
+                # is nothing but narrow strips, none of them a flap.
+                flap = ((ra < PIECE_FLAP_AREA * ra.max()) & (rw < PIECE_FLAP_WIDTH)
+                        & (ra.max() >= 0.6 * ra.sum()))
+                if flap.any():
+                    reg_o &= ~np.isin(rl, idx[flap])
+            # A piece built of several regions -- a rib cuff between its rib
+            # lines, a striped hem, a quilted panel -- has the drawn lines
+            # between them as gaps in this union. Outlined as is, every strip
+            # got its own loop and the ribs came out as fat outlined bars.
+            # Seal it into the one shape the piece is.
+            # (Closing only, no hole fill: a pocket sitting on the panel is
+            # a hole in it, and its outline marks where the pocket goes.)
+            sealed = ndimage.binary_closing(reg_o, dil, iterations=PIECE_SEAL)
+            # ...but a SMALL hole -- a pocket of another part's leftover
+            # pixels, a gap where two lines met -- outlined as a little square
+            # loop inside the piece.
+            holes = ndimage.binary_fill_holes(sealed) & ~sealed
+            hl, hn = ndimage.label(holes)
+            if hn:
+                ha = ndimage.sum_labels(holes, hl, np.arange(1, hn + 1))
+                small = ha < PIECE_HOLE_MIN * sealed.sum()
+                sealed |= np.isin(hl, np.nonzero(small)[0] + 1)
+            for znm, zc in zip_core.items():
+                if znm != nm:
+                    sealed &= ~zc
+            reg_o = sealed
+        if nm in band_hull:
+            reg_o = band_hull[nm].copy()
+            for znm, zc in zip_core.items():
+                reg_o &= ~zc
+        elif band_hull and reg_o.any():
+            for bnm, bh in band_hull.items():
+                if bnm != nm:
+                    reg_o &= ~bh
+        if reg_o.any():
+            canvas_o, oscale = thin_canvas(reg_o, dil, 0.0)
             outline_paths[nm] = scale_paths(trace(canvas_o, ss_of(oscale)), oscale)
+            # The standalone piece is clipped to this: a neighbour's seam end,
+            # a stub or a speck that the band sharing pulled in from just
+            # outside the piece came along into the export as a loose line
+            # hanging off the outline.
+            clip_masks[nm] = ndimage.binary_dilation(
+                reg_o, dil, iterations=int(np.ceil(max(2.0, float(outline_px)))) + 2)
+        if nm in zip_core:
+            # a zip has no region of its own to clip to; its strip is it (the
+            # export otherwise carried the collar's V and the hem's lines
+            # crossing either end)
+            clip_masks[nm] = ndimage.binary_dilation(zip_core[nm], dil, iterations=3)
         layers.append((zkey(nm), nm, paths, guide_paths))
         print(f"  [{nm}] {len(paths)} paths")
 
@@ -2688,6 +2885,9 @@ def main(in_png, labels_npy, groups_json, out_svg):
         n_grey = 0
         for nm, p in cfg["parts"].items():
             m = gmask & np.isin(labels, p["regions"])
+            for znm, zc in zip_core.items():
+                if znm != nm:
+                    m &= ~zc
             if m.sum() < 20:
                 continue
             canvas = np.full((H, W), 255, np.uint8)
@@ -2856,6 +3056,17 @@ def main(in_png, labels_npy, groups_json, out_svg):
         # each neighbour would stroke the shared seam again.
         outline_w = max(2.0, float(outline_px))
 
+        def _clip_png(nm: str, png_path: str) -> None:
+            # (Done on the raster: the PNG renderer ignores SVG clip-path.)
+            if nm not in clip_masks or os.environ.get("PART_CLIP", "1") != "1":
+                return
+            im = Image.open(png_path).convert("RGBA")
+            keep = Image.fromarray(clip_masks[nm].astype(np.uint8) * 255).resize(
+                im.size, Image.NEAREST)
+            im.putalpha(Image.fromarray(np.minimum(
+                np.asarray(im.getchannel("A")), np.asarray(keep))))
+            im.save(png_path)
+
         def _with_outline(nm: str, svg_fragment: str) -> str:
             if not outline_paths.get(nm) or os.environ.get("PART_OUTLINE", "1") != "1":
                 return svg_fragment
@@ -2889,6 +3100,7 @@ def main(in_png, labels_npy, groups_json, out_svg):
             svg2png(svg_bytes=(head + _with_outline(nm, _visible_boundary(g)) + extra_g + "</svg>").encode(),
                     write_to=os.path.join(pdir, nm + ".png"),
                     output_width=min(W, 1600))
+            _clip_png(nm, os.path.join(pdir, nm + ".png"))
             svg2png(svg_bytes=(head + g + extra_g + "</svg>").encode(),
                     write_to=os.path.join(ldir, nm + ".png"),
                     output_width=min(W, 1600))

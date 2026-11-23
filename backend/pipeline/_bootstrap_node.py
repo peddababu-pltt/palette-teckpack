@@ -86,7 +86,12 @@ def ensure_npm_packages(pipeline_dir: Path, packages: list[str]) -> None:
 
     env = dict(os.environ)
     env["PATH"] = f"{node_bin.parent}{os.pathsep}{env.get('PATH', '')}"
-    cmd = ([node_exe, str(npm_cli)] if npm_cli.is_file() else ["npm"]) + [
+    # The hosted image's $HOME/.npm is root-owned while the app runs as uid
+    # 10001, so npm's default cache dir fails with EACCES. Keep the cache (and
+    # its _logs) next to node_modules, which we already know is writable.
+    env["npm_config_cache"] = str(pipeline_dir / ".npm-cache")
+    env["npm_config_update_notifier"] = "false"
+    cmd =([node_exe, str(npm_cli)] if npm_cli.is_file() else ["npm"]) + [
         "install", "--no-save", "--no-audit", "--no-fund",
         "--prefix", str(pipeline_dir), *missing,
     ]

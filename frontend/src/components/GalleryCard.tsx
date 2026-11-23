@@ -31,6 +31,7 @@ export default function GalleryCard({
   onToggleMenu,
   onOpen,
   onDelete,
+  onShare,
 }: {
   job: Job
   imgUrl: string
@@ -39,6 +40,7 @@ export default function GalleryCard({
   onToggleMenu: () => void
   onOpen: (tab: "overview" | "parts" | "pattern" | "spec") => void
   onDelete: () => void
+  onShare: () => void
 }) {
   const { t } = usePluginTranslations(STRINGS)
   const out = job.outputs || ({} as Job["outputs"])
@@ -52,6 +54,9 @@ export default function GalleryCard({
   // original (only the overlay's own Parts SVG tab cache-busts that one).
   const patternPdfUrl = withCacheBust(resolveUrl(out.pattern_pages), job.mtime)
   const partsSvgUrl = resolveUrl(out.parts_svg)
+  // Older backends don't send `owner`; treat that as the caller's own job.
+  const isOwner = job.owner !== false
+  const isShared = isOwner && !!job.shared && (job.shared.org || job.shared.users.length > 0)
 
   return (
     <div className="tp-card">
@@ -123,17 +128,32 @@ export default function GalleryCard({
           >
             {t("galleryCard.details")}
           </button>
-          <button
-            type="button"
-            className="tp-menu-item tp-menu-danger"
-            onClick={(e) => {
-              e.stopPropagation()
-              onToggleMenu()
-              onDelete()
-            }}
-          >
-            {t("galleryCard.deleteTechpack")}
-          </button>
+          {isOwner && (
+            <button
+              type="button"
+              className="tp-menu-item"
+              onClick={(e) => {
+                e.stopPropagation()
+                onToggleMenu()
+                onShare()
+              }}
+            >
+              {t("galleryCard.share")}
+            </button>
+          )}
+          {isOwner && (
+            <button
+              type="button"
+              className="tp-menu-item tp-menu-danger"
+              onClick={(e) => {
+                e.stopPropagation()
+                onToggleMenu()
+                onDelete()
+              }}
+            >
+              {t("galleryCard.deleteTechpack")}
+            </button>
+          )}
         </div>
         {/* The flat, not the uploaded photo: the card stands for the techpack this
             run produced, and the flat is that deliverable. */}
@@ -157,6 +177,8 @@ export default function GalleryCard({
       <div className="tp-card-caption">
         <span className="tp-card-cat">{cat}</span>
         <span className="tp-card-sub">{sub || ""}</span>
+        {!isOwner && <span className="tp-card-shared">{t("galleryCard.sharedWithYou")}</span>}
+        {isShared && <span className="tp-card-shared">{t("galleryCard.sharedBadge")}</span>}
       </div>
       <div className="tp-card-foot">
         <button

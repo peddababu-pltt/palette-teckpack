@@ -5,7 +5,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { usePluginTranslations } from "@palettelab/sdk"
 import { STRINGS } from "../../strings"
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js"
-import { fetchBinary, fetchJson, resolveUrl, saveToDataRoom, startGarment3D, watchJob, withCacheBust, type Job, type PatternDesign, type PatternPieces3D } from "../../api"
+import { fetchBinary, fetchJson, resolveUrl, saveToDataRoom, startGarment3D, watchJob, withCacheBust, type Job, type JobWatch, type PatternDesign, type PatternPieces3D } from "../../api"
 import { loadManifest, loadScan, vtonBaseFrom, type ScanMesh } from "../../vton/assets"
 import { BOTTOM_VARIANTS, TOP_VARIANTS, planFromPattern, type TryOnPlan } from "../../vton/plan"
 import { VtonScene, type Look } from "../../vton/VtonScene"
@@ -160,8 +160,8 @@ export default function VtonViewer({ job, pluginId, onClose, measurePanel, liveC
     autoStarted.current = job.job_id
     void generateReal(genImages.length > 0)
   }, [genChecked, humanReady, hasGen, gen.busy, job.job_id])
-  // the progress stream is single-reader server-side: a closed viewer lets go of it
-  const genStream = useRef<EventSource | null>(null)
+  // stop polling the build's progress once the viewer closes
+  const genStream = useRef<JobWatch | null>(null)
   useEffect(() => () => genStream.current?.close(), [])
   // Don't depend on the progress stream to learn the garment is ready: on the
   // hosted app it can drop (an EventSource carries no auth headers; proxies cut

@@ -135,6 +135,22 @@ Check each tile in IMAGE 2 against IMAGE 1:
   chest, that's placket content misfiled. Also confirm front-view
   collar and back-view collar are kept as separate parts, not merged
   with each other or with a yoke/placket region.
+- A SPLIT / COLOUR-BLOCK PANEL IS TWO PIECES, and keeping it split is
+  correct -- do NOT merge it. When a solid seam line runs right across a
+  body panel edge to edge (armhole or side seam to centre front / zip,
+  straight or diagonal, or side to side), the part above it (named
+  "front_left_yoke" / "front_right_yoke") and the part below it are
+  separate cut pieces. A texture, print or mesh filling one side and stopping exactly
+  at that line proves two different fabrics are sewn together there. If
+  one tile shows both sides of such a seam, split it.
+- A RIBBED CORNER ON A PLAIN PIECE IS A MERGE DEFECT. A body panel, sleeve
+  or yoke tile showing a patch of close parallel rib lines (a rib shoulder
+  insert) has another piece folded into it: split those regions out into
+  "<view>_<side>_shoulder_rib_trim".
+- FRONT AND BACK MUST AGREE. A peplum, flounce or hem band that is its own
+  part on the front view ("front_left_hem") must also be its own part on
+  the back ("back_hem"). A back body tile that still carries that band
+  below the waist seam is a merge defect -- split it.
 - COLLAR vs SHOULDER PANEL: a narrow diagonal/triangular strip running
   from the collar's outer point OUT to the sleeve/armhole at the
   shoulder is a shoulder panel, not the collar, even though its region

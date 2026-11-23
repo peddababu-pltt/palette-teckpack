@@ -18,4 +18,5 @@ backend/pipeline/_vendor/
 backend/pipeline/_vendor_node/
 backend/pipeline/node_modules/
 backend/pipeline/.cache/
+backend/pipeline/.npm-cache/
 .playwright-mcp/

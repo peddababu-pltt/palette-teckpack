@@ -337,16 +337,40 @@ export const CUSTOM_MEASUREMENTS = [
 
 const MEDIA = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' }
 
+// The body (front, back, yokes, sleeve, trouser legs) is NOT drawn by the model:
+// custom-block.mjs drafts it from a real pattern block to the measurements, cut by
+// the construction below. The model describes how the garment is built, and draws
+// only the pieces that aren't body panels.
+const BODY_ROLE_LIST = 'front | back | frontYoke | backYoke | sleeve | frontLeg | backLeg'
+const ATTACHED_ROLE_LIST = 'collar | collarStand | cuff | hemBand | waistband | frontFacing'
 const CUSTOM_HINT = `Respond with ONLY a raw JSON object, no prose, no markdown fences:
 {
+  "construction": {
+    "body": "upper | lower | none"   <- upper = tops, shirts, jackets, coats (drafted from a shirt/bodice block); lower = trousers, shorts (trouser block); none = neither (bags, hats, accessories),
+    "frontOpening": "zip | button | snap | none"   <- what closes the centre front, looking for zipper teeth, buttons or snaps actually visible; none = pullover, front cut on the fold,
+    "buttonStandCm": <number>   <- button/snap overlap added past centre front, 0 for a zip,
+    "backYokeCm": <number>   <- depth of a back yoke seam below the high shoulder point, 0 if no back yoke (a yoke is a HORIZONTAL seam across the upper back; quilting lines are not yokes),
+    "frontYokeCm": <number>   <- same for a front yoke, 0 if none,
+    "bodyLengthCm": <number>   <- finished length from high shoulder point to hem at centre back (including any hem band) -- judge it against the body: hip ~65-72, thigh ~80-90, knee ~95-110, calf ~115-125, ankle ~135+,
+    "hem": "straight | curved"   <- curved = shirt-tail hem rising at the side seams,
+    "hemDropCm": <number>   <- how much a curved hem rises at the side, 0 for straight,
+    "hemBandCm": <number>   <- finished height of a separate hem band / rib, 0 if none,
+    "sleeve": "setin | raglan | dropped | none"   <- look at where the sleeve seam meets the body: "raglan" = a DIAGONAL seam running from the neckline down to the underarm, no seam on top of the shoulder (the sleeve includes the shoulder); "setin" = a seam at the natural shoulder point that curves round the armhole, plus a shoulder seam; "dropped" = the shoulder/armhole seam sits well down on the upper arm, the body is wide and the sleeve cap is flat; "none" = sleeveless,
+    "sleeveLengthCm": <number>   <- shoulder point to wrist edge, including the cuff,
+    "cuffDepthCm": <number>   <- finished cuff / rib cuff height, 0 if none,
+    "legLengthCm": <number>   <- lower body only: waist to hem at the side seam,
+    "waistbandCm": <number>   <- finished waistband height, 0 if none
+  },
   "pieces": [
     {
       "name": "<camelCase id, letters only, e.g. front, back, sleeve, hood, pocket, waistband>",
       "title": "<short human name>",
+      "role": "${BODY_ROLE_LIST} | ${ATTACHED_ROLE_LIST} | lining:<role> | interfacing:<role> | other",
+      "of": "<for a lining or interfacing: the name of the piece it copies>",
       "cutCount": <integer 1..8>,
       "material": "main | lining | interfacing | contrast | rib",
       "onFold": <bool>  <- true when the piece is cut on a fold; then its FIRST edge (point 0 -> point 1) must be the fold line, running straight down x = 0,
-      "outline": [[x, y], ...]  <- 4 to 60 points, in CENTIMETRES, the piece's own frame (origin top-left, y grows downward), the SEAMLINE only (no seam allowance), in drawing order. Trace curved seams (neckline, armhole, sleeve cap, crotch, collar edge, rounded hems) with a point every 2-3 cm so they stay smooth curves; straight seams need only their end points,
+      "outline": [[x, y], ...]  <- OMIT for body roles (${BODY_ROLE_LIST}) and for linings/interfacings: those are drafted from the block. For every other piece: 4 to 60 points, in CENTIMETRES, the piece's own frame (origin top-left, y grows downward), the SEAMLINE only (no seam allowance), in drawing order, curves traced with a point every 2-3 cm. Collars, stands, cuffs, bands, waistbands and facings are re-sized to the drafted seams, so give their SHAPE (points, curves, proportions) right,
       "notes": "<one short sewing note>"
     }
   ]
@@ -411,7 +435,12 @@ function validatePieces(obj, crossed = []) {
     if (!name) throw new Error('piece without a name')
     while (seen.has(name)) name += 'B'
     seen.add(name)
-    if (!Array.isArray(p.outline) || p.outline.length < 3) throw new Error(`piece ${name}: bad outline`)
+    const role = typeof p.role === 'string' ? p.role.slice(0, 40) : ''
+    const drafted = BODY_ROLES_SET.has(role.replace(/^(lining|interfacing):/, '')) || /^(lining|interfacing):/.test(role)
+    if (!Array.isArray(p.outline) || p.outline.length < 3) {
+      if (!drafted) throw new Error(`piece ${name}: bad outline`)
+      p.outline = [[0, 0], [1, 0], [1, 1], [0, 1]] // placeholder: the block supplies its shape
+    }
     const outline = p.outline.map((pt) => {
       if (!Array.isArray(pt) || pt.length !== 2 || !pt.every((v) => Number.isFinite(v) && v >= -5 && v <= 400))
         throw new Error(`piece ${name}: bad point ${JSON.stringify(pt)}`)
@@ -427,14 +456,88 @@ function validatePieces(obj, crossed = []) {
       name, title: String(p.title || name).slice(0, 40), outline: smoothOutline(outline), onFold: !!p.onFold,
       cut: `Cut ${cutCount}${p.onFold ? ' on fold' : ''} from ${material === 'main' ? 'main fabric' : material}`,
       notes: p.notes ? [String(p.notes).slice(0, 80)] : [],
+      role, of: typeof p.of === 'string' ? p.of.replace(/[^a-zA-Z]/g, '') : undefined, cutCount, material,
     }
   }).filter(Boolean)
 }
 
-// Asks the vision model for the garment's full cut-piece list, sized to `cm`.
-// MOCK_CUSTOM_PIECES='{"pieces":[...]}' short-circuits it for offline tests.
-export async function draftCustomPieces(photoPath, attrs, cm, size, reference = '') {
-  if (process.env.MOCK_CUSTOM_PIECES) return validatePieces(JSON.parse(process.env.MOCK_CUSTOM_PIECES))
+const BODY_ROLES_SET = new Set(['front', 'back', 'frontYoke', 'backYoke', 'sleeve', 'frontLeg', 'backLeg'])
+
+// ---------------- master pattern prompt ----------------
+// The one prompt every non-catalogue garment is drafted with, whatever it is --
+// top, dress, jumpsuit, coat, skirt, trousers, kurta, kimono, cape... It tells the
+// model how a pattern maker breaks ANY garment into properly cut pieces: read the
+// construction, split at every seam, cut symmetric pieces as a half on the fold
+// (the PDF shows them unfolded, pattern-pages.mjs unfoldPiece), mirrored pieces as
+// a pair, asymmetric ones singly, and make every pair of joined edges the same length.
+export function masterPatternPrompt({ notes, seen, size, fit, body }) {
+  return [
+    `ROLE: You are a senior industrial pattern maker drafting a PRODUCTION sewing pattern for the garment in the image ("${notes}"). ` +
+    `It is not one of our catalogue patterns: draft it from scratch from what you see. Do not force it into the shape of a T-shirt, ` +
+    `shirt, hoodie, trouser or any other standard pattern it merely resembles.`,
+
+    `ALREADY READ FROM THE IMAGE: ${seen}. Re-check each against the image; where they disagree, the image wins.`,
+
+    `RULE 1 -- DRAFT ONLY WHAT IS THERE. Every piece must correspond to something visible. A pocket, zip, fly, placket, cuff, band, ` +
+    `collar, hood, yoke, tab, loop, tie, ruffle or lining gets a piece ONLY when the image shows it. If the image is a line drawing ` +
+    `it is the user's own design: a feature that is not drawn does not exist. Never add parts because this kind of garment usually has them.`,
+
+    `RULE 2 -- READ THE CONSTRUCTION. Look at front and back. Every visible seam line separates two pieces (shoulder, side, ` +
+    `centre back, princess, yoke, panel, waist, armhole, raglan, inseam, crotch). A smooth edge with no seam is one piece. Darts, ` +
+    `pleats and gathers stay inside their piece (note them); they do not split it. Length class and silhouette (cropped / hip / ` +
+    `knee / ankle; fitted / straight / A-line / flared / gathered) must match the image exactly. Lower garments: legs ending at or ` +
+    `above the knee are SHORTS, legs reaching toward the ankle are full-length TROUSERS -- leg length decides, nothing else.`,
+
+    `RULE 3 -- PIECE CHECKLIST BY GARMENT FAMILY (include a piece only if RULE 1 allows it):\n` +
+    `  * Tops / shirts / blouses / kurtas: front, back, sleeve; then yokes, collar + collar stand, neckband or neck facing, ` +
+    `button placket or front facing, cuffs, hem band, pockets.\n` +
+    `  * Jackets / coats: front (and side front if princess-seamed), back (and side back), sleeve (upper + under sleeve if two-piece), ` +
+    `collar + under collar, lapel facing, back neck facing, hood panels, pocket bags + welts/flaps, lining for body and sleeves, interfacings.\n` +
+    `  * Hoodies / sweatshirts: front, back, sleeve, hood (side panels + centre panel if seamed), kangaroo pocket, rib cuffs, rib hem band, neckband.\n` +
+    `  * Dresses / jumpsuits: bodice front + back from the block, then skirt front + back panels (or gores/tiers) drawn with their real ` +
+    `flare or gathers, waist seam/band, facings, sleeves; a jumpsuit adds trouser legs from the lower block.\n` +
+    `  * Skirts: front, back (or gores / tiers / circle sections), waistband or waist facing, pockets.\n` +
+    `  * Trousers / shorts: front leg, back leg, waistband, fly facing + fly shield ONLY if a fly is shown, pocket bags/facings, belt loops, cuffs/hem bands.\n` +
+    `  * Anything else (cape, poncho, kimono, wrap, accessory): split it at its real seams and draw each panel.`,
+
+    `RULE 4 -- HOW EACH PIECE IS CUT (this is what makes the pattern correct):\n` +
+    `  * SYMMETRIC about the centre line (a plain front, a back, a collar, a waistband, a centre hood panel): draw ONLY HALF, ` +
+    `set "onFold": true, cutCount 1, and make the outline's FIRST edge (point 0 -> point 1) the centre line, running straight down x = 0. ` +
+    `It is shown and cut as one full piece.\n` +
+    `  * A LEFT/RIGHT PAIR (sleeves, side panels, legs, hood side panels, cuffs, patch pockets on both sides): draw ONE, onFold false, cutCount 2 (mirror).\n` +
+    `  * ASYMMETRIC or opening at the centre (a wrap front, an offset zip front, a buttoned front with an overlap): onFold false; ` +
+    `draw each different piece fully (e.g. "rightFront" and "leftFront", cutCount 1 each), or one piece with cutCount 2 when the two sides mirror.\n` +
+    `  * Never split a symmetric piece into two separate halves, and never draw a full symmetric piece AND mark it on the fold.`,
+
+    `RULE 5 -- SHAPES THAT SEW TOGETHER. Outlines are the SEAMLINE (no seam allowance), in cm, origin top-left, y down. Edges that ` +
+    `are sewn together have the SAME length: collar neck edge = neckline it joins (front + back), collar stand = collar, cuff = sleeve ` +
+    `hem plus overlap, waistband = waist plus overlap, facing = the edge it faces, hood neck edge = neckline, skirt waist = bodice waist ` +
+    `(plus gather allowance if gathered), side seams of front and back match. Curves are smooth with a point every 2-3 cm (necklines, ` +
+    `armholes, sleeve caps, crotch, hood crowns, collar edges); corners are exact. Add ease right for fit "${fit}". Grain runs ` +
+    `parallel to the centre line unless the garment is clearly bias-cut.`,
+
+    `RULE 6 -- BODY PIECES FROM THE BLOCK. Fill in "construction" carefully (front opening, yoke depths from the high shoulder point, ` +
+    `body length, hem shape and drop, sleeve type and length, cuff depth, hem band, leg length, waistband). Our software drafts the ` +
+    `front, back, yokes and sleeves (or trouser legs) from a real block to these values and the body measurements -- list those body ` +
+    `pieces by role only and do NOT draw their outlines. Draw every other piece.`,
+
+    `SIZE ${size}. Body measurements in cm: ${body}. Size every piece to them.`,
+
+    `FINAL CHECK before answering: (a) every seam visible in the image is the edge of a piece; (b) no piece exists for something the ` +
+    `image does not show; (c) every symmetric piece is a half on the fold, every pair has cutCount 2; (d) joined edges have equal ` +
+    `lengths; (e) a pattern maker could cut and sew exactly this garment from your list alone. Fix anything that fails, then answer.`,
+  ].join('\n\n')
+}
+
+// Asks the vision model how the garment is constructed and for its non-body pieces.
+// Returns { pieces, construction } -- custom-block.mjs assemblePieces() turns that
+// into the final cut pieces. MOCK_CUSTOM_PIECES='{"construction":{...},"pieces":[...]}'
+// short-circuits it for offline tests.
+export async function draftCustomPieces(photoPath, attrs, cm, size, feedback = '') {
+  if (process.env.MOCK_CUSTOM_PIECES) {
+    const mock = JSON.parse(process.env.MOCK_CUSTOM_PIECES)
+    return { pieces: validatePieces(mock), construction: mock.construction || null }
+  }
   const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.GOOGLE_AI_API_KEY
   if (!apiKey) throw new Error('GEMINI_API_KEY is not set')
   const mediaType = MEDIA[path.extname(photoPath).toLowerCase()]
@@ -442,18 +545,21 @@ export async function draftCustomPieces(photoPath, attrs, cm, size, reference = 
   const data = fs.readFileSync(photoPath).toString('base64')
   const client = new GoogleGenAI({ apiKey })
   const body = CUSTOM_MEASUREMENTS.map((k) => `${k}=${cm[k]}`).join(', ')
-  const prompt = `You are an expert garment pattern maker. This garment ("${attrs.notes}") is not a standard block, ` +
-    `so draft its sewing pattern from scratch. List EVERY separate piece that must be cut to sew it exactly as shown ` +
-    `(bodice/front/back panels, sleeves, collar, hood, facings, yokes, pockets, flaps, bands, cuffs, ties, straps...). ` +
-    `Size ${size}, fit "${attrs.fit}". Body measurements in cm: ${body}. ` +
-    `Size each outline to those measurements plus ease that matches the fit — e.g. a front bodice half is about chest/4 + ease wide. ` +
-    `Draw half pieces on the fold where the garment is symmetric. ` +
-    (reference ? `The closest pattern in our catalogue is: ${reference}. Follow the same drafting conventions as that pattern (its standard pieces, seam placement, block proportions), but draw THIS garment's own pieces for every way it differs. ` : '') +
-    `Include every piece a real production pattern would: main panels, facings, linings, collar pieces, pocket pieces, bands, cuffs.\n${CUSTOM_HINT}`
+  const seen = [
+    `category=${attrs.garmentCategory}`, `fit=${attrs.fit}`, `length=${attrs.garmentLength}`,
+    `sleeves=${attrs.sleeveLength}`, `neckline=${attrs.neckline}`,
+    attrs.neckline === 'collar' ? `collar=${attrs.collarStyle}` : '',
+    `closure=${attrs.closure}${attrs.closure === 'zipper' || attrs.closure === 'snap' ? ` (${attrs.zipLength})` : ''}${attrs.closure === 'button' ? ` (${attrs.buttonCount} buttons)` : ''}`,
+    `cuffs=${attrs.cuffs}`, `waistband=${attrs.waistband}`,
+    attrs.pockets?.type && attrs.pockets.type !== 'none' ? `pockets=${attrs.pockets.count} ${attrs.pockets.type} at ${attrs.pockets.position} (${attrs.pockets.widthCm}x${attrs.pockets.heightCm} cm)` : 'pockets=none',
+  ].filter(Boolean).join(', ')
+  const prompt = masterPatternPrompt({ notes: attrs.notes, seen, size, fit: attrs.fit, body }) +
+    (feedback ? `\n\nCORRECTIONS -- a pattern maker checked your previous draft against the image and found these mistakes. ` +
+      `Fix every one of them in this draft (construction values AND piece list):\n- ${feedback}` : '')
   const ask = async (extra = '') => {
     const res = await client.models.generateContent({
       model: 'gemini-2.5-pro',
-      contents: [{ role: 'user', parts: [{ inlineData: { mimeType: mediaType, data } }, { text: `${prompt} ${extra}` }] }],
+      contents: [{ role: 'user', parts: [{ inlineData: { mimeType: mediaType, data } }, { text: `${prompt}\n\n${CUSTOM_HINT} ${extra}` }] }],
     })
     return JSON.parse(res.text.replace(/```json|```/g, '').trim())
   }
@@ -463,9 +569,10 @@ export async function draftCustomPieces(photoPath, attrs, cm, size, reference = 
   } catch {
     first = await ask('Your previous answer was invalid. Follow the schema EXACTLY.')
   }
+  const construction = first && typeof first.construction === 'object' ? first.construction : null
   const crossed = []
   const pieces = validatePieces(first, crossed)
-  if (!crossed.length) return pieces
+  if (!crossed.length) return { pieces, construction }
   // one redraw for pieces whose outline crossed itself; any still crossed are dropped
   // (logged) rather than printed as an impossible shape
   try {
@@ -474,10 +581,10 @@ export async function draftCustomPieces(photoPath, attrs, cm, size, reference = 
     const still = []
     const fixed = validatePieces(again, still).filter((p) => crossed.includes(p.name))
     for (const n of still) console.log(`Note: AI piece "${n}" still crosses itself after a redraw — left out.`)
-    return [...pieces, ...fixed]
+    return { pieces: [...pieces, ...fixed], construction }
   } catch {
     for (const n of crossed) console.log(`Note: AI piece "${n}" crosses itself — left out.`)
-    return pieces
+    return { pieces, construction }
   }
 }
 

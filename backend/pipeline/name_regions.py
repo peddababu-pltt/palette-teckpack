@@ -72,6 +72,18 @@ Group ALL region ids into named garment parts. Rules:
   seam running right across the upper back, from armhole to armhole, well
   below the shoulder. The test is that seam. A front view has no yoke unless
   a seam like that crosses it too.
+- A SPLIT / COLOUR-BLOCK PANEL IS TWO PIECES. When a solid seam line runs
+  right across a body panel from one of its edges to another -- armhole or
+  side seam to the centre front / zip, straight or diagonal, or side to side
+  -- the regions above it and below it are two separate cut pieces: name the
+  upper one "front_left_yoke" / "front_right_yoke" (exactly that -- never
+  "..._upper_panel", which is folded back into the body) and the lower one
+  "front_left_body_panel" (and the same on the back). Never merge regions that sit on opposite sides of such a seam into
+  one part. A texture, print or mesh that fills one side and stops exactly
+  at that line is the strongest proof: it marks two different fabrics sewn
+  together, not decoration on one piece. This is not the armhole strip above
+  -- that seam runs along the sleeve, this one cuts across the panel, so the
+  ban on "front_left_yoke" above does not apply to it.
 - The parts you are looking for are the garment's construction pieces:
   body panels (front left/right, back), yoke, sleeves, cuffs, collar,
   waistband, plackets, zip, buttons, pockets, and the dashes/topstitch
@@ -121,6 +133,21 @@ Group ALL region ids into named garment parts. Rules:
   than its neighbours and the seams between them step. Symmetry is the check
   on a hem that exists, never a reason to invent one: name a hem part for
   every panel along that same hem line, or -- the common case -- none at all.
+- A RIB-KNIT INSERT IS ITS OWN PIECE. A ribbed section set into the garment
+  away from the edges -- most often a rib shoulder/raglan insert running from
+  the collar over the shoulder, drawn with the same close parallel rib lines
+  as the cuffs -- is a separate piece in a different fabric. Group all of its
+  regions on one side into "front_left_shoulder_rib_trim" /
+  "front_right_shoulder_rib_trim" (and "back_left_..." / "back_right_..."),
+  even where it continues across the body/sleeve/yoke seam. Never fold any of
+  its regions into the body panel, sleeve or yoke it touches: extracted, that
+  piece came out with a ribbed corner stuck to it.
+- A PEPLUM / FLOUNCE / DEEP HEM BAND drawn on BOTH views is a separate piece
+  on BOTH views. If the front view's band below the waist seam is its own
+  part ("front_left_hem" / "front_right_hem"), the back view's band below the
+  same seam is "back_hem" -- never folded into "back_body". The back is cut
+  from the same pattern; a band split on one view and merged on the other
+  produces two different garments.
   A ribbed hem BAND (visible rib ticks, a real band with two edges) is a
   different thing and is named as usual; this rule is about the thin
   turned-up allowance strip.
@@ -643,9 +670,15 @@ def merge_hem_allowance(parts: dict, info: dict) -> dict:
         # touched here.
         _, _, _, by1 = panels[best]
         key = "_".join(best.split("_")[:2])
+        # A sibling is another PANEL of the same group. The name prefix alone
+        # also matched front_left_sleeve to front_left_body_panel, and a
+        # sleeve always hangs below the body hem, so every real rib waistband
+        # on those sides was merged into its body panel.
         lower_sibling = next(
             (onm for onm, (_, _, _, oy1) in panels.items()
              if onm != best and "_".join(onm.split("_")[:2]) == key
+             and any(k in onm for k in ("panel", "body", "skirt"))
+             and not any(k in onm for k in ("sleeve", "cuff", "leg"))
              and oy1 > by1 + HEM_STEP_MIN), None)
         if not lower_sibling:
             print(f"  {nm} kept: no sibling panel of {best} runs lower "
@@ -1371,6 +1404,7 @@ def return_hem_rib_to_waistband(parts: dict, info: dict) -> dict:
 SLEEVE_XOVERLAP = 0.70   # share of its own width a column must share with the
                          # sleeve's x-range to be that same sleeve
 SLEEVE_YOVERLAP = 0.40   # ...and of its own height, with the sleeve's y-range
+SLEEVE_COL_MIN_HFRAC = 0.7   # a sleeve column spans most of the sleeve's height
 SLEEVE_MIN_ASPECT = 2.0  # ...and it must be a tall column, not a wide flap
 SLEEVE_MAX_W_MULT = 2.0  # ...no wider than this many sleeve widths
 SLEEVE_MAX_A_MULT = 1.5  # ...and no bigger than this many sleeve areas
@@ -1437,6 +1471,13 @@ def reunite_sleeve_columns(parts: dict, info: dict) -> dict:
                         continue
                     if (ov(b[0], b[2], sb[0], sb[2]) / w < SLEEVE_XOVERLAP
                             or ov(b[1], b[3], sb[1], sb[3]) / h < SLEEVE_YOVERLAP):
+                        continue
+                    # A sleeve column runs the sleeve's length. The strip of
+                    # torso side seen between a hanging sleeve and the body's
+                    # side seam fits every test above but covers only the
+                    # lower part: moved, the extracted sleeve carried the body
+                    # side as a doubled inner edge.
+                    if h < SLEEVE_COL_MIN_HFRAC * (sb[3] - sb[1]):
                         continue
                     p["regions"].remove(r)
                     parts[snm]["regions"] = sorted(set(parts[snm]["regions"]) | {r})
@@ -1993,6 +2034,52 @@ SUBPANEL_MERGE_VIEWS = {"upper": ("front",), "shoulder": ("front",)}
                         # style line across one piece.
 
 
+RIB_ABSORB_MAX_FRAC = 0.15   # a region at most this share of its part...
+RIB_ABSORB_MIN_BORDER = 20   # ...sharing at least this many px of border
+
+
+def absorb_into_rib_trims(parts: dict, info: dict, segdir: str) -> dict:
+    """Hand a rib insert the pieces of it left on the parts it crosses.
+
+    A rib shoulder insert runs from the collar over the shoulder seam into the
+    sleeve cap, and the naming model files the insert itself as
+    "..._shoulder_rib_trim" but leaves the part of it below the shoulder seam
+    in the sleeve (or body, or yoke) -- every one of those came out of the
+    export with a ribbed corner stuck to it. A small region of a part that
+    borders a rib trim on the same view and side belongs to the trim.
+    """
+    lab_path = os.path.join(segdir, "labels.npy")
+    trims = [n for n in parts if "rib_trim" in n and parts[n].get("regions")]
+    if not trims or not os.path.isfile(lab_path):
+        return parts
+    lab = np.load(lab_path)
+    st = np.ones((3, 3), bool)
+    area = {int(k): v["area"] for k, v in info.items()}
+    # repeated: a region reaches the trim through one that only just joined it
+    for tnm in trims * 3:
+        prefix = "_".join(tnm.split("_")[:2])          # front_left, back_right
+        tmask = np.isin(lab, parts[tnm]["regions"])
+        near = ndimage.binary_dilation(tmask, st, iterations=BORDER_DILATE)
+        for onm, p in parts.items():
+            if onm == tnm or "rib_trim" in onm or not onm.startswith(prefix + "_"):
+                continue
+            regs = p.get("regions", [])
+            if len(regs) < 2 or p.get("grab_box"):
+                continue
+            total = sum(area.get(r, 0) for r in regs)
+            for r in list(regs):
+                if area.get(r, 0) > RIB_ABSORB_MAX_FRAC * total:
+                    continue
+                border = int((near & (lab == r)).sum())
+                if border < RIB_ABSORB_MIN_BORDER:
+                    continue
+                p["regions"].remove(r)
+                parts[tnm]["regions"] = sorted(set(parts[tnm]["regions"]) | {r})
+                print(f"  region {r} borders {tnm} -> part of the rib insert, not {onm}")
+    return {nm: p for nm, p in parts.items()
+            if p.get("regions") or p.get("grab_box")}
+
+
 def collapse_subpanels(parts: dict, info: dict, segdir: str) -> dict:
     """Fold a sub-panel back into the piece it is a section OF.
 
@@ -2440,6 +2527,7 @@ def deterministic_repairs(parts: dict, all_ids: set, info: dict,
     parts = split_oversized_applied(parts, info, segdir)
     parts = strip_panels_from_applied(parts, info, segdir)
     parts = collapse_subpanels(parts, info, segdir)
+    parts = absorb_into_rib_trims(parts, info, segdir)
     # after collapse_subpanels, so the qualified sections are already home and
     # what is left under a bare "..._panel" is judged on size alone.
     parts = fold_texture_slivers(parts, info, segdir)

@@ -148,6 +148,7 @@ export function ViewerTaskPanel({
 export function PartsCanvas({ parts, visible }: { parts: PartInfo[]; visible: boolean[] }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const imagesRef = useRef<HTMLImageElement[]>([])
+  const soloRef = useRef<HTMLImageElement[]>([])
   const sizedRef = useRef(false)
 
   // Sizing the canvas BUFFER to the source image's full native resolution
@@ -190,6 +191,16 @@ export function PartsCanvas({ parts, visible }: { parts: PartInfo[]; visible: bo
       img.src = p.layer || p.image
       return img
     })
+    // A layer carries only the edges this part itself draws -- a seam owned by
+    // the neighbour is missing, which is right when they're stacked together
+    // but shows as gaps in the outline once that neighbour is hidden. The
+    // standalone export has the piece's own closed outline.
+    soloRef.current = parts.map((p) => {
+      const img = new Image()
+      img.onload = () => draw()
+      img.src = p.image
+      return img
+    })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [parts])
 
@@ -217,8 +228,11 @@ export function PartsCanvas({ parts, visible }: { parts: PartInfo[]; visible: bo
     ctx.imageSmoothingEnabled = true
     ctx.imageSmoothingQuality = "high"
     ctx.clearRect(0, 0, canvas.width, canvas.height)
+    const solo = visible.some((v) => !v)
     parts.forEach((_, i) => {
-      const img = imagesRef.current[i]
+      const stacked = imagesRef.current[i]
+      const own = soloRef.current[i]
+      const img = solo && own && own.complete && own.naturalWidth ? own : stacked
       if (visible[i] && img && img.complete && img.naturalWidth) ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
     })
   }

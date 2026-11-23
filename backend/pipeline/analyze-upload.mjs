@@ -13,11 +13,11 @@
 try { process.loadEnvFile(new URL('./.env', import.meta.url)) } catch {}
 import { screenImage } from './analyze.mjs'
 import {
-  DESIGNS, CATEGORY_TO_DESIGN, BODY_REGION,
+  DESIGNS, BODY_REGION,
   HOW_TO_MEASURE, defaultMeasurements, humanLabel,
 } from './designs.mjs'
 import { CUSTOM_MEASUREMENTS } from './extra-pieces.mjs'
-import { CATALOGUE_MATCH_MIN } from './catalogue.mjs'
+import { catalogueDesignFor } from './catalogue.mjs'
 
 function fail(message) {
   process.stdout.write(JSON.stringify({ error: message }) + '\n')
@@ -34,15 +34,14 @@ try {
   fail(`vision screen failed: ${e.message}`)
 }
 
-// A real garment with no catalogue design ("other") is drafted by AI from scratch
-// (extra-pieces.mjs draftCustomPieces) — it still needs body measurements.
-// Same catalogue-first rule as photo-draft.mjs, so the measurement fields asked for
-// here are the ones the draft will actually use.
-const m = screen.catalogueMatch
-const matched = m && m.design !== 'none' && DESIGNS[m.design] && m.similarity >= CATALOGUE_MATCH_MIN ? m.design : null
+// Same rule as photo-draft.mjs: a catalogue pattern only when vision says the garment
+// IS that catalogue garment (sameGarment); every other real garment is drafted by AI
+// from scratch (extra-pieces.mjs draftCustomPieces) and still needs body measurements.
+// So the measurement fields asked for here are the ones the draft will actually use.
+const matched = catalogueDesignFor(screen.catalogueMatch)
 const isGarment = screen.imageKind !== 'not_a_garment' && screen.garmentCategory !== 'unsupported'
-const isCustom = isGarment && (m ? !matched : screen.garmentCategory === 'other')
-const design = isCustom ? 'custom' : matched || CATEGORY_TO_DESIGN[screen.garmentCategory] || null
+const isCustom = isGarment && !(matched && DESIGNS[matched])
+const design = isCustom ? 'custom' : isGarment ? matched : null
 const entry = isCustom
   ? { label: 'Custom AI draft (not in pattern catalogue)', Design: { patternConfig: { measurements: CUSTOM_MEASUREMENTS } } }
   : design ? DESIGNS[design] : null

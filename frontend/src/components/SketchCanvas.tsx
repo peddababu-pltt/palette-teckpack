@@ -3,6 +3,7 @@ import { usePluginTranslations } from "@palettelab/sdk"
 import { STRINGS } from "../strings"
 
 type Tool = "pencil" | "marker" | "brush" | "eraser" | "pan" | "select"
+type Floating = { canvas: HTMLCanvasElement; url: string; x: number; y: number; w: number; h: number }
 
 // Each drawing tool is the same stroke engine with a different character:
 // how wide it runs for a given stroke size, how opaque it lays down, and
@@ -83,6 +84,98 @@ export default function SketchCanvas({
   const lastMidRef = useRef<{ x: number; y: number } | null>(null)
   const [marquee, setMarquee] = useState<{ x: number; y: number; w: number; h: number } | null>(null)
   const marqueeStartRef = useRef<{ x: number; y: number } | null>(null)
+  // Select tool: a marquee LIFTS that region off the page into a floating piece
+  // you can drag elsewhere; Delete/Backspace throws it away (erasing the region),
+  // Enter/Esc, a click outside it or switching tools drops it back onto the page.
+  const [floating, setFloatingState] = useState<Floating | null>(null)
+  const floatingRef = useRef<Floating | null>(null)
+  const dragRef = useRef<{ start: { x: number; y: number }; ox: number; oy: number } | null>(null)
+  const [overFloating, setOverFloating] = useState(false)
+  // Pan tool: the page is moved (and wheel-zoomed) as a view transform -- the
+  // bitmap itself never changes, and pointFromCoords reads the transformed rect,
+  // so drawing still lands under the cursor at any pan/zoom.
+  const [view, setView] = useState({ x: 0, y: 0, zoom: 1 })
+  const viewRef = useRef(view)
+  viewRef.current = view
+  const panStartRef = useRef<{ cx: number; cy: number; vx: number; vy: number } | null>(null)
+  const [panning, setPanning] = useState(false)
+  const wrapRef = useRef<HTMLDivElement | null>(null)
+  const stageRef = useRef<HTMLDivElement | null>(null)
+
+  function setFloating(f: Floating | null) {
+    floatingRef.current = f
+    setFloatingState(f)
+  }
+
+  // Drops the floating selection back onto the page where it now sits.
+  function commitFloating() {
+    const f = floatingRef.current
+    if (!f) return
+    const ctx = canvasRef.current?.getContext("2d")
+    if (ctx) {
+      ctx.globalAlpha = 1
+      ctx.globalCompositeOperation = "source-over"
+      ctx.drawImage(f.canvas, Math.round(f.x), Math.round(f.y))
+    }
+    setFloating(null)
+  }
+
+  // Lifts a marquee region off the page: copies it out, whitens where it was.
+  function liftSelection(r: { x: number; y: number; w: number; h: number }) {
+    const canvas = canvasRef.current
+    const ctx = canvas?.getContext("2d")
+    if (!canvas || !ctx) return
+    const x = Math.max(0, Math.floor(r.x)), y = Math.max(0, Math.floor(r.y))
+    const w = Math.min(canvas.width, Math.ceil(r.x + r.w)) - x
+    const h = Math.min(canvas.height, Math.ceil(r.y + r.h)) - y
+    if (w < 2 || h < 2) return
+    pushUndo()
+    const piece = document.createElement("canvas")
+    piece.width = w
+    piece.height = h
+    piece.getContext("2d")?.drawImage(canvas, x, y, w, h, 0, 0, w, h)
+    ctx.globalAlpha = 1
+    ctx.globalCompositeOperation = "source-over"
+    ctx.fillStyle = "#FFFFFF"
+    ctx.fillRect(x, y, w, h)
+    setFloating({ canvas: piece, url: piece.toDataURL("image/png"), x, y, w, h })
+  }
+
+  function pickTool(next: Tool) {
+    commitFloating()
+    setTool(next)
+  }
+
+  function insideFloating(p: { x: number; y: number }) {
+    const f = floatingRef.current
+    return !!f && p.x >= f.x && p.x <= f.x + f.w && p.y >= f.y && p.y <= f.y + f.h
+  }
+
+  // Wheel zooms around the cursor. Registered by hand because React's onWheel is
+  // passive and can't stop the page from scrolling.
+  useEffect(() => {
+    const wrap = wrapRef.current
+    if (!wrap) return
+    function onWheel(e: WheelEvent) {
+      const stage = stageRef.current
+      if (!stage) return
+      e.preventDefault()
+      const v = viewRef.current
+      const zoom = Math.min(4, Math.max(0.5, v.zoom * Math.exp(-e.deltaY * 0.0015)))
+      if (zoom === v.zoom) return
+      const r = stage.getBoundingClientRect()
+      // untransformed centre of the stage (scale is about the centre)
+      const c0x = r.left + r.width / 2 - v.x, c0y = r.top + r.height / 2 - v.y
+      const k = zoom / v.zoom
+      setView({
+        zoom,
+        x: e.clientX - c0x - (e.clientX - c0x - v.x) * k,
+        y: e.clientY - c0y - (e.clientY - c0y - v.y) * k,
+      })
+    }
+    wrap.addEventListener("wheel", onWheel, { passive: false })
+    return () => wrap.removeEventListener("wheel", onWheel)
+  }, [])
 
   // Load the starting bitmap once on mount: the previously-saved drawing if
   // there is one, otherwise a blank white page.
@@ -102,6 +195,18 @@ export default function SketchCanvas({
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
+      if (floatingRef.current) {
+        if (e.key === "Delete" || e.key === "Backspace") {
+          e.preventDefault()
+          setFloating(null) // the region was already whitened when it was lifted
+          return
+        }
+        if (e.key === "Escape" || e.key === "Enter") {
+          e.preventDefault()
+          commitFloating()
+          return
+        }
+      }
       if (e.key !== "Escape") return
       if (colorPopoverOpen) {
         setColorPopoverOpen(false)
@@ -141,6 +246,7 @@ export default function SketchCanvas({
   }
 
   async function undo() {
+    commitFloating()
     if (!undoStack.length) return
     const data = undoStack[undoStack.length - 1]
     const current = snapshot()
@@ -150,6 +256,7 @@ export default function SketchCanvas({
   }
 
   async function redo() {
+    commitFloating()
     if (!redoStack.length) return
     const data = redoStack[redoStack.length - 1]
     const current = snapshot()
@@ -159,6 +266,7 @@ export default function SketchCanvas({
   }
 
   function clearCanvas() {
+    commitFloating()
     pushUndo()
     const canvas = canvasRef.current
     const ctx = canvas?.getContext("2d")
@@ -204,12 +312,24 @@ export default function SketchCanvas({
   }
 
   function onPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
-    if (tool === "pan") return
     const canvas = canvasRef.current
     const ctx = canvas?.getContext("2d")
     if (!canvas || !ctx) return
+    if (tool === "pan") {
+      canvas.setPointerCapture?.(e.pointerId)
+      panStartRef.current = { cx: e.clientX, cy: e.clientY, vx: view.x, vy: view.y }
+      setPanning(true)
+      return
+    }
     const point = pointFromEvent(e)
     if (tool === "select") {
+      canvas.setPointerCapture?.(e.pointerId)
+      const f = floatingRef.current
+      if (f && insideFloating(point)) {
+        dragRef.current = { start: point, ox: f.x, oy: f.y }
+        return
+      }
+      commitFloating()
       marqueeStartRef.current = point
       setMarquee({ x: point.x, y: point.y, w: 0, h: 0 })
       return
@@ -256,7 +376,23 @@ export default function SketchCanvas({
   }
 
   function onPointerMove(e: React.PointerEvent<HTMLCanvasElement>) {
+    if (tool === "pan") {
+      const start = panStartRef.current
+      if (start) setView((v) => ({ ...v, x: start.vx + e.clientX - start.cx, y: start.vy + e.clientY - start.cy }))
+      return
+    }
     const point = pointFromEvent(e)
+    if (tool === "select" && dragRef.current) {
+      const d = dragRef.current
+      const f = floatingRef.current
+      if (f) setFloating({ ...f, x: d.ox + point.x - d.start.x, y: d.oy + point.y - d.start.y })
+      return
+    }
+    if (tool === "select" && !marqueeStartRef.current) {
+      const over = insideFloating(point)
+      if (over !== overFloating) setOverFloating(over)
+      return
+    }
     if (tool === "select" && marqueeStartRef.current) {
       const start = marqueeStartRef.current
       setMarquee({
@@ -267,7 +403,7 @@ export default function SketchCanvas({
       })
       return
     }
-    if (!drawingRef.current || tool === "pan") return
+    if (!drawingRef.current) return
     const canvas = canvasRef.current
     const ctx = canvas?.getContext("2d")
     if (!canvas || !ctx) return
@@ -285,6 +421,19 @@ export default function SketchCanvas({
   }
 
   function onPointerUp(e?: React.PointerEvent<HTMLCanvasElement>) {
+    const cap = canvasRef.current
+    if (tool === "pan" || tool === "select") {
+      if (cap && e && cap.hasPointerCapture?.(e.pointerId)) cap.releasePointerCapture(e.pointerId)
+    }
+    if (tool === "pan") {
+      panStartRef.current = null
+      setPanning(false)
+      return
+    }
+    if (tool === "select" && dragRef.current) {
+      dragRef.current = null
+      return
+    }
     // Smoothing lags the drawn point behind the pointer, so a stroke would end
     // a few px short of where you lifted. Close the gap before finishing.
     if (drawingRef.current && e && tool !== "eraser") {
@@ -299,15 +448,8 @@ export default function SketchCanvas({
         ctx.stroke()
       }
     }
-    if (tool === "select" && marquee) {
-      const canvas = canvasRef.current
-      const ctx = canvas?.getContext("2d")
-      if (canvas && ctx && marquee.w > 0 && marquee.h > 0) {
-        pushUndo()
-        ctx.globalAlpha = 1
-        ctx.fillStyle = "#FFFFFF"
-        ctx.fillRect(marquee.x, marquee.y, marquee.w, marquee.h)
-      }
+    if (tool === "select") {
+      if (marquee) liftSelection(marquee)
       marqueeStartRef.current = null
       setMarquee(null)
       return
@@ -329,6 +471,7 @@ export default function SketchCanvas({
   }
 
   function handleSelectSketch() {
+    commitFloating()
     const canvas = canvasRef.current
     if (!canvas) return
     canvas.toBlob((blob) => {
@@ -340,8 +483,16 @@ export default function SketchCanvas({
 
   const canvasEl = canvasRef.current
   const rect = canvasEl?.getBoundingClientRect()
+  // screen px per canvas px, zoom included (rect is the transformed size)
   const scaleX = rect ? rect.width / CANVAS_WIDTH : 1
-  const scaleY = rect ? rect.height / CANVAS_HEIGHT : 1
+  // Overlays sit inside the (transformed) stage, so place them in percentages of
+  // the page: they then follow pan and zoom with no maths of their own.
+  const pct = (r: { x: number; y: number; w: number; h: number }) => ({
+    left: `${(r.x / CANVAS_WIDTH) * 100}%`,
+    top: `${(r.y / CANVAS_HEIGHT) * 100}%`,
+    width: `${(r.w / CANVAS_WIDTH) * 100}%`,
+    height: `${(r.h / CANVAS_HEIGHT) * 100}%`,
+  })
 
   // The ring under the pointer is the eraser's actual footprint, in SCREEN px
   // (the canvas is 900px wide but drawn smaller, so its own units are not what
@@ -373,19 +524,26 @@ export default function SketchCanvas({
       </button>
 
       <div
+        ref={wrapRef}
         className="sketch-canvas-stage-wrap"
         onClick={(e) => {
           if (e.target === e.currentTarget) onClose()
         }}
       >
-        <div className="sketch-canvas-stage">
+        <div
+          ref={stageRef}
+          className="sketch-canvas-stage"
+          style={{ transform: `translate(${view.x}px, ${view.y}px) scale(${view.zoom})` }}
+        >
           <canvas
             ref={canvasRef}
             width={CANVAS_WIDTH}
             height={CANVAS_HEIGHT}
-            className={`sketch-canvas${tool === "pan" ? " pan" : ""}`}
+            className={`sketch-canvas${tool === "pan" ? (panning ? " panning" : " pan") : ""}`}
             style={
-              tool === "eraser"
+              tool === "select"
+                ? { cursor: overFloating || dragRef.current ? "move" : "crosshair" }
+                : tool === "eraser"
                 ? { cursor: eraserCursor }
                 : tool === "pencil"
                 ? { cursor: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 24 24'%3E%3Cpath d='M17 3a2.828 2.828 0 114 4L7.5 20.5 2 22l1.5-5.5L17 3z' fill='none' stroke='%23333' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") 2 18, crosshair` }
@@ -396,17 +554,12 @@ export default function SketchCanvas({
             onPointerUp={onPointerUp}
             onPointerCancel={onPointerUp}
           />
-          {marquee && (
-            <div
-              className="sketch-canvas-marquee"
-              style={{
-                left: marquee.x * scaleX,
-                top: marquee.y * scaleY,
-                width: marquee.w * scaleX,
-                height: marquee.h * scaleY,
-              }}
-            />
+          {floating && (
+            <div className="sketch-canvas-floating" style={pct(floating)}>
+              <img src={floating.url} alt="" draggable={false} />
+            </div>
           )}
+          {marquee && <div className="sketch-canvas-marquee" style={pct(marquee)} />}
         </div>
       </div>
 
@@ -415,7 +568,7 @@ export default function SketchCanvas({
           type="button"
           className={`sc-tool-btn${tool === "pencil" ? " active" : ""}`}
           title={t("sketchCanvas.pencil")}
-          onClick={() => setTool("pencil")}
+          onClick={() => pickTool("pencil")}
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <path d="M17 3a2.828 2.828 0 114 4L7.5 20.5 2 22l1.5-5.5L17 3z" />
@@ -425,7 +578,7 @@ export default function SketchCanvas({
           type="button"
           className={`sc-tool-btn${tool === "marker" ? " active" : ""}`}
           title={t("sketchCanvas.marker")}
-          onClick={() => setTool("marker")}
+          onClick={() => pickTool("marker")}
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <path d="M15 3l6 6-9.5 9.5H6l-1.5-4.5L15 3z" />
@@ -436,7 +589,7 @@ export default function SketchCanvas({
           type="button"
           className={`sc-tool-btn${tool === "brush" ? " active" : ""}`}
           title={t("sketchCanvas.brush")}
-          onClick={() => setTool("brush")}
+          onClick={() => pickTool("brush")}
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <path d="M9.5 14.5 20 4a2 2 0 00-3-3L6.5 11.5" />
@@ -447,7 +600,7 @@ export default function SketchCanvas({
           type="button"
           className={`sc-tool-btn${tool === "eraser" ? " active" : ""}`}
           title={t("sketchCanvas.eraser")}
-          onClick={() => setTool("eraser")}
+          onClick={() => pickTool("eraser")}
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <circle cx="12" cy="12" r="8" />
@@ -551,7 +704,9 @@ export default function SketchCanvas({
           type="button"
           className={`sc-tool-btn${tool === "pan" ? " active" : ""}`}
           title={t("sketchCanvas.pan")}
-          onClick={() => setTool("pan")}
+          onClick={() => pickTool("pan")}
+          // double-click the hand to put the page back: centred, 100%
+          onDoubleClick={() => setView({ x: 0, y: 0, zoom: 1 })}
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <path d="M18 11V6a2 2 0 00-4 0v5M14 10V4a2 2 0 00-4 0v7M10 10.5V6a2 2 0 00-4 0v9a7 7 0 0014 0v-3a2 2 0 00-4 0" />
@@ -561,7 +716,7 @@ export default function SketchCanvas({
           type="button"
           className={`sc-tool-btn${tool === "select" ? " active" : ""}`}
           title={t("sketchCanvas.select")}
-          onClick={() => setTool("select")}
+          onClick={() => pickTool("select")}
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeDasharray="4 3">
             <rect x="4" y="4" width="16" height="16" rx="1" />

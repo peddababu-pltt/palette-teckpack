@@ -17,28 +17,37 @@ design packages, pdf-lib, @resvg/resvg-js, @google/genai etc. from the repo
 root's node_modules, since Node's module resolution walks up from each
 script's own path regardless of where under the repo it lives.
 
-Job artifacts live on local disk under the repo root's existing `jobs/`
-directory (unchanged from app.py) rather than Palette Data Rooms: this pass
-targets local-dev (`pltt dev`) parity with static/index.html, not hosted
-multi-tenant storage. Every route app.py exposes is ported here, 1:1.
+Job state is not tied to one server. Ownership/sharing (Job), files (JobFile)
+and run progress/cancel (JobRun) are rows in this plugin's database
+(techpack_models.py), and the pipeline runs as a Palette durable job
+(run_pipeline) on whichever worker picks it up. The `jobs/` directory is only
+each server's cache of those files. So any server can list, serve, follow or
+cancel any job, and restarts lose nothing.
 """
 
 import asyncio
 import io
 import json
+import mimetypes
+import os
 import re
 import shutil
 import sys
+import time
 import uuid
 from collections import deque
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import Depends, File, Form, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from palette_sdk import PluginContext, PluginRouter, get_plugin_context, require_permission
+from fastapi import Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response
+from palette_sdk import JobExecution, PluginContext, PluginRouter, get_plugin_context, job, require_permission
 from PIL import Image
+from pydantic import BaseModel, Field
+from sqlalchemy import delete as sa_delete
+from sqlalchemy import select
 
 # backend/api/main.py -> backend/api -> backend -> palette-app
 PLUGIN_ROOT = Path(__file__).resolve().parents[2]
@@ -92,6 +101,10 @@ from _bootstrap_node import ensure_node, ensure_npm_packages  # noqa: E402
 sys.modules.pop("llm_bridge", None)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import llm_bridge  # noqa: E402
+
+# Not evicted like the modules above: re-executing a mapped SQLAlchemy class
+# re-registers its table on PluginBase.metadata and fails on hot reload.
+from techpack_models import Job, JobFile, JobRun  # noqa: E402
 
 NODE_PACKAGES = [
     "@freesewing/aaron@^4.10.0", "@freesewing/albert@^4.10.0", "@freesewing/ashley@^4.10.0",
@@ -156,19 +169,320 @@ def subprocess_env(ctx: PluginContext) -> dict:
     env.update(llm_bridge.env_for(ctx, llm_bridge.gateway_from(env)))
     return env
 
-JOB_QUEUES: dict[str, asyncio.Queue] = {}
-# Jobs whose generate pipeline (sketch -> redraw -> variations -> classify) is
-# still running. Parts SVG and the pattern must not start before it ends: they
-# trace effective_sketch(), and mid-run that is still the raw flat -- the redraw
-# (the "Default" image the job shows) lands a few seconds later, so the SVG and
-# pattern came out of a different image than the one on screen.
-GENERATING: set[str] = set()
-JOB_PROCS: dict[str, asyncio.subprocess.Process] = {}
-CANCELLED: set[str] = set()
+
+# --- Durable job state ---------------------------------------------------------
+# Nothing about a job lives only in one server's memory or on its disk:
+#   - files: techpack__job_files (JobFile). JOBS_DIR is a per-server cache that
+#     pull_files() fills from the database and push_files() writes back from;
+#   - runs: techpack__job_runs (JobRun) holds status, the event log the page
+#     polls (GET /jobs/{id}/run), and the cancel request;
+#   - the pipeline itself runs as a Palette durable job (RUN_HANDLER), on
+#     whichever worker picks it up, not as a subprocess of the request's server.
+# So a follow-up request that lands on another server, or after a restart,
+# finds the same files, progress and cancel flag.
+RUN_HANDLER = "techpack.run"
+RUN_ACTIVE = ("queued", "running")
+RUN_EVENTS_KEPT = 400
+# A running job's row is touched at least every FLUSH_EVERY seconds; a row this
+# old belongs to a worker that died or was timed out, and no longer blocks
+# a rerun or keeps the page waiting.
+RUN_STALE_AFTER = timedelta(seconds=150)
+FLUSH_EVERY = 1.0
+SYNC_SKIP_DIRS = {".thumbs", "__pycache__"}
+PUSH_BATCH_BYTES = 32 * 1024 * 1024
 
 
 def job_slot(job_id: str, stage: str | None) -> str:
     return f"{job_id}:{stage}" if stage else job_id
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+def _aware(dt: datetime | None) -> datetime | None:
+    # SQLite hands timezone-aware columns back naive
+    return dt.replace(tzinfo=UTC) if dt is not None and dt.tzinfo is None else dt
+
+
+def _version(mtime: float) -> float:
+    # Rounded so a cached copy (os.utime) reads back exactly the stored version.
+    return round(float(mtime), 3)
+
+
+async def _commit(ctx: PluginContext) -> None:
+    try:
+        await ctx.db.commit()
+    except Exception:
+        await ctx.db.rollback()
+        raise
+
+
+async def _fresh(ctx: PluginContext, model, row_id: str):
+    """The row as committed right now (not a copy cached in this session)."""
+    stmt = (select(model).where(model.id == row_id, model.organization_id == ctx.organization_id)
+            .execution_options(populate_existing=True))
+    return (await ctx.db.execute(stmt)).scalar_one_or_none()
+
+
+def run_is_active(run: JobRun | None) -> bool:
+    if run is None or run.status not in RUN_ACTIVE:
+        return False
+    return _utcnow() - _aware(run.updated_at) < RUN_STALE_AFTER
+
+
+async def get_run(ctx: PluginContext, slot: str) -> JobRun | None:
+    return await _fresh(ctx, JobRun, slot)
+
+
+async def is_generating(ctx: PluginContext, job_id: str) -> bool:
+    # The generate pipeline (sketch -> redraw -> variations -> classify) is still
+    # running. Parts SVG and the pattern must not start before it ends: they
+    # trace effective_sketch(), and mid-run that is still the raw flat.
+    run = await get_run(ctx, job_id)
+    return bool(run and run.generating and run_is_active(run))
+
+
+def _append_events(run: JobRun, items: list[str]) -> None:
+    if not items:
+        return
+    run.events = ((run.events or []) + items)[-RUN_EVENTS_KEPT:]
+    run.events_total = (run.events_total or 0) + len(items)
+
+
+async def start_run(ctx: PluginContext, job_id: str, stage: str | None, spec: dict, *,
+                    generating: bool = False) -> JobRun:
+    """(Re)start one pipeline slot of a job as a durable job. A slot that is
+    already running is returned as-is -- the page re-attaches to it after a
+    reload, and a second worker racing the first over the same output files
+    would corrupt them."""
+    slot = job_slot(job_id, stage)
+    run = await get_run(ctx, slot)
+    if run_is_active(run):
+        return run
+    now = _utcnow()
+    values = {
+        "job_id": job_id, "stage": stage or "", "run_id": uuid.uuid4().hex, "handle_id": None,
+        "status": "queued", "generating": generating, "cancel_requested": False,
+        "events": [], "events_total": 0, "error": None, "created_at": now, "updated_at": now,
+    }
+    if run is None:
+        run = JobRun(id=slot, organization_id=ctx.organization_id, **values)
+        ctx.db.add(run)
+    else:
+        for key, value in values.items():
+            setattr(run, key, value)
+    await _commit(ctx)
+    try:
+        handle = await ctx.jobs.enqueue(
+            RUN_HANDLER,
+            {"job_id": job_id, "slot": slot, "run_id": run.run_id, "spec": spec},
+            idempotency_key=f"{slot}:{run.run_id}",
+        )
+    except Exception as exc:  # no durable job service, or the platform refused
+        run.status = "error"
+        run.error = f"couldn't queue the job: {exc}"[:2000]
+        _append_events(run, [json.dumps({"event": "error", "message": run.error})])
+        await _commit(ctx)
+        return run
+    run.handle_id = handle.id
+    await _commit(ctx)
+    return run
+
+
+# --- Job files: database is the source, JOBS_DIR a cache --------------------------
+def _sync_skip(rel_parts: tuple[str, ...], name: str) -> bool:
+    return bool(SYNC_SKIP_DIRS.intersection(rel_parts)) or name.endswith(".part")
+
+
+def _local_files(job_dir: Path) -> dict[str, tuple[int, float]]:
+    out: dict[str, tuple[int, float]] = {}
+    if not job_dir.is_dir():
+        return out
+    for p in job_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(job_dir)
+        if _sync_skip(rel.parts, p.name):
+            continue
+        st = p.stat()
+        out[rel.as_posix()] = (st.st_size, _version(st.st_mtime))
+    return out
+
+
+async def _db_file_meta(ctx: PluginContext, job_ids: list[str]) -> dict[str, dict[str, tuple[int, float]]]:
+    out: dict[str, dict[str, tuple[int, float]]] = {j: {} for j in job_ids}
+    if not job_ids:
+        return out
+    stmt = select(JobFile.job_id, JobFile.path, JobFile.size, JobFile.mtime).where(
+        JobFile.organization_id == ctx.organization_id, JobFile.job_id.in_(job_ids))
+    for job_id, path, size, mtime in (await ctx.db.execute(stmt)).all():
+        out.setdefault(job_id, {})[path] = (size, _version(mtime))
+    return out
+
+
+def _safe_job_file(job_id: str, rel: str) -> Path | None:
+    """JOBS_DIR/<job_id>/<rel>, or None if rel climbs out of the job folder."""
+    job_dir = (JOBS_DIR / job_id).resolve()
+    target = (job_dir / rel).resolve()
+    if job_dir not in target.parents:
+        return None
+    return target
+
+
+def _write_cached(target: Path, data: bytes, mtime: float) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f"{target.name}.{uuid.uuid4().hex[:6]}.part")
+    tmp.write_bytes(data)
+    os.utime(tmp, (mtime, mtime))
+    tmp.replace(target)
+
+
+async def _fetch_into_cache(ctx: PluginContext, job_id: str, wanted: dict[str, float]) -> None:
+    ids = [f"{job_id}/{rel}" for rel in wanted]
+    for i in range(0, len(ids), 20):
+        stmt = select(JobFile.path, JobFile.content, JobFile.mtime).where(
+            JobFile.organization_id == ctx.organization_id, JobFile.id.in_(ids[i:i + 20]))
+        for rel, content, mtime in (await ctx.db.execute(stmt)).all():
+            target = _safe_job_file(job_id, rel)
+            if target is not None:
+                await asyncio.to_thread(_write_cached, target, content, _version(mtime))
+
+
+async def pull_files(ctx: PluginContext, job_id: str, only: list[str] | None = None) -> None:
+    """Bring this server's cached copy of the job up to date with the database."""
+    meta = (await _db_file_meta(ctx, [job_id]))[job_id]
+    local = _local_files(JOBS_DIR / job_id)
+    wanted = {rel: m[1] for rel, m in meta.items()
+              if (only is None or rel in only) and local.get(rel) != m}
+    if wanted:
+        await _fetch_into_cache(ctx, job_id, wanted)
+
+
+async def pull_one(ctx: PluginContext, job_id: str, rel: str) -> Path | None:
+    """One job file in this server's cache, fetched if missing or stale; None if
+    the job has no such file."""
+    target = _safe_job_file(job_id, rel)
+    if target is None:
+        return None
+    row = (await ctx.db.execute(select(JobFile.size, JobFile.mtime).where(
+        JobFile.organization_id == ctx.organization_id, JobFile.id == f"{job_id}/{rel}"))).first()
+    if row is None:
+        return None
+    size, mtime = row[0], _version(row[1])
+    try:
+        st = target.stat()
+        fresh = st.st_size == size and _version(st.st_mtime) == mtime
+    except OSError:
+        fresh = False
+    if not fresh:
+        await _fetch_into_cache(ctx, job_id, {rel: mtime})
+    return target if target.is_file() else None
+
+
+async def push_files(ctx: PluginContext, job_id: str, only: list[str] | None = None) -> None:
+    """Store every new or changed file of the job's local folder in the database."""
+    job_dir = JOBS_DIR / job_id
+    local = _local_files(job_dir)
+    stored = (await _db_file_meta(ctx, [job_id]))[job_id]
+    changed = [rel for rel, m in local.items() if (only is None or rel in only) and stored.get(rel) != m]
+    pending = 0
+    for rel in changed:
+        size, mtime = local[rel]
+        data = await asyncio.to_thread((job_dir / rel).read_bytes)
+        file_id = f"{job_id}/{rel}"
+        row = await _fresh(ctx, JobFile, file_id) if rel in stored else None
+        if row is None:
+            ctx.db.add(JobFile(
+                id=file_id, organization_id=ctx.organization_id, job_id=job_id, path=rel, content=data,
+                content_type=mimetypes.guess_type(rel)[0], size=len(data), mtime=mtime,
+            ))
+        else:
+            row.content, row.size, row.mtime = data, len(data), mtime
+        pending += len(data)
+        if pending >= PUSH_BATCH_BYTES:
+            await _commit(ctx)
+            pending = 0
+    if changed:
+        await _commit(ctx)
+
+
+async def delete_job_data(ctx: PluginContext, job_id: str) -> None:
+    for model in (JobFile, JobRun):
+        await ctx.db.execute(sa_delete(model).where(
+            model.organization_id == ctx.organization_id, model.job_id == job_id))
+    await ctx.db.execute(sa_delete(Job).where(Job.organization_id == ctx.organization_id, Job.id == job_id))
+    await _commit(ctx)
+
+
+class FileView:
+    """Which files a job has, and their versions, from the database or this
+    server's cache -- the job list and the stage-done payloads read this
+    instead of stat()-ing files that may not be on this server at all."""
+
+    def __init__(self, job_id: str, meta: dict[str, tuple[int, float]], json_files: dict[str, bytes]):
+        self.job_id = job_id
+        self.meta = meta
+        self._json = json_files
+
+    @classmethod
+    def local(cls, job_id: str) -> "FileView":
+        job_dir = JOBS_DIR / job_id
+        meta = _local_files(job_dir)
+        json_files = {rel: (job_dir / rel).read_bytes() for rel in LIST_JSON_FILES if rel in meta}
+        return cls(job_id, meta, json_files)
+
+    def is_file(self, rel: str) -> bool:
+        return rel in self.meta
+
+    def mtime(self, rel: str) -> float | None:
+        m = self.meta.get(rel)
+        return m[1] if m else None
+
+    def size(self, rel: str) -> int:
+        m = self.meta.get(rel)
+        return m[0] if m else 0
+
+    def json(self, rel: str):
+        raw = self._json.get(rel)
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return None
+
+    def names_in(self, folder: str, suffix: str) -> list[str]:
+        prefix = folder.rstrip("/") + "/"
+        return sorted(rel[len(prefix):] for rel in self.meta
+                      if rel.startswith(prefix) and "/" not in rel[len(prefix):] and rel.endswith(suffix))
+
+
+LIST_JSON_FILES = ("variations/manifest.json", "classification.json")
+
+
+async def db_views(ctx: PluginContext, job_ids: list[str]) -> dict[str, FileView]:
+    meta = await _db_file_meta(ctx, job_ids)
+    json_files: dict[str, dict[str, bytes]] = {j: {} for j in job_ids}
+    if job_ids:
+        stmt = select(JobFile.job_id, JobFile.path, JobFile.content).where(
+            JobFile.organization_id == ctx.organization_id, JobFile.job_id.in_(job_ids),
+            JobFile.path.in_(LIST_JSON_FILES))
+        for job_id, path, content in (await ctx.db.execute(stmt)).all():
+            json_files.setdefault(job_id, {})[path] = content
+    return {j: FileView(j, meta.get(j, {}), json_files.get(j, {})) for j in job_ids}
+
+
+async def db_view(ctx: PluginContext, job_id: str) -> FileView:
+    return (await db_views(ctx, [job_id]))[job_id]
+
+
+def _sketch_name(view: FileView) -> str:
+    """effective_sketch() by name, for a job whose files may not be on this server."""
+    for rel in ("sketch_regen.png", "flat_sketch_upscaled.png", "flat_sketch.png"):
+        if view.is_file(rel):
+            return rel
+    return "flat_sketch.png"
 
 
 def image_error(data: bytes) -> str | None:
@@ -222,6 +536,59 @@ def job_paths(job_id: str):
     }
 
 
+# --- Job access control -----------------------------------------------------
+# Every job has a row in techpack__jobs (techpack_models.Job): its organisation
+# (row-level security keeps other organisations' rows out of every query), the
+# user who created it, and who it is shared with. Every /jobs/{job_id}/* route
+# loads that row first and refuses with 404 -- never 403, so a probe can't tell
+# "exists but not yours" from "doesn't exist" -- when the caller is not the
+# owner, not a listed teammate, and the job isn't shared with the whole org.
+# Job folders created before this table existed have no row, so they stay on
+# disk untouched but are unreachable through the API.
+JOB_ID_RE = re.compile(r"[0-9a-f]{12}")
+
+
+def _job_not_found() -> HTTPException:
+    return HTTPException(status_code=404, detail="unknown job_id")
+
+
+def can_view(job: Job, ctx: PluginContext) -> bool:
+    return (
+        job.owner_user_id == ctx.user_id
+        or bool(job.shared_org)
+        or ctx.user_id in (job.shared_user_ids or [])
+    )
+
+
+def is_owner(job: Job, ctx: PluginContext) -> bool:
+    return job.owner_user_id == ctx.user_id
+
+
+async def create_job_row(ctx: PluginContext, job_id: str, kind: str) -> Job:
+    return await ctx.repo(Job).create(
+        id=job_id, owner_user_id=ctx.user_id, kind=kind, shared_org=False, shared_user_ids=[],
+    )
+
+
+async def authorize_job(ctx: PluginContext, job_id: str, *, owner_only: bool = False) -> Job:
+    """The caller's Job row for job_id, or 404. Also the only gate between a
+    caller-supplied job_id and JOBS_DIR / job_id, hence the strict format check."""
+    if not JOB_ID_RE.fullmatch(job_id or ""):
+        raise _job_not_found()
+    job = await ctx.repo(Job).get(job_id)
+    if job is None or not (is_owner(job, ctx) if owner_only else can_view(job, ctx)):
+        raise _job_not_found()
+    return job
+
+
+def _share_payload(job: Job) -> dict:
+    return {"org": bool(job.shared_org), "users": list(job.shared_user_ids or [])}
+
+
+def _new_job_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
 _DRAWING_CACHE: dict[tuple[str, float], bool] = {}
 
 
@@ -264,169 +631,414 @@ def effective_sketch(paths) -> Path:
     return paths["sketch"]
 
 
+
 class JobCancelled(Exception):
     pass
 
 
-async def stream_subprocess(cmd: list[str], cwd: Path, queue: asyncio.Queue, stage: str,
-                            slot: str | None = None, env: dict | None = None):
+class RunReporter:
+    """Writes a running job's events, heartbeat and cancel check to its JobRun
+    row -- at most every FLUSH_EVERY seconds, from the one coroutine that owns
+    this job's session (an AsyncSession isn't safe to share across tasks)."""
+
+    def __init__(self, ctx: PluginContext, run: JobRun, execution: JobExecution):
+        self.ctx = ctx
+        self.slot = run.id
+        self.run_id = run.run_id
+        self.execution = execution
+        self.pending: list[str] = []
+        self.last_flush = 0.0
+        self.cancel = False
+
+    def emit(self, item: str | dict) -> None:
+        self.pending.append(item if isinstance(item, str) else json.dumps(item))
+
+    async def flush(self, force: bool = False) -> JobRun | None:
+        now = time.monotonic()
+        if not force and now - self.last_flush < FLUSH_EVERY:
+            return None
+        self.last_flush = now
+        run = await _fresh(self.ctx, JobRun, self.slot)
+        if run is None or run.run_id != self.run_id:
+            # the job was deleted, or a newer run replaced this one
+            self.cancel = True
+            self.pending.clear()
+            return None
+        _append_events(run, self.pending)
+        self.pending = []
+        run.updated_at = _utcnow()
+        if run.cancel_requested:
+            self.cancel = True
+        await _commit(self.ctx)
+        try:
+            if await self.execution.cancelled():
+                self.cancel = True
+            await self.execution.heartbeat()
+        except Exception:
+            pass
+        return run
+
+    async def finish(self, status: str, error: str | None = None) -> None:
+        run = await self.flush(force=True)
+        if run is None:
+            return
+        run.status = status
+        run.error = error
+        run.updated_at = _utcnow()
+        await _commit(self.ctx)
+
+    async def wait(self, coro):
+        """Await coro while keeping the row's heartbeat and cancel check going."""
+        task = asyncio.ensure_future(coro)
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=FLUSH_EVERY)
+                if done:
+                    return task.result()
+                await self.flush()
+                if self.cancel:
+                    raise JobCancelled()
+        finally:
+            if not task.done():
+                task.cancel()
+
+
+async def run_command(cmd: list[str], stage: str, reporter: RunReporter, env: dict) -> None:
     proc = await asyncio.create_subprocess_exec(
-        *cmd, cwd=str(cwd), env=env if env is not None else SUBPROCESS_ENV,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+        *cmd, cwd=str(REPO_ROOT), env=env,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
-    if slot:
-        JOB_PROCS[slot] = proc
+    # Keep a tail of output, not just the last line — a failing subprocess
+    # is often itself wrapping a child subprocess (flat2svg_auto.py calling
+    # seg_parts.py), so the final line is a generic "CalledProcessError:
+    # exit status 1" while the real cause (e.g. a traceback's exception
+    # line) sits a dozen lines earlier and would otherwise be discarded.
+    tail: deque[str] = deque(maxlen=25)
+    read = None
     try:
-        # Keep a tail of output, not just the last line — a failing subprocess
-        # is often itself wrapping a child subprocess (flat2svg_auto.py calling
-        # seg_parts.py), so the final line is a generic "CalledProcessError:
-        # exit status 1" while the real cause (e.g. a traceback's exception
-        # line) sits a dozen lines earlier and would otherwise be discarded.
-        tail: deque[str] = deque(maxlen=25)
         while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            text = line.decode(errors="replace").rstrip()
-            if text:
-                tail.append(text)
-                await queue.put(f"[{stage}] {text}")
+            if read is None:
+                read = asyncio.ensure_future(proc.stdout.readline())
+            done, _ = await asyncio.wait({read}, timeout=FLUSH_EVERY)
+            if done:
+                line = read.result()
+                read = None
+                if not line:
+                    break
+                text = line.decode(errors="replace").rstrip()
+                if text:
+                    tail.append(text)
+                    reporter.emit(f"[{stage}] {text}")
+            await reporter.flush()
+            if reporter.cancel:
+                raise JobCancelled()
         code = await proc.wait()
     finally:
-        if slot:
-            JOB_PROCS.pop(slot, None)
-    if slot and slot in CANCELLED:
-        raise JobCancelled()
+        if read is not None and not read.done():
+            read.cancel()
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
     if code != 0:
         raise RuntimeError("\n".join(tail) if tail else f"{stage} exited {code}")
 
 
-async def run_multi_stage(slot: str, steps: list[tuple[str, list[str]]], on_success, env: dict | None = None,
-                          generating: bool = False):
-    queue = JOB_QUEUES[slot]
-    total = len(steps)
-    if generating:
-        GENERATING.add(slot)
+def _variation_args(spec: dict) -> list[str]:
+    args = []
+    mode = spec.get("mode") or "both"
+    if mode == "sketch":
+        args += ["--variants", str(int(spec.get("variants") or 2))]
+    else:
+        if spec.get("colors"):
+            args += ["--colors", ",".join(spec["colors"])]
+        if spec.get("season"):
+            args += ["--season", spec["season"]]
+    if spec.get("prompt"):
+        args += ["--prompt", spec["prompt"]]
+    return args
+
+
+def _reference_paths(paths) -> list[str]:
+    ref_dir = paths["variations_dir"] / "references"
+    return [str(p) for p in sorted(ref_dir.glob("ref_*.png"))[:5]] if ref_dir.is_dir() else []
+
+
+def _url(job_id: str, rel: str) -> str:
+    return _file_url(job_id, rel, FileView.local(job_id))
+
+
+def build_steps(job_id: str, spec: dict):
+    """The subprocess steps of one durable run, built on the worker against its
+    own cached copy of the job, plus the stage_done payload to send after."""
+    paths = job_paths(job_id)
+    kind = spec["kind"]
+    py = sys.executable
+
+    if kind == "stage1":
+        cmd = [py, str(PIPELINE_DIR / "warp_pattern.py"), str(paths["input"]), str(paths["sketch"])]
+        return ([("stage 1", cmd)],
+                lambda: {"event": "stage_done", "stage": 1, "file": _url(job_id, "flat_sketch.png")})
+
+    if kind == "measure_upload":
+        return ([("measure", [py, str(PIPELINE_DIR / "measure_garment.py"), str(paths["measure_input"]),
+                              str(paths["measure_out"]), "--size", spec.get("size") or "M"])],
+                lambda: {"event": "stage_done", "stage": "measure",
+                         "result": json.loads(paths["measure_out"].read_text())})
+
+    if kind == "generate":
+        refs = _reference_paths(paths)
+        var_cmd = [py, str(PIPELINE_DIR / "variations.py"), str(paths["regen_out"]),
+                   str(paths["variations_dir"])] + _variation_args(spec)
+        sketch_cmd = [py, str(PIPELINE_DIR / "warp_pattern.py"), str(paths["input"]), str(paths["sketch"])]
+        if refs:
+            var_cmd += ["--references", ",".join(refs)]
+            sketch_cmd += ["--references", ",".join(refs)]
+        var_cmd += ["--mode", spec.get("mode") or "both"]
+        steps = [
+            ("stage 1", sketch_cmd),
+            ("redraw", [py, str(PIPELINE_DIR / "regen_sketch.py"), str(paths["sketch"]), str(paths["regen_out"])]),
+            ("stage 2", var_cmd),
+            ("classify", [py, str(PIPELINE_DIR / "measure_garment.py"), str(paths["regen_out"]),
+                          str(paths["classification"]), "--size", "M"]),
+        ]
+
+        def on_success():
+            view = FileView.local(job_id)
+            return {
+                "event": "stage_done", "job_id": job_id,
+                "variations": _variations_response(job_id, view),
+                "references": _reference_images_response(job_id, view),
+                "classification": view.json("classification.json"),
+            }
+        return steps, on_success
+
+    if kind == "pattern_image":
+        sheet = paths["dir"] / "pattern-sheet.png"
+        steps = [
+            ("segment", [py, str(PIPELINE_DIR / "pattern_segment.py"), str(sheet), str(paths["dir"]),
+                         "--longest-cm", str(float(spec.get("longest_cm") or 70.0))]),
+            ("classify", ["node", str(PIPELINE_DIR / "pattern-image.mjs"), str(paths["dir"]),
+                          spec.get("size") or "M", str(sheet)]),
+        ]
+        return steps, lambda: {
+            "event": "stage_done", "job_id": job_id, "stage": "pattern-image",
+            "pattern_pieces": _url(job_id, "pattern-pieces.json"),
+            "design": _url(job_id, "pattern-design.json"),
+        }
+
+    if kind == "regen":
+        cmd = [py, str(PIPELINE_DIR / "regen_sketch.py"), str(paths["regen_input"]), str(paths["regen_out"])]
+        if spec.get("seed"):
+            cmd += ["--seed", spec["seed"]]
+        return [("regen", cmd)], lambda: {
+            "event": "stage_done", "stage": "regen", "job_id": job_id,
+            "file": _url(job_id, "sketch_regen.png"), "input": _url(job_id, "regen_input.png"),
+        }
+
+    if kind == "stage2":
+        cmd = [py, str(PIPELINE_DIR / "variations.py"), str(paths["sketch"]),
+               str(paths["variations_dir"])] + _variation_args(spec)
+        refs = _reference_paths(paths) if spec.get("use_refs") else []
+        if refs:
+            cmd += ["--references", ",".join(refs)]
+        cmd += ["--mode", spec.get("mode") or "both"]
+        return [("stage 2", cmd)], lambda: {
+            "event": "stage_done", "stage": 2, "variations": _variations_response(job_id, FileView.local(job_id)),
+        }
+
+    if kind == "redraw":
+        # Redraw from the raw stage-1 flat, not from effective_sketch() -- that
+        # resolves to the redraw itself, so redrawing twice would reconstruct a
+        # reconstruction and drift further from the photo each time.
+        source = paths["sketch"] if paths["sketch"].is_file() else effective_sketch(paths)
+        cmd = [py, str(PIPELINE_DIR / "regen_sketch.py"), str(source), str(paths["regen_out"])]
+        if spec.get("seed"):
+            cmd += ["--seed", spec["seed"]]
+        return [("redraw", cmd)], lambda: {
+            "event": "stage_done", "stage": "redraw",
+            "file": _url(job_id, "sketch_regen.png"), "input": _url(job_id, source.name),
+        }
+
+    if kind == "stage4":
+        return ([("stage 4", [py, str(PIPELINE_DIR / "flat2svg_auto.py"), str(effective_sketch(paths)),
+                              str(paths["parts_svg"])])],
+                lambda: {"event": "stage_done", "stage": 4, "file": _url(job_id, "parts.svg")})
+
+    if kind == "stage5":
+        cmd = ["node", str(PIPELINE_DIR / "photo-draft.mjs"), str(effective_sketch(paths))]
+        if paths["user_measurements"].is_file():
+            cmd.append(str(paths["user_measurements"]))
+        cmd.append(str(paths["pattern_svg"]))
+        # No cover-photo argument: the pattern pages' cover then shows the same
+        # clean flat the pattern was drafted from (photo-draft falls back to it).
+        return [("stage 5", cmd)], lambda: {
+            "event": "stage_done", "stage": 5,
+            "file": _url(job_id, "pattern.svg"),
+            "pages_file": _url(job_id, "pattern-pages.pdf"),
+            "pieces_file": _url(job_id, "pattern-pieces.json"),
+            "design_file": _url(job_id, "pattern-design.json"),
+        }
+
+    if kind == "garment3d":
+        sketch, photo = effective_sketch(paths), paths["input"]
+        cmd = [py, str(PIPELINE_DIR / "garment3d.py"), str(sketch if sketch.is_file() else photo),
+               str(paths["dir"]), "--colour", spec["colour"], "--desc", (spec.get("desc") or "")[:200],
+               "--region", spec.get("region") or "upper"]
+        if photo.is_file() and not input_is_drawing(photo):
+            cmd += ["--photo", str(photo)]
+        return [("garment3d", cmd)], lambda: {
+            "event": "stage_done", "stage": "garment3d",
+            "file": _url(job_id, "garment3d.glb"), "meta": _url(job_id, "garment3d.json"),
+        }
+
+    if kind == "job_measure":
+        source = paths["input"]
+        if not source.is_file() or input_is_drawing(source):
+            source = effective_sketch(paths)
+        return ([("measure", [py, str(PIPELINE_DIR / "measure_garment.py"), str(source),
+                              str(paths["measure_out"]), "--size", spec.get("size") or "M"])],
+                lambda: {"event": "stage_done", "stage": "measure",
+                         "result": json.loads(paths["measure_out"].read_text()),
+                         "file": _url(job_id, "measurements.json")})
+
+    if kind == "simulate":
+        blender = _blender_bin()
+        if not blender:
+            raise RuntimeError("Blender is not installed on the server running this job")
+        sim_in = paths["dir"] / "garment-sim-input.json"
+        cmd = [blender, "-b", "--factory-startup", "--python", str(PIPELINE_DIR / "blender_sim.py"), "--",
+               str(sim_in), str(paths["dir"] / "garment-sim.json"), str(paths["dir"] / "garment.glb")]
+        return ([("simulate", cmd)],
+                lambda: {"event": "stage_done", "stage": "simulate",
+                         "result": _url(job_id, "garment-sim.json"), "glb": _url(job_id, "garment.glb")})
+
+    raise ValueError(f"unknown run kind {kind!r}")
+
+
+async def _prepare_node(steps, reporter: RunReporter):
+    if not any(cmd and cmd[0] == "node" for _, cmd in steps):
+        return steps
+    reporter.emit(f"[{steps[0][0]}] preparing Node.js runtime and packages...")
+    await reporter.flush(force=True)
+    await reporter.wait(asyncio.to_thread(ensure_npm_packages, PIPELINE_DIR, NODE_PACKAGES))
+    node = await reporter.wait(asyncio.to_thread(ensure_node, PIPELINE_DIR))
+    return [(name, [node if c == "node" else c for c in cmd]) for name, cmd in steps]
+
+
+@job(RUN_HANDLER, timeout_seconds=7200, max_attempts=2)
+async def run_pipeline(ctx: PluginContext, execution: JobExecution, payload: dict) -> dict:
+    """One pipeline slot of one job, on whichever worker picks it up: fetch the
+    job's files from the database, run the steps, store the outputs back, and
+    keep the JobRun row (progress, log, cancel) current throughout. Expected
+    failures end the run as `error` on the row rather than raising -- a retry
+    would only redo paid model calls; the second attempt is for a worker that
+    died mid-run."""
+    job_id, slot, run_id = payload.get("job_id", ""), payload.get("slot", ""), payload.get("run_id", "")
+    spec = payload.get("spec") or {}
+    if not JOB_ID_RE.fullmatch(job_id or ""):
+        return {"skipped": True, "reason": "bad job id"}
+    run = await _fresh(ctx, JobRun, slot)
+    if run is None or run.run_id != run_id or run.status not in RUN_ACTIVE:
+        return {"skipped": True}
+    reporter = RunReporter(ctx, run, execution)
+    if run.cancel_requested:
+        reporter.emit({"event": "cancelled"})
+        await reporter.finish("cancelled")
+        return {"status": "cancelled"}
+    if await _fresh(ctx, Job, job_id) is None:
+        await reporter.finish("error", "this techpack was deleted")
+        return {"status": "error"}
+    run.status = "running"
+    run.updated_at = _utcnow()
+    await _commit(ctx)
+    if execution.attempt > 1:
+        reporter.emit(f"[{spec.get('kind', 'job')}] restarting after the previous worker stopped")
+
+    env = None
     try:
-        for i, (stage_name, cmd) in enumerate(steps):
-            await queue.put(json.dumps({
-                "event": "stage_progress", "stage": stage_name,
-                "completed": i, "total": total,
-                "percent": round(i / total * 100),
-            }))
-            await queue.put(f"[{stage_name}] starting")
-            await stream_subprocess(cmd, REPO_ROOT, queue, stage_name, slot, env)
-        await queue.put(json.dumps(on_success()))
-        await queue.put(json.dumps({"event": "done"}))
+        await reporter.wait(pull_files(ctx, job_id))
+        steps, on_success = build_steps(job_id, spec)
+        steps = await _prepare_node(steps, reporter)
+        env = subprocess_env(ctx)
+        total = len(steps)
+        for i, (name, cmd) in enumerate(steps):
+            reporter.emit({"event": "stage_progress", "stage": name, "completed": i, "total": total,
+                           "percent": round(i / total * 100)})
+            reporter.emit(f"[{name}] starting")
+            try:
+                await execution.progress(round(i / total * 100), name)
+            except Exception:
+                pass
+            await reporter.flush(force=True)
+            if reporter.cancel:
+                raise JobCancelled()
+            await run_command(cmd, name, reporter, env)
+        await push_files(ctx, job_id)
+        reporter.emit(on_success())
+        reporter.emit({"event": "done"})
+        await reporter.finish("done")
+        return {"status": "done"}
     except JobCancelled:
-        await queue.put(json.dumps({"event": "cancelled"}))
-    except Exception as e:
-        await queue.put(json.dumps({"event": "error", "message": str(e)}))
+        reporter.emit({"event": "cancelled"})
+        await reporter.finish("cancelled")
+        return {"status": "cancelled"}
+    except Exception as exc:
+        message = str(exc) or type(exc).__name__
+        reporter.emit({"event": "error", "message": message})
+        await reporter.finish("error", message[:4000])
+        return {"status": "error"}
     finally:
-        GENERATING.discard(slot)
-        CANCELLED.discard(slot)
         llm_bridge.release(env)
-        await queue.put("__END__")
 
 
-async def run_stage(slot: str, stage_name: str, cmd: list[str], on_success, env: dict | None = None):
-    await run_multi_stage(slot, [(stage_name, cmd)], on_success, env)
-
-
-async def run_node_stage(slot: str, stage_name: str, cmd: list[str], on_success, env: dict | None = None):
-    """Like run_stage, but for a cmd whose [0] is the literal string "node" --
-    bootstraps a real node binary + this stage's npm packages first (off-thread,
-    so it doesn't block the route that scheduled this as a background task),
-    reporting failure through the same queue/SSE contract instead of leaving
-    the listener hanging on a task that never signals it."""
-    queue = JOB_QUEUES[slot]
-    try:
-        await queue.put(json.dumps({
-            "event": "stage_progress", "stage": stage_name,
-            "completed": 0, "total": 1, "percent": 0,
-        }))
-        await queue.put(f"[{stage_name}] preparing Node.js runtime and packages...")
-        await asyncio.to_thread(ensure_npm_packages, PIPELINE_DIR, NODE_PACKAGES)
-        cmd[0] = ensure_node(PIPELINE_DIR)
-    except Exception as e:
-        llm_bridge.release(env)
-        await queue.put(json.dumps({"event": "error", "message": str(e)}))
-        await queue.put("__END__")
-        return
-    await run_stage(slot, stage_name, cmd, on_success, env)
-
-
-async def run_node_multi(slot: str, steps: list[tuple[str, list[str]]], on_success, env: dict | None = None):
-    """run_multi_stage for a mix of python + node steps: node is bootstrapped once first."""
-    queue = JOB_QUEUES[slot]
-    try:
-        await queue.put(f"[{steps[0][0]}] preparing Node.js runtime and packages...")
-        await asyncio.to_thread(ensure_npm_packages, PIPELINE_DIR, NODE_PACKAGES)
-        node = ensure_node(PIPELINE_DIR)
-        steps = [(name, [node if c == "node" else c for c in cmd]) for name, cmd in steps]
-    except Exception as e:
-        llm_bridge.release(env)
-        await queue.put(json.dumps({"event": "error", "message": str(e)}))
-        await queue.put("__END__")
-        return
-    await run_multi_stage(slot, steps, on_success, env)
-
-
-def _default_sketch_name(paths) -> str:
-    return effective_sketch(paths).name
-
-
-def _file_url(job_id: str, rel: str) -> str:
+def _file_url(job_id: str, rel: str, view: FileView | None = None) -> str:
     # Versioned by the file's own mtime: job files are rewritten in place
     # (redrafts, the white-background pass on realistic.png), and an <img>
-    # keeps showing whatever copy the browser cached under the bare URL --
-    # copies cached before job_file sent Cache-Control never revalidate.
+    # keeps showing whatever copy the browser cached under the bare URL.
+    # The version comes from the database (or this server's cache, which
+    # carries the same mtime), so every server hands out the same URL.
     url = f"/api/v1/plugins/techpack/jobs/{job_id}/file/{rel}"
-    try:
-        return f"{url}?v={int((JOBS_DIR / job_id / rel).stat().st_mtime)}"
-    except OSError:
-        return url
+    mtime = (view or FileView.local(job_id)).mtime(rel)
+    return f"{url}?v={int(mtime)}" if mtime is not None else url
 
 
-def _variations_response(job_id: str, paths) -> list[dict]:
-    manifest_path = paths["variations_dir"] / "manifest.json"
-    manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else []
+def _variations_response(job_id: str, view: FileView) -> list[dict]:
+    manifest = view.json("variations/manifest.json") or []
     variations = [{
         "id": "default", "label": "Default",
-        "sketch": _file_url(job_id, _default_sketch_name(paths)),
+        "sketch": _file_url(job_id, _sketch_name(view), view),
         "realistic": None,
     }]
     for v in manifest:
         variations.append({
             "id": v["id"], "label": v["label"],
-            "sketch": _file_url(job_id, f"variations/{v['sketch']}") if v.get("sketch") else None,
-            "realistic": _file_url(job_id, f"variations/{v['realistic']}") if v.get("realistic") else None,
+            "sketch": _file_url(job_id, f"variations/{v['sketch']}", view) if v.get("sketch") else None,
+            "realistic": _file_url(job_id, f"variations/{v['realistic']}", view) if v.get("realistic") else None,
         })
     return variations
 
 
-def _outputs_response(job_id: str, paths) -> dict:
-    def url(key: str, name: str) -> str | None:
-        return _file_url(job_id, name) if paths[key].is_file() else None
+def _outputs_response(job_id: str, view: FileView) -> dict:
+    def url(name: str) -> str | None:
+        return _file_url(job_id, name, view) if view.is_file(name) else None
 
-    measurements = url("measure_out", "measurements.json") or url("classification", "classification.json")
     return {
-        "parts_svg": url("parts_svg", "parts.svg"),
-        "pattern_svg": url("pattern_svg", "pattern.svg"),
-        "pattern_pages": url("pattern_pages_pdf", "pattern-pages.pdf"),
-        "design": url("pattern_design", "pattern-design.json"),
-        "pattern_pieces": url("pattern_pieces_json", "pattern-pieces.json"),
-        "measurements": measurements,
-        "redraw": url("regen_out", "sketch_regen.png"),
+        "parts_svg": url("parts.svg"),
+        "pattern_svg": url("pattern.svg"),
+        "pattern_pages": url("pattern-pages.pdf"),
+        "design": url("pattern-design.json"),
+        "pattern_pieces": url("pattern-pieces.json"),
+        "measurements": url("measurements.json") or url("classification.json"),
+        "redraw": url("sketch_regen.png"),
     }
 
 
-def _reference_images_response(job_id: str, paths) -> list[str]:
-    ref_dir = paths["variations_dir"] / "references"
-    if not ref_dir.is_dir():
-        return []
-    return [_file_url(job_id, f"variations/references/{p.name}") for p in sorted(ref_dir.glob("*.png"))]
+def _reference_images_response(job_id: str, view: FileView) -> list[str]:
+    return [_file_url(job_id, f"variations/references/{name}", view)
+            for name in view.names_in("variations/references", ".png")]
 
 
 @router.get("/health")
@@ -479,6 +1091,18 @@ async def vton_asset(name: str) -> Response:
     return FileResponse(str(path), media_type=VTON_TYPES[path.suffix], headers={"Cache-Control": "public, max-age=86400"})
 
 
+def _ok(body: dict | None = None) -> Response:
+    return Response(content=json.dumps(body or {"ok": True}), media_type="application/json")
+
+
+async def _new_job(ctx: PluginContext, kind: str, job_id: str | None = None) -> tuple[str, dict]:
+    job_id = job_id or _new_job_id()
+    await create_job_row(ctx, job_id, kind)
+    paths = job_paths(job_id)
+    paths["dir"].mkdir(parents=True, exist_ok=True)
+    return job_id, paths
+
+
 @router.post("/run", dependencies=[require_permission("resources:write")])
 async def run(photo: UploadFile = File(...), ctx: PluginContext = Depends(get_plugin_context)) -> Response:
     if not photo.filename:
@@ -487,20 +1111,169 @@ async def run(photo: UploadFile = File(...), ctx: PluginContext = Depends(get_pl
     err = image_error(data)
     if err:
         return JSONResponse({"error": f"photo {err}"}, status_code=400)
-
-    job_id = uuid.uuid4().hex[:12]
-    paths = job_paths(job_id)
-    paths["dir"].mkdir(parents=True)
+    job_id, paths = await _new_job(ctx, "run")
     paths["input"].write_bytes(data)
+    await push_files(ctx, job_id)
+    await start_run(ctx, job_id, None, {"kind": "stage1"})
+    return _ok({"job_id": job_id})
 
-    JOB_QUEUES[job_id] = asyncio.Queue()
-    asyncio.create_task(run_stage(
-        job_id, "stage 1",
-        [sys.executable, str(PIPELINE_DIR / "warp_pattern.py"), str(paths["input"]), str(paths["sketch"])],
-        lambda: {"event": "stage_done", "stage": 1, "file": _file_url(job_id, "flat_sketch.png")},
-        subprocess_env(ctx),
-    ))
-    return Response(content=json.dumps({"job_id": job_id}), media_type="application/json")
+
+@router.post("/measure", dependencies=[require_permission("resources:write")])
+async def measure(
+    photo: UploadFile = File(...), size: str = Form(...), ctx: PluginContext = Depends(get_plugin_context)
+) -> Response:
+    if not photo.filename:
+        return JSONResponse({"error": "no photo uploaded"}, status_code=400)
+    data = await photo.read()
+    err = image_error(data)
+    if err:
+        return JSONResponse({"error": f"photo {err}"}, status_code=400)
+    job_id, paths = await _new_job(ctx, "measure")
+    paths["measure_input"].write_bytes(data)
+    await push_files(ctx, job_id)
+    await start_run(ctx, job_id, None, {"kind": "measure_upload", "size": size})
+    return _ok({"job_id": job_id})
+
+
+async def _save_references(references: list[UploadFile], paths) -> str | None:
+    """Writes up to 5 reference uploads as variations/references/ref_N.png;
+    returns an error message for a bad one."""
+    named = [r for r in references if r.filename]
+    if not named:
+        return None
+    ref_dir = paths["variations_dir"] / "references"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    for old in ref_dir.glob("ref_*.png"):
+        old.unlink()
+    for i, ref in enumerate(named[:5]):
+        rdata = await ref.read()
+        rerr = image_error(rdata)
+        if rerr:
+            return f"reference image {rerr}"
+        save_reference_png(rdata, ref_dir / f"ref_{i + 1}.png")
+    return None
+
+
+@router.post("/jobs/generate", dependencies=[require_permission("resources:write")])
+async def generate(
+    photo: UploadFile = File(...),
+    mode: str = Form("both"),
+    variants: int = Form(2),
+    colors: list[str] = Form([]),
+    season: str = Form(""),
+    prompt: str = Form(""),
+    measurements: str = Form(""),
+    references: list[UploadFile] = File([]),
+    request_id: str = Form(""),
+    ctx: PluginContext = Depends(get_plugin_context),
+) -> Response:
+    # One Generate click = one techpack. The browser sends the same request_id
+    # on its retry after a gateway 502/503/504 -- and that gateway error can
+    # come back AFTER this route already created the job (it uploads the files
+    # and queues the run before answering), so the retry used to create a
+    # second techpack from the same input. The id becomes the job id; a repeat
+    # of it returns the job that already exists.
+    request_id = request_id.strip().lower()
+    if not JOB_ID_RE.fullmatch(request_id):
+        request_id = ""
+    if request_id:
+        existing = await ctx.repo(Job).get(request_id)
+        if existing is not None:
+            if is_owner(existing, ctx):
+                return _ok({"job_id": request_id, "duplicate": True})
+            request_id = ""  # someone else's id (never in practice): mint a fresh one
+    if not photo.filename:
+        return JSONResponse({"error": "no image uploaded"}, status_code=400)
+    data = await photo.read()
+    err = image_error(data)
+    if err:
+        return JSONResponse({"error": f"image {err}"}, status_code=400)
+
+    user_measurements = None
+    if measurements.strip():
+        try:
+            parsed = json.loads(measurements)
+        except ValueError:
+            return JSONResponse({"error": "measurements is not valid JSON"}, status_code=400)
+        if not isinstance(parsed, dict):
+            return JSONResponse({"error": "measurements must be an object"}, status_code=400)
+        numeric = {k: v for k, v in parsed.items() if isinstance(v, (int, float))}
+        if numeric:
+            user_measurements = {"measurements": numeric}
+
+    job_id, paths = await _new_job(ctx, "generate", request_id or None)
+    paths["input"].write_bytes(data)
+    if user_measurements:
+        paths["user_measurements"].write_text(json.dumps(user_measurements, indent=2))
+    ref_err = await _save_references(references, paths)
+    if ref_err:
+        return JSONResponse({"error": ref_err}, status_code=400)
+    await push_files(ctx, job_id)
+    await start_run(ctx, job_id, None, {
+        "kind": "generate", "mode": mode, "variants": variants, "colors": colors,
+        "season": season, "prompt": prompt,
+    }, generating=True)
+    return _ok({"job_id": job_id})
+
+
+@router.post("/jobs/pattern-image", dependencies=[require_permission("resources:write")])
+async def pattern_image(
+    image: UploadFile = File(...),
+    longest_cm: float = Form(70.0),
+    size: str = Form("M"),
+    ctx: PluginContext = Depends(get_plugin_context),
+) -> Response:
+    """An image of sewing-pattern pieces -> a job with pattern-pieces.json (segmented +
+    classified) and pattern-design.json, ready for the 3D garment workspace."""
+    data = await image.read()
+    err = image_error(data)
+    if err:
+        return JSONResponse({"error": f"image {err}"}, status_code=400)
+    if not (5 <= longest_cm <= 300):
+        return JSONResponse({"error": "longest_cm must be between 5 and 300"}, status_code=400)
+    size = size.strip().upper()
+    if size not in PATTERN_SIZES:
+        size = "M"
+    job_id, paths = await _new_job(ctx, "pattern-image")
+    save_reference_png(data, paths["dir"] / "pattern-sheet.png")
+    await push_files(ctx, job_id)
+    await start_run(ctx, job_id, None, {"kind": "pattern_image", "longest_cm": longest_cm, "size": size})
+    return _ok({"job_id": job_id})
+
+
+@router.post("/jobs/new-with-sketch", dependencies=[require_permission("resources:write")])
+async def new_with_sketch(
+    sketch: UploadFile = File(...), ctx: PluginContext = Depends(get_plugin_context)
+) -> Response:
+    if not sketch.filename:
+        return JSONResponse({"error": "no sketch uploaded"}, status_code=400)
+    data = await sketch.read()
+    err = image_error(data)
+    if err:
+        return JSONResponse({"error": f"sketch {err}"}, status_code=400)
+    job_id, paths = await _new_job(ctx, "new-with-sketch")
+    paths["sketch"].write_bytes(data)
+    await push_files(ctx, job_id)
+    return _ok({"job_id": job_id})
+
+
+@router.post("/jobs/regen", dependencies=[require_permission("resources:write")])
+async def regen(
+    sketch: UploadFile = File(...), seed: str = Form(""), ctx: PluginContext = Depends(get_plugin_context)
+) -> Response:
+    """Single-stage: low-quality technical flat -> clean vector-style flat,
+    reconstructed by regen_sketch.py (router image-edit alias = nano-banana)."""
+    if not sketch.filename:
+        return JSONResponse({"error": "no sketch uploaded"}, status_code=400)
+    data = await sketch.read()
+    err = image_error(data)
+    if err:
+        return JSONResponse({"error": f"sketch {err}"}, status_code=400)
+    job_id, paths = await _new_job(ctx, "regen")
+    paths["regen_input"].write_bytes(data)
+    await push_files(ctx, job_id)
+    await start_run(ctx, job_id, None, {"kind": "regen", "seed": seed.strip()})
+    return _ok({"job_id": job_id})
 
 
 @router.post("/analyze", dependencies=[require_permission("resources:write")])
@@ -549,294 +1322,181 @@ async def analyze(image: UploadFile = File(...), ctx: PluginContext = Depends(ge
         return JSONResponse({"error": "analysis returned malformed JSON"}, status_code=502)
 
 
-@router.post("/measure", dependencies=[require_permission("resources:write")])
-async def measure(
-    photo: UploadFile = File(...), size: str = Form(...), ctx: PluginContext = Depends(get_plugin_context)
-) -> Response:
-    if not photo.filename:
-        return JSONResponse({"error": "no photo uploaded"}, status_code=400)
-    data = await photo.read()
-    err = image_error(data)
-    if err:
-        return JSONResponse({"error": f"photo {err}"}, status_code=400)
-
-    job_id = uuid.uuid4().hex[:12]
-    paths = job_paths(job_id)
-    paths["dir"].mkdir(parents=True)
-    paths["measure_input"].write_bytes(data)
-
-    def on_success():
-        result = json.loads(paths["measure_out"].read_text())
-        return {"event": "stage_done", "stage": "measure", "result": result}
-
-    JOB_QUEUES[job_id] = asyncio.Queue()
-    asyncio.create_task(run_stage(
-        job_id, "measure",
-        [sys.executable, str(PIPELINE_DIR / "measure_garment.py"),
-         str(paths["measure_input"]), str(paths["measure_out"]), "--size", size],
-        on_success,
-        subprocess_env(ctx),
-    ))
-    return Response(content=json.dumps({"job_id": job_id}), media_type="application/json")
-
-
-@router.post("/jobs/generate", dependencies=[require_permission("resources:write")])
-async def generate(
-    photo: UploadFile = File(...),
-    mode: str = Form("both"),
-    variants: int = Form(2),
-    colors: list[str] = Form([]),
-    season: str = Form(""),
-    prompt: str = Form(""),
-    measurements: str = Form(""),
-    references: list[UploadFile] = File([]),
-    ctx: PluginContext = Depends(get_plugin_context),
-) -> Response:
-    if not photo.filename:
-        return JSONResponse({"error": "no image uploaded"}, status_code=400)
-    data = await photo.read()
-    err = image_error(data)
-    if err:
-        return JSONResponse({"error": f"image {err}"}, status_code=400)
-
-    user_measurements = None
-    if measurements.strip():
-        try:
-            parsed = json.loads(measurements)
-        except ValueError:
-            return JSONResponse({"error": "measurements is not valid JSON"}, status_code=400)
-        if not isinstance(parsed, dict):
-            return JSONResponse({"error": "measurements must be an object"}, status_code=400)
-        numeric = {k: v for k, v in parsed.items() if isinstance(v, (int, float))}
-        if numeric:
-            user_measurements = {"measurements": numeric}
-
-    job_id = uuid.uuid4().hex[:12]
-    paths = job_paths(job_id)
-    paths["dir"].mkdir(parents=True)
-    paths["input"].write_bytes(data)
-    if user_measurements:
-        paths["user_measurements"].write_text(json.dumps(user_measurements, indent=2))
-
-    ref_paths = []
-    named_refs = [r for r in references if r.filename]
-    if named_refs:
-        ref_dir = paths["variations_dir"] / "references"
-        ref_dir.mkdir(parents=True, exist_ok=True)
-        for i, ref in enumerate(named_refs[:5]):
-            rdata = await ref.read()
-            rerr = image_error(rdata)
-            if rerr:
-                return JSONResponse({"error": f"reference image {rerr}"}, status_code=400)
-            p = ref_dir / f"ref_{i + 1}.png"
-            save_reference_png(rdata, p)
-            ref_paths.append(str(p))
-
-    var_cmd = [sys.executable, str(PIPELINE_DIR / "variations.py"),
-               str(paths["regen_out"]), str(paths["variations_dir"])]
-    if mode == "sketch":
-        var_cmd += ["--variants", str(variants)]
-    else:
-        if colors:
-            var_cmd += ["--colors", ",".join(colors)]
-        if season:
-            var_cmd += ["--season", season]
-    if prompt:
-        var_cmd += ["--prompt", prompt]
-    if ref_paths:
-        var_cmd += ["--references", ",".join(ref_paths)]
-    var_cmd += ["--mode", mode]
-
-    sketch_cmd = [sys.executable, str(PIPELINE_DIR / "warp_pattern.py"), str(paths["input"]), str(paths["sketch"])]
-    if ref_paths:
-        sketch_cmd += ["--references", ",".join(ref_paths)]
-
-    steps = [
-        ("stage 1", sketch_cmd),
-        ("redraw", [sys.executable, str(PIPELINE_DIR / "regen_sketch.py"),
-                    str(paths["sketch"]), str(paths["regen_out"])]),
-    ]
-    steps.append(("stage 2", var_cmd))
-    steps.append(("classify", [sys.executable, str(PIPELINE_DIR / "measure_garment.py"),
-                               str(paths["regen_out"]), str(paths["classification"]), "--size", "M"]))
-
-    def on_success():
-        classification = (
-            json.loads(paths["classification"].read_text()) if paths["classification"].is_file() else None
-        )
-        return {
-            "event": "stage_done", "job_id": job_id,
-            "variations": _variations_response(job_id, paths),
-            "references": _reference_images_response(job_id, paths),
-            "classification": classification,
-        }
-
-    JOB_QUEUES[job_id] = asyncio.Queue()
-    GENERATING.add(job_id)  # before the task starts: a list refresh can land first
-    asyncio.create_task(run_multi_stage(job_id, steps, on_success, subprocess_env(ctx), generating=True))
-    return Response(content=json.dumps({"job_id": job_id}), media_type="application/json")
-
-
-@router.post("/jobs/pattern-image", dependencies=[require_permission("resources:write")])
-async def pattern_image(
-    image: UploadFile = File(...),
-    longest_cm: float = Form(70.0),
-    size: str = Form("M"),
-    ctx: PluginContext = Depends(get_plugin_context),
-) -> Response:
-    """An image of sewing-pattern pieces -> a job with pattern-pieces.json (segmented +
-    classified) and pattern-design.json, ready for the 3D garment workspace."""
-    data = await image.read()
-    err = image_error(data)
-    if err:
-        return JSONResponse({"error": f"image {err}"}, status_code=400)
-    if not (5 <= longest_cm <= 300):
-        return JSONResponse({"error": "longest_cm must be between 5 and 300"}, status_code=400)
-    size = size.strip().upper()
-    if size not in PATTERN_SIZES:
-        size = "M"
-    job_id = uuid.uuid4().hex[:12]
-    paths = job_paths(job_id)
-    paths["dir"].mkdir(parents=True)
-    sheet = paths["dir"] / "pattern-sheet.png"
-    save_reference_png(data, sheet)
-
-    def on_success():
-        return {
-            "event": "stage_done", "job_id": job_id, "stage": "pattern-image",
-            "pattern_pieces": _file_url(job_id, "pattern-pieces.json"),
-            "design": _file_url(job_id, "pattern-design.json"),
-        }
-
-    steps = [
-        ("segment", [sys.executable, str(PIPELINE_DIR / "pattern_segment.py"), str(sheet), str(paths["dir"]),
-                     "--longest-cm", str(longest_cm)]),
-        ("classify", ["node", str(PIPELINE_DIR / "pattern-image.mjs"), str(paths["dir"]), size, str(sheet)]),
-    ]
-    JOB_QUEUES[job_id] = asyncio.Queue()
-    asyncio.create_task(run_node_multi(job_id, steps, on_success, subprocess_env(ctx)))
-    return Response(content=json.dumps({"job_id": job_id}), media_type="application/json")
-
-
-@router.post("/jobs/new-with-sketch", dependencies=[require_permission("resources:write")])
-async def new_with_sketch(sketch: UploadFile = File(...)) -> Response:
-    if not sketch.filename:
-        return JSONResponse({"error": "no sketch uploaded"}, status_code=400)
-    data = await sketch.read()
-    err = image_error(data)
-    if err:
-        return JSONResponse({"error": f"sketch {err}"}, status_code=400)
-
-    job_id = uuid.uuid4().hex[:12]
-    paths = job_paths(job_id)
-    paths["dir"].mkdir(parents=True)
-    paths["sketch"].write_bytes(data)
-    return Response(content=json.dumps({"job_id": job_id}), media_type="application/json")
-
-
-@router.post("/jobs/regen", dependencies=[require_permission("resources:write")])
-async def regen(
-    sketch: UploadFile = File(...), seed: str = Form(""), ctx: PluginContext = Depends(get_plugin_context)
-) -> Response:
-    """Single-stage: low-quality technical flat -> clean vector-style flat,
-    reconstructed by regen_sketch.py (router image-edit alias = nano-banana)."""
-    if not sketch.filename:
-        return JSONResponse({"error": "no sketch uploaded"}, status_code=400)
-    data = await sketch.read()
-    err = image_error(data)
-    if err:
-        return JSONResponse({"error": f"sketch {err}"}, status_code=400)
-
-    job_id = uuid.uuid4().hex[:12]
-    paths = job_paths(job_id)
-    paths["dir"].mkdir(parents=True)
-    paths["regen_input"].write_bytes(data)
-
-    cmd = [sys.executable, str(PIPELINE_DIR / "regen_sketch.py"),
-           str(paths["regen_input"]), str(paths["regen_out"])]
-    if seed.strip():
-        cmd += ["--seed", seed.strip()]
-
-    JOB_QUEUES[job_id] = asyncio.Queue()
-    asyncio.create_task(run_stage(
-        job_id, "regen", cmd,
-        lambda: {
-            "event": "stage_done", "stage": "regen", "job_id": job_id,
-            "file": _file_url(job_id, "sketch_regen.png"),
-            "input": _file_url(job_id, "regen_input.png"),
-        },
-        subprocess_env(ctx),
-    ))
-    return Response(content=json.dumps({"job_id": job_id}), media_type="application/json")
-
-
 @router.get("/jobs/list", dependencies=[require_permission("resources:read")])
-async def jobs_list() -> Response:
+async def jobs_list(ctx: PluginContext = Depends(get_plugin_context)) -> Response:
+    # Built from the caller's visible Job rows and the database's file list,
+    # never from JOBS_DIR: that folder is one server's cache, shared by every
+    # organisation on it.
+    repo = ctx.repo(Job)
+    rows = {r.id: r for r in await repo.list(filters={"owner_user_id": ctx.user_id},
+                                              order_by="-created_at", limit=500)}
+    for r in await repo.list(order_by="-created_at", limit=500):
+        if r.id not in rows and can_view(r, ctx):
+            rows[r.id] = r
+    ids = [j for j in rows if JOB_ID_RE.fullmatch(j)]
+    views = await db_views(ctx, ids)
+    generating = set()
+    if ids:
+        stmt = select(JobRun).where(JobRun.organization_id == ctx.organization_id, JobRun.job_id.in_(ids),
+                                    JobRun.generating.is_(True))
+        generating = {r.job_id for r in (await ctx.db.execute(stmt)).scalars() if run_is_active(r)}
     jobs = []
-    for job_dir in JOBS_DIR.iterdir():
-        if not job_dir.is_dir():
-            continue
-        job_id = job_dir.name
-        paths = job_paths(job_id)
-        if paths["sketch"].is_file():
-            display_name = _default_sketch_name(paths)
-        elif paths["regen_out"].is_file():
+    for job_id in ids:
+        row, view = rows[job_id], views[job_id]
+        has_sketch = view.is_file("flat_sketch.png")
+        if has_sketch:
+            display_name = _sketch_name(view)
+        elif view.is_file("sketch_regen.png"):
             display_name = "sketch_regen.png"
         else:
             continue
-        display = job_dir / display_name
-        # The dashboard card shows the clean redraw the SVG and pattern are built
-        # from (not the raw upload). Variations stay inside the job page.
-        card = display
-        classification_path = job_dir / "classification.json"
-        classification = json.loads(classification_path.read_text()) if classification_path.is_file() else None
+        owner = is_owner(row, ctx)
         jobs.append({
             "job_id": job_id,
-            "sketch": _file_url(job_id, display_name),
-            "thumb": (f"/api/v1/plugins/techpack/jobs/{job_id}/thumb/{card.name}"
-                      f"?v={int(card.stat().st_mtime)}"),
-            "input": _file_url(job_id, "input.jpg") if paths["input"].is_file() else None,
-            "size_kb": round(display.stat().st_size / 1024, 1),
-            "mtime": display.stat().st_mtime,
-            "classification": classification,
-            "has_sketch": paths["sketch"].is_file(),
-            "generating": job_id in GENERATING,
-            "variations": _variations_response(job_id, paths) if paths["sketch"].is_file() else [],
-            "references": _reference_images_response(job_id, paths),
-            "outputs": _outputs_response(job_id, paths),
+            "sketch": _file_url(job_id, display_name, view),
+            # The dashboard card shows the clean redraw the SVG and pattern are
+            # built from (not the raw upload). Variations stay inside the job page.
+            "thumb": (f"/api/v1/plugins/techpack/jobs/{job_id}/thumb/{display_name}"
+                      f"?v={int(view.mtime(display_name))}"),
+            "input": _file_url(job_id, "input.jpg", view) if view.is_file("input.jpg") else None,
+            "size_kb": round(view.size(display_name) / 1024, 1),
+            "mtime": view.mtime(display_name),
+            "classification": view.json("classification.json"),
+            "has_sketch": has_sketch,
+            "generating": job_id in generating,
+            "variations": _variations_response(job_id, view) if has_sketch else [],
+            "references": _reference_images_response(job_id, view),
+            "outputs": _outputs_response(job_id, view),
+            "owner": owner,
+            # who else can see it -- only the owner is told
+            "shared": _share_payload(row) if owner else None,
         })
     jobs.sort(key=lambda j: j["mtime"], reverse=True)
-    return Response(content=json.dumps({"jobs": jobs[:50]}), media_type="application/json")
+    return _ok({"jobs": jobs[:50]})
+
+
+@router.get("/jobs/{job_id}/run", dependencies=[require_permission("resources:read")])
+async def job_run_status(
+    job_id: str, stage: str | None = None, after: int = 0, ctx: PluginContext = Depends(get_plugin_context)
+) -> Response:
+    """A run's state and its events after the first `after` -- what the page
+    polls in place of the old per-server SSE stream. Events are the same
+    strings that stream carried: a JSON event (stage_progress, stage_done,
+    error, cancelled, done) or a "[stage] log line"."""
+    await authorize_job(ctx, job_id)
+    run = await get_run(ctx, job_slot(job_id, stage))
+    if run is None:
+        return JSONResponse({"error": "unknown job_id"}, status_code=404)
+    first = (run.events_total or 0) - len(run.events or [])
+    events = (run.events or [])[max(0, after - first):]
+    status, error = run.status, run.error
+    if status in RUN_ACTIVE and not run_is_active(run):
+        status = "error"
+        error = "the job stopped responding (its worker restarted or timed out) -- run it again"
+        events = events + [json.dumps({"event": "error", "message": error})]
+    return _ok({"status": status, "total": run.events_total or 0, "events": events, "error": error})
 
 
 @router.post("/jobs/{job_id}/cancel", dependencies=[require_permission("resources:write")])
-async def cancel_job(job_id: str, stage: str | None = None) -> Response:
-    slot = job_slot(job_id, stage)
-    proc = JOB_PROCS.get(slot)
-    if proc is None:
+async def cancel_job(
+    job_id: str, stage: str | None = None, ctx: PluginContext = Depends(get_plugin_context)
+) -> Response:
+    await authorize_job(ctx, job_id)
+    run = await get_run(ctx, job_slot(job_id, stage))
+    if not run_is_active(run):
         return JSONResponse({"error": "no running stage for this job"}, status_code=404)
-    CANCELLED.add(slot)
-    try:
-        proc.kill()
-    except ProcessLookupError:
-        pass
-    return Response(content=json.dumps({"cancelled": job_id}), media_type="application/json")
+    # Recorded on the row, so it reaches the worker wherever it runs; the worker
+    # checks it every second and kills its subprocess.
+    run.cancel_requested = True
+    await _commit(ctx)
+    if run.handle_id:
+        try:
+            await ctx.jobs.cancel(run.handle_id)
+        except Exception:
+            pass
+    return _ok({"cancelled": job_id})
 
 
 @router.delete("/jobs/{job_id}", dependencies=[require_permission("resources:write")])
-async def delete_job(job_id: str) -> Response:
-    job_dir = (JOBS_DIR / job_id).resolve()
-    if JOBS_DIR.resolve() not in job_dir.parents or not job_dir.is_dir():
-        return JSONResponse({"error": "unknown job_id"}, status_code=404)
+async def delete_job(job_id: str, ctx: PluginContext = Depends(get_plugin_context)) -> Response:
+    await authorize_job(ctx, job_id, owner_only=True)
+    stmt = select(JobRun).where(JobRun.organization_id == ctx.organization_id, JobRun.job_id == job_id)
+    for r in (await ctx.db.execute(stmt)).scalars():
+        if run_is_active(r) and r.handle_id:
+            try:
+                await ctx.jobs.cancel(r.handle_id)
+            except Exception:
+                pass
+    # Deleting the rows also stops a running worker: its next check finds no run.
+    await delete_job_data(ctx, job_id)
+    shutil.rmtree(JOBS_DIR / job_id, ignore_errors=True)
+    return _ok()
+
+
+class ShareIn(BaseModel):
+    users: list[str] = Field(default_factory=list, max_length=200)
+    org: bool = False
+
+
+def _member_entry(m) -> dict | None:
+    if not isinstance(m, dict):
+        return None
+    uid = m.get("user_id") or m.get("id")
+    if uid is None:
+        return None
+    return {"id": str(uid), "name": m.get("name") or m.get("full_name") or m.get("display_name"),
+            "email": m.get("email")}
+
+
+async def _org_members(ctx: PluginContext) -> list[dict] | None:
+    """This organisation's members, or None where the runtime has no member
+    service (pltt dev) or the grant is missing."""
     try:
-        shutil.rmtree(job_dir)
-    except OSError:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        if job_dir.is_dir():
-            return JSONResponse({"error": "delete failed, try again"}, status_code=500)
-    for key in [job_id] + [k for k in JOB_QUEUES if k.startswith(f"{job_id}:")]:
-        JOB_QUEUES.pop(key, None)
-    return Response(content=json.dumps({"ok": True}), media_type="application/json")
+        raw = await ctx.members.list()
+    except (RuntimeError, PermissionError):
+        return None
+    return [e for e in (_member_entry(m) for m in raw or []) if e]
+
+
+@router.get("/members", dependencies=[require_permission("resources:read")])
+async def list_members(ctx: PluginContext = Depends(get_plugin_context)) -> Response:
+    """Teammates a job can be shared with (everyone in the org except the caller)."""
+    members = await _org_members(ctx)
+    if members is None:
+        return JSONResponse({"available": False, "members": []})
+    return JSONResponse({"available": True, "members": [m for m in members if m["id"] != ctx.user_id]})
+
+
+@router.get("/jobs/{job_id}/share", dependencies=[require_permission("resources:read")])
+async def get_share(job_id: str, ctx: PluginContext = Depends(get_plugin_context)) -> Response:
+    job = await authorize_job(ctx, job_id, owner_only=True)
+    return JSONResponse(_share_payload(job))
+
+
+@router.put("/jobs/{job_id}/share", dependencies=[require_permission("resources:write")])
+async def set_share(job_id: str, body: ShareIn, ctx: PluginContext = Depends(get_plugin_context)) -> Response:
+    """Owner only: replaces who the job is shared with -- chosen teammates,
+    the whole organisation, or both. Only members of the caller's own
+    organisation can be added."""
+    await authorize_job(ctx, job_id, owner_only=True)
+    users = list(dict.fromkeys(u.strip() for u in body.users if u and u.strip() and u.strip() != ctx.user_id))
+    if users:
+        members = await _org_members(ctx)
+        # No member service on this runtime: the ids came from the platform's own
+        # member list in the browser. They're kept as given -- every job row is
+        # scoped to this organisation, so an id from outside it never matches anyone.
+        known = {m["id"] for m in members} if members is not None else set(users)
+        unknown = [u for u in users if u not in known]
+        if unknown:
+            return JSONResponse({"error": "not a member of this organisation", "users": unknown},
+                                status_code=400)
+    job = await ctx.repo(Job).update(job_id, shared_user_ids=users, shared_org=bool(body.org))
+    return JSONResponse(_share_payload(job))
+
+
+def _generating_conflict() -> Response:
+    return JSONResponse({"error": "still generating this techpack's sketch -- try again when it finishes",
+                         "generating": True}, status_code=409)
 
 
 @router.post("/jobs/{job_id}/stage2", dependencies=[require_permission("resources:write")])
@@ -850,45 +1510,22 @@ async def stage2(
     references: list[UploadFile] = File([]),
     ctx: PluginContext = Depends(get_plugin_context),
 ) -> Response:
-    paths = job_paths(job_id)
-    if not paths["sketch"].is_file():
+    await authorize_job(ctx, job_id)
+    if not (await db_view(ctx, job_id)).is_file("flat_sketch.png"):
         return JSONResponse({"error": "stage 1 output missing — run stage 1 first"}, status_code=400)
-
-    ref_paths = []
-    named_refs = [r for r in references if r.filename]
-    if named_refs:
-        ref_dir = paths["variations_dir"] / "references"
-        ref_dir.mkdir(parents=True, exist_ok=True)
-        for i, ref in enumerate(named_refs[:5]):
-            data = await ref.read()
-            err = image_error(data)
-            if err:
-                return JSONResponse({"error": f"reference image {err}"}, status_code=400)
-            p = ref_dir / f"ref_{i + 1}.png"
-            save_reference_png(data, p)
-            ref_paths.append(str(p))
-
-    def on_success():
-        return {"event": "stage_done", "stage": 2, "variations": _variations_response(job_id, paths)}
-
-    cmd = [sys.executable, str(PIPELINE_DIR / "variations.py"), str(paths["sketch"]), str(paths["variations_dir"])]
-    if mode == "sketch":
-        cmd += ["--variants", str(variants)]
-    else:
-        if colors:
-            cmd += ["--colors", ",".join(colors)]
-        if season:
-            cmd += ["--season", season]
-    if prompt:
-        cmd += ["--prompt", prompt]
-    if ref_paths:
-        cmd += ["--references", ",".join(ref_paths)]
-    cmd += ["--mode", mode]
-
-    slot = job_slot(job_id, "stage2")
-    JOB_QUEUES[slot] = asyncio.Queue()
-    asyncio.create_task(run_stage(slot, "stage 2", cmd, on_success, subprocess_env(ctx)))
-    return Response(content=json.dumps({"ok": True}), media_type="application/json")
+    paths = job_paths(job_id)
+    paths["dir"].mkdir(parents=True, exist_ok=True)
+    use_refs = any(r.filename for r in references)
+    ref_err = await _save_references(references, paths)
+    if ref_err:
+        return JSONResponse({"error": ref_err}, status_code=400)
+    if use_refs:
+        await push_files(ctx, job_id)
+    await start_run(ctx, job_id, "stage2", {
+        "kind": "stage2", "mode": mode, "variants": variants, "colors": colors, "season": season,
+        "prompt": prompt, "use_refs": use_refs,
+    })
+    return _ok()
 
 
 # Stage 3 (warp_pattern.py --upscale-only) is gone: the generate pipeline chains
@@ -903,60 +1540,25 @@ async def job_redraw(
 ) -> Response:
     """Redraw this card's flat: same regen_sketch.py pass as an uploaded
     redraw, but reading the sketch already in the job instead of an upload."""
-    paths = job_paths(job_id)
-    # Redraw from the raw stage-1 flat, not from effective_sketch() -- that now
-    # resolves to the redraw itself, so redrawing twice would reconstruct a
-    # reconstruction and drift further from the photo each time.
-    source = paths["sketch"] if paths["sketch"].is_file() else effective_sketch(paths)
-    if not source.is_file():
+    await authorize_job(ctx, job_id)
+    view = await db_view(ctx, job_id)
+    if not any(view.is_file(n) for n in ("flat_sketch.png", "flat_sketch_upscaled.png", "sketch_regen.png")):
         return JSONResponse({"error": "this job has no sketch to redraw"}, status_code=400)
-
-    cmd = [sys.executable, str(PIPELINE_DIR / "regen_sketch.py"), str(source), str(paths["regen_out"])]
-    if seed.strip():
-        cmd += ["--seed", seed.strip()]
-
-    slot = job_slot(job_id, "redraw")
-    JOB_QUEUES[slot] = asyncio.Queue()
-    asyncio.create_task(run_stage(
-        slot, "redraw", cmd,
-        lambda: {
-            "event": "stage_done", "stage": "redraw",
-            "file": _file_url(job_id, "sketch_regen.png"),
-            "input": _file_url(job_id, source.name),
-        },
-        subprocess_env(ctx),
-    ))
-    return Response(content=json.dumps({"ok": True}), media_type="application/json")
+    await start_run(ctx, job_id, "redraw", {"kind": "redraw", "seed": seed.strip()})
+    return _ok()
 
 
 @router.post("/jobs/{job_id}/stage4", dependencies=[require_permission("resources:write")])
 async def stage4(job_id: str, ctx: PluginContext = Depends(get_plugin_context)) -> Response:
-    paths = job_paths(job_id)
-    if job_id in GENERATING:
-        return JSONResponse({"error": "still generating this techpack's sketch -- try again when it finishes",
-                             "generating": True}, status_code=409)
-    if not paths["sketch"].is_file():
+    await authorize_job(ctx, job_id)
+    if await is_generating(ctx, job_id):
+        return _generating_conflict()
+    if not (await db_view(ctx, job_id)).is_file("flat_sketch.png"):
         return JSONResponse({"error": "stage 1 output missing — run stage 1 first"}, status_code=400)
-
-    def on_success():
-        return {"event": "stage_done", "stage": 4, "file": _file_url(job_id, "parts.svg")}
-
-    slot = job_slot(job_id, "stage4")
-    # The frontend re-attaches to whatever's already running for a job after
-    # a page reload (its in-memory live-stage tracking doesn't survive one) --
-    # without this check, that re-attach would start a SECOND subprocess
-    # racing the first one over the same parts.svg output file.
-    if slot in JOB_PROCS:
-        return Response(content=json.dumps({"ok": True}), media_type="application/json")
-    JOB_QUEUES[slot] = asyncio.Queue()
-    asyncio.create_task(run_stage(
-        slot, "stage 4",
-        [sys.executable, str(PIPELINE_DIR / "flat2svg_auto.py"),
-         str(effective_sketch(paths)), str(paths["parts_svg"])],
-        on_success,
-        subprocess_env(ctx),
-    ))
-    return Response(content=json.dumps({"ok": True}), media_type="application/json")
+    # Already running: start_run hands back that run, so the page re-attaching
+    # after a reload doesn't start a second one racing it over parts.svg.
+    await start_run(ctx, job_id, "stage4", {"kind": "stage4"})
+    return _ok()
 
 
 PATTERN_SIZES = {"XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL"}
@@ -972,11 +1574,10 @@ async def stage5(
     """Drafts (or redrafts) the sewing pattern. `size` + `measurements` come from the
     pattern tab's size/measurement editor: when either is sent, they replace the
     job's user-measurements.json so the redraft uses exactly what's on screen."""
-    paths = job_paths(job_id)
-    if job_id in GENERATING:
-        return JSONResponse({"error": "still generating this techpack's sketch -- try again when it finishes",
-                             "generating": True}, status_code=409)
-    if not paths["sketch"].is_file():
+    await authorize_job(ctx, job_id)
+    if await is_generating(ctx, job_id):
+        return _generating_conflict()
+    if not (await db_view(ctx, job_id)).is_file("flat_sketch.png"):
         return JSONResponse({"error": "stage 1 output missing — run stage 1 first"}, status_code=400)
 
     size = size.strip().upper()
@@ -999,36 +1600,13 @@ async def stage5(
         if size:
             payload["size"] = size
         # A redraft must not race a draft still reading the old file.
-        if job_slot(job_id, "stage5") not in JOB_PROCS:
+        if not run_is_active(await get_run(ctx, job_slot(job_id, "stage5"))):
+            paths = job_paths(job_id)
+            paths["dir"].mkdir(parents=True, exist_ok=True)
             paths["user_measurements"].write_text(json.dumps(payload, indent=2))
-
-    cmd = ["node", str(PIPELINE_DIR / "photo-draft.mjs"), str(effective_sketch(paths))]
-    if paths["user_measurements"].is_file():
-        cmd.append(str(paths["user_measurements"]))
-    cmd.append(str(paths["pattern_svg"]))
-    # No cover-photo argument: the pattern pages' cover then shows the same clean
-    # flat the pattern was drafted from (photo-draft falls back to it), not the
-    # raw upload -- a rough hand drawing on the cover read as the deliverable.
-
-    slot = job_slot(job_id, "stage5")
-    # See the matching check in stage4() above: without it, a post-reload
-    # re-attach would race a second subprocess against an already-running one
-    # over the same pattern.svg/pattern-pages.pdf output files.
-    if slot in JOB_PROCS:
-        return Response(content=json.dumps({"ok": True}), media_type="application/json")
-    JOB_QUEUES[slot] = asyncio.Queue()
-    asyncio.create_task(run_node_stage(
-        slot, "stage 5", cmd,
-        lambda: {
-            "event": "stage_done", "stage": 5,
-            "file": _file_url(job_id, "pattern.svg"),
-            "pages_file": _file_url(job_id, "pattern-pages.pdf"),
-            "pieces_file": _file_url(job_id, "pattern-pieces.json"),
-            "design_file": _file_url(job_id, "pattern-design.json"),
-        },
-        subprocess_env(ctx),
-    ))
-    return Response(content=json.dumps({"ok": True}), media_type="application/json")
+            await push_files(ctx, job_id, only=["user-measurements.json"])
+    await start_run(ctx, job_id, "stage5", {"kind": "stage5"})
+    return _ok()
 
 
 DATA_ROOM_NAME = "Techpack"
@@ -1038,14 +1616,13 @@ DATA_ROOM_NAME = "Techpack"
 async def save_to_dataroom(job_id: str, ctx: PluginContext = Depends(get_plugin_context)) -> Response:
     """Copies the job's big deliverables -- the pattern pages PDF and the 3D
     garment -- into the organisation's "Techpack" Data Room, one folder per job,
-    where users find them as documents and they outlive the job folder on the
-    hosted machine's local disk. The frontend calls it right after a pattern
-    draft or a 3D build finishes: this needs a live request's ctx (a background
-    stage's would be gone by then). Files already there are left alone, and a
-    runtime without the Data Room service (pltt dev) just reports skipped."""
+    where users find them as documents. The frontend calls it right after a
+    pattern draft or a 3D build finishes. Files already there are left alone,
+    and a runtime without the Data Room service (pltt dev) just reports skipped."""
+    await authorize_job(ctx, job_id)
     paths = job_paths(job_id)
-    if not paths["dir"].is_dir():
-        return JSONResponse({"error": "unknown job_id"}, status_code=404)
+    await pull_files(ctx, job_id, only=["pattern-pages.pdf", "garment3d.glb", "pattern-design.json",
+                                        "classification.json"])
     rooms = getattr(ctx, "data_rooms", None)
     design = {}
     try:
@@ -1090,68 +1667,33 @@ async def garment3d(
     sketch) laid out in a T-pose by nano-banana, front + back, and reconstructed
     into a GLB by three.ws Forge (garment3d.py). The photos are uploaded to
     three.ws for this."""
-    paths = job_paths(job_id)
-    sketch = effective_sketch(paths)
-    photo = paths["input"]
-    if not photo.is_file() and not sketch.is_file():
+    await authorize_job(ctx, job_id)
+    view = await db_view(ctx, job_id)
+    if not view.is_file("input.jpg") and not view.is_file(_sketch_name(view)):
         return JSONResponse({"error": "this techpack has no input image yet"}, status_code=400)
     if not re.fullmatch(r"#[0-9a-fA-F]{6}", colour):
         return JSONResponse({"error": "colour must be #rrggbb"}, status_code=400)
     if region not in ("upper", "lower"):
         return JSONResponse({"error": "region must be upper or lower"}, status_code=400)
-    slot = job_slot(job_id, "garment3d")
-    if slot in JOB_PROCS:
-        return Response(content=json.dumps({"ok": True}), media_type="application/json")
-    cmd = [sys.executable, str(PIPELINE_DIR / "garment3d.py"), str(sketch if sketch.is_file() else photo),
-           str(paths["dir"]), "--colour", colour, "--desc", desc[:200], "--region", region]
-    if photo.is_file() and not input_is_drawing(photo):
-        cmd += ["--photo", str(photo)]
-    JOB_QUEUES[slot] = asyncio.Queue()
-    asyncio.create_task(run_stage(
-        slot, "garment3d", cmd,
-        lambda: {
-            "event": "stage_done", "stage": "garment3d",
-            "file": _file_url(job_id, "garment3d.glb"),
-            "meta": _file_url(job_id, "garment3d.json"),
-        },
-        subprocess_env(ctx),
-    ))
-    return Response(content=json.dumps({"ok": True}), media_type="application/json")
+    await start_run(ctx, job_id, "garment3d", {"kind": "garment3d", "colour": colour, "desc": desc[:200],
+                                               "region": region})
+    return _ok()
 
 
 @router.post("/jobs/{job_id}/measure", dependencies=[require_permission("resources:write")])
 async def job_measure(
     job_id: str, size: str = Form("M"), ctx: PluginContext = Depends(get_plugin_context)
 ) -> Response:
-    paths = job_paths(job_id)
-    source = paths["input"]
-    if not source.is_file() or input_is_drawing(source):
-        source = effective_sketch(paths)
-    if not source.is_file():
+    await authorize_job(ctx, job_id)
+    view = await db_view(ctx, job_id)
+    if not view.is_file("input.jpg") and not view.is_file(_sketch_name(view)):
         return JSONResponse({"error": "this job has no image to measure"}, status_code=400)
-
-    def on_success():
-        return {
-            "event": "stage_done", "stage": "measure",
-            "result": json.loads(paths["measure_out"].read_text()),
-            "file": _file_url(job_id, "measurements.json"),
-        }
-
-    slot = job_slot(job_id, "measure")
-    JOB_QUEUES[slot] = asyncio.Queue()
-    asyncio.create_task(run_stage(
-        slot, "measure",
-        [sys.executable, str(PIPELINE_DIR / "measure_garment.py"),
-         str(source), str(paths["measure_out"]), "--size", size],
-        on_success,
-        subprocess_env(ctx),
-    ))
-    return Response(content=json.dumps({"ok": True}), media_type="application/json")
+    await start_run(ctx, job_id, "measure", {"kind": "job_measure", "size": size})
+    return _ok()
 
 
 def _blender_bin() -> str | None:
     """Blender for the high-quality garment simulation, if this host has it."""
-    import shutil
     for cand in (_os.environ.get("BLENDER_PATH"), shutil.which("blender"),
                  "/Applications/Blender.app/Contents/MacOS/Blender"):
         if cand and Path(cand).is_file():
@@ -1161,51 +1703,40 @@ def _blender_bin() -> str | None:
 
 @router.get("/simulate/available", dependencies=[require_permission("resources:read")])
 async def simulate_available() -> Response:
-    return Response(content=json.dumps({"available": bool(_blender_bin())}), media_type="application/json")
+    return _ok({"available": bool(_blender_bin())})
 
 
 @router.post("/jobs/{job_id}/simulate", dependencies=[require_permission("resources:write")])
-async def simulate_garment(job_id: str, payload: UploadFile = File(...), ctx: PluginContext = Depends(get_plugin_context)) -> Response:
+async def simulate_garment(
+    job_id: str, payload: UploadFile = File(...), ctx: PluginContext = Depends(get_plugin_context)
+) -> Response:
     """High-quality cloth simulation in Blender: the workspace sends the fitted body +
     assembled pieces + stitches; the result is garment-sim.json (positions) +
-    garment.glb. Async: progress on the job's "simulate" event stream."""
-    blender = _blender_bin()
-    if not blender:
-        return JSONResponse({"available": False, "error": "Blender is not installed on this server"}, status_code=501)
-    paths = job_paths(job_id)
-    if not paths["dir"].is_dir():
-        return JSONResponse({"error": "no such job"}, status_code=404)
+    garment.glb. Async: progress on the job's "simulate" run."""
+    await authorize_job(ctx, job_id)
+    if not _blender_bin():
+        return JSONResponse({"available": False, "error": "Blender is not installed on this server"},
+                            status_code=501)
     raw = await payload.read()
     try:
         json.loads(raw)
     except ValueError:
         return JSONResponse({"error": "payload is not valid JSON"}, status_code=400)
-    sim_in = paths["dir"] / "garment-sim-input.json"
-    sim_in.write_bytes(raw)
     slot = job_slot(job_id, "simulate")
-    if slot in JOB_PROCS:
-        return Response(content=json.dumps({"job_id": job_id, "status": "running"}), media_type="application/json")
-
-    def on_success():
-        return {
-            "event": "stage_done", "stage": "simulate",
-            "result": _file_url(job_id, "garment-sim.json"),
-            "glb": _file_url(job_id, "garment.glb"),
-        }
-
-    JOB_QUEUES[slot] = asyncio.Queue()
-    asyncio.create_task(run_stage(
-        slot, "simulate",
-        [blender, "-b", "--factory-startup", "--python", str(PIPELINE_DIR / "blender_sim.py"), "--",
-         str(sim_in), str(paths["dir"] / "garment-sim.json"), str(paths["dir"] / "garment.glb")],
-        on_success,
-        subprocess_env(ctx),
-    ))
-    return Response(content=json.dumps({"job_id": job_id, "status": "queued"}), media_type="application/json")
+    if run_is_active(await get_run(ctx, slot)):
+        return _ok({"job_id": job_id, "status": "running"})
+    paths = job_paths(job_id)
+    paths["dir"].mkdir(parents=True, exist_ok=True)
+    (paths["dir"] / "garment-sim-input.json").write_bytes(raw)
+    await push_files(ctx, job_id, only=["garment-sim-input.json"])
+    await start_run(ctx, job_id, "simulate", {"kind": "simulate"})
+    return _ok({"job_id": job_id, "status": "queued"})
 
 
 @router.get("/jobs/{job_id}/parts", dependencies=[require_permission("resources:read")])
-async def job_parts(job_id: str) -> Response:
+async def job_parts(job_id: str, ctx: PluginContext = Depends(get_plugin_context)) -> Response:
+    await authorize_job(ctx, job_id)
+    await pull_files(ctx, job_id)
     paths = job_paths(job_id)
     # Every flat a job may have been traced from: jobs traced before the switch
     # to the input's own flat keep their parts under sketch_regen_seg/, and
@@ -1253,45 +1784,29 @@ async def job_parts(job_id: str) -> Response:
     return Response(content=json.dumps(payload), media_type="application/json")
 
 
-@router.get("/jobs/{job_id}/events", dependencies=[require_permission("resources:read")])
-async def job_events(job_id: str, stage: str | None = None) -> Response:
-    queue = JOB_QUEUES.get(job_slot(job_id, stage))
-    if queue is None:
-        return JSONResponse({"error": "unknown job_id"}, status_code=404)
-
-    async def gen():
-        while True:
-            line = await queue.get()
-            if line == "__END__":
-                break
-            yield f"data: {line}\n\n"
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
-
 
 @router.get("/jobs/{job_id}/file/{path:path}", dependencies=[require_permission("resources:read")])
-async def job_file(job_id: str, path: str, dl: int = 0) -> Response:
-    file_path = (JOBS_DIR / job_id / path).resolve()
-    if JOBS_DIR.resolve() not in file_path.parents or not file_path.is_file():
+async def job_file(
+    job_id: str, path: str, dl: int = 0, ctx: PluginContext = Depends(get_plugin_context)
+) -> Response:
+    await authorize_job(ctx, job_id)
+    # From the database through this server's cache: the file may have been
+    # written by a worker, or by a request that landed on another server.
+    file_path = await pull_one(ctx, job_id, path)
+    if file_path is None:
         return JSONResponse({"error": "not found"}, status_code=404)
     # This same URL is used two ways: an <a download> link that wants a real
     # save-as, and an <object>/<img> embed that wants the file rendered in
     # place. Content-Disposition: attachment satisfies the former but makes
-    # Chrome download an <object>'s SVG instead of displaying it (blank pane,
-    # no click needed to trigger it) -- so default to inline and only force
-    # attachment when the caller passes dl=1 (see downloadUrl() in api.ts).
-    # Chrome still needs a Content-Disposition header to honor <a download>
-    # cross-origin at all (frontend and this backend run on different ports),
-    # which is why this passes filename= either way instead of omitting the
-    # header for the inline case.
+    # Chrome download an <object>'s SVG instead of displaying it -- so default
+    # to inline and only force attachment when the caller passes dl=1 (see
+    # downloadUrl() in api.ts). Chrome still needs a Content-Disposition header
+    # to honor <a download> cross-origin at all, which is why this passes
+    # filename= either way.
     disposition = "attachment" if dl else "inline"
-    # Job files are rewritten in place by every redraft, while the frontend's
-    # ?v= cache-buster is the job's SKETCH mtime -- unchanged by a redraft. With
-    # no Cache-Control the browser kept heuristically serving stale copies
-    # (measured: a shorts job's pattern-pieces.json came back as its old
-    # 3-piece, polygon-less version, so the try-on's pattern view stayed off).
-    # no-cache = always revalidate; FileResponse's ETag/Last-Modified make an
-    # unchanged file a cheap 304.
+    # Job files are rewritten in place by every redraft; no-cache = always
+    # revalidate, and FileResponse's ETag/Last-Modified make an unchanged file
+    # a cheap 304.
     return FileResponse(file_path, filename=file_path.name, content_disposition_type=disposition,
                         headers={"Cache-Control": "no-cache"})
 
@@ -1327,9 +1842,10 @@ def _build_thumb(src: Path, dest: Path) -> None:
 
 
 @router.get("/jobs/{job_id}/thumb/{path:path}", dependencies=[require_permission("resources:read")])
-async def job_thumb(job_id: str, path: str) -> Response:
-    src = (JOBS_DIR / job_id / path).resolve()
-    if JOBS_DIR.resolve() not in src.parents or not src.is_file():
+async def job_thumb(job_id: str, path: str, ctx: PluginContext = Depends(get_plugin_context)) -> Response:
+    await authorize_job(ctx, job_id)
+    src = await pull_one(ctx, job_id, path)
+    if src is None:
         return JSONResponse({"error": "not found"}, status_code=404)
     cache = JOBS_DIR / job_id / ".thumbs" / (path.replace("/", "__") + ".png")
     try:

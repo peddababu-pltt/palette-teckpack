@@ -1,0 +1,11 @@
+{
+  "id": 904,
+  "plugin_id": "techpack",
+  "version": "1.1.37",
+  "env": "qa",
+  "url": "https://qa-api.pltt.ai",
+  "publish_type": "release",
+  "preview_url": null,
+  "preview_expires_at": null,
+  "published_at": "2026-11-23T12:09:48.428Z"
+}

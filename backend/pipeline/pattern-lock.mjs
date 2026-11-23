@@ -17,7 +17,9 @@ import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
 
-const LOCK_VERSION = 1
+// 2: custom drafts keep { pieces, construction } and re-draft the body from a block
+// (custom-block.mjs); a v1 lock's free-hand AI body outlines are discarded.
+const LOCK_VERSION = 2
 
 export function lockPathFor(outSvg) {
   return outSvg ? path.join(path.dirname(path.resolve(outSvg)), 'pattern-lock.json') : null

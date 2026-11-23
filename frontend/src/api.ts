@@ -8,7 +8,8 @@
 // simulator, whose generated CORS config is allow_origins="*" +
 // allow_credentials=False — those two can never coexist for a browser).
 
-import { getBaseUrl, setBaseUrl } from "@palettelab/sdk"
+import { createPaletteClient, getBaseUrl, hasPermission, setBaseUrl } from "@palettelab/sdk"
+import type { PlatformContext } from "@palettelab/sdk"
 
 // The SDK's module-level `getBaseUrl()` defaults to a hardcoded
 // "http://localhost:8000" and is only ever corrected by a call to
@@ -154,6 +155,20 @@ export interface Job {
   variations: Variation[]
   references: string[]
   outputs: JobOutputs
+  owner?: boolean // the caller created it (can share / delete); false = shared with them
+  shared?: JobShare | null // only sent to the owner
+}
+
+export interface JobShare {
+  org: boolean // everyone in the organisation can open it
+  users: string[] // teammates it is shared with, by user id
+}
+
+export interface OrgMember {
+  id: string
+  name: string | null
+  email: string | null
+  role?: string | null
 }
 
 export interface PatternMeasurement {
@@ -222,7 +237,7 @@ export interface PartsResponse {
 
 export type MeasureResult = Classification
 
-// ---------------- SSE event contract ----------------
+// ---------------- job run event contract ----------------
 
 export type SseHandlers = {
   onProgress?: (d: { event: "stage_progress"; stage: string; completed: number; total: number; percent: number }) => void
@@ -233,20 +248,40 @@ export type SseHandlers = {
   onLine?: (line: string) => void
 }
 
-// Opens an SSE stream for job_id, routes events to the matching handler.
-// `done` is a separate terminal sentinel from `stage_done`, which carries the
-// stage's payload (file urls, classification, etc).
-export function watchJob(pluginId: string, jobId: string, handlers: SseHandlers, stage?: string): EventSource {
-  // stage names which of the job's queues to read: parts and pattern run as
+/** A live watch on one job run; close() stops it. */
+export interface JobWatch {
+  close: () => void
+}
+
+const POLL_MS = 1000
+const POLL_MAX_FAILURES = 5
+
+// Follows one run of job_id by polling GET /jobs/<id>/run, and routes its
+// events to the matching handler. The run's state lives in the database, so
+// this works whichever server answers each poll, and keeps working after a
+// backend restart -- the old EventSource stream only existed on the one
+// server that started the job. `done` is a separate terminal sentinel from
+// `stage_done`, which carries the stage's payload (file urls, classification).
+export function watchJob(pluginId: string, jobId: string, handlers: SseHandlers, stage?: string): JobWatch {
+  // stage names which of the job's runs to read: parts and pattern run as
   // independent slots server-side, so omitting it only works for the
   // create-a-job routes, which never have a second stage running alongside.
-  const query = stage ? `?stage=${encodeURIComponent(stage)}` : ""
-  const path = withPreviewQuery(`${jobsBase(pluginId)}/${jobId}/events${query}`)
-  const es = new EventSource(`${getBaseUrl()}${path}`, { withCredentials: credentialsMode() === "include" })
-  es.onmessage = (ev) => {
+  const stageQuery = stage ? `&stage=${encodeURIComponent(stage)}` : ""
+  let after = 0
+  let closed = false
+  let failures = 0
+  let timer: ReturnType<typeof setTimeout> | null = null
+
+  const close = () => {
+    closed = true
+    if (timer) clearTimeout(timer)
+  }
+
+  // true = the run is over and nothing more will come
+  const dispatch = (raw: string): boolean => {
     let parsed: any = null
     try {
-      parsed = JSON.parse(ev.data)
+      parsed = JSON.parse(raw)
     } catch {
       // not JSON -> a raw subprocess log line
     }
@@ -256,26 +291,58 @@ export function watchJob(pluginId: string, jobId: string, handlers: SseHandlers,
       handlers.onStageDone?.(parsed)
     } else if (parsed && parsed.event === "error") {
       handlers.onError?.(parsed.message)
-      es.close()
+      return true
     } else if (parsed && parsed.event === "cancelled") {
       handlers.onCancelled?.()
-      es.close()
+      return true
     } else if (parsed && parsed.event === "done") {
       handlers.onDone?.()
-      es.close()
+      return true
     } else {
-      handlers.onLine?.(ev.data)
+      handlers.onLine?.(raw)
     }
+    return false
   }
-  // A dropped connection (network hiccup, dev server reload) otherwise leaves
-  // the caller's run promise unresolved forever -- the stage's spinner never
-  // clears and, since the engine's `live` entry is never removed, isLive()
-  // stays true and Rerun silently no-ops on it for good. Surface it instead.
-  es.onerror = () => {
-    handlers.onError?.("lost connection to the server")
-    es.close()
+
+  const poll = async () => {
+    if (closed) return
+    try {
+      const res = await apiCall(`${jobsBase(pluginId)}/${jobId}/run?after=${after}${stageQuery}`)
+      if (closed) return
+      if (res.status === 404) {
+        handlers.onError?.("this job has no run to follow")
+        close()
+        return
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data: { status: string; total: number; events: string[]; error?: string | null } = await res.json()
+      failures = 0
+      after = data.total
+      for (const ev of data.events || []) {
+        if (closed) return
+        if (dispatch(ev)) {
+          close()
+          return
+        }
+      }
+      // Finished without a terminal event left in the kept window: still end it.
+      if (data.status === "error") { handlers.onError?.(data.error || "the job failed"); close(); return }
+      if (data.status === "cancelled") { handlers.onCancelled?.(); close(); return }
+      if (data.status === "done") { handlers.onDone?.(); close(); return }
+    } catch {
+      // A dropped request (network hiccup, a server restarting) is retried; only
+      // a run of failures gives up, so the caller's spinner can't hang forever.
+      if (++failures >= POLL_MAX_FAILURES) {
+        handlers.onError?.("lost connection to the server")
+        close()
+        return
+      }
+    }
+    if (!closed) timer = setTimeout(poll, POLL_MS)
   }
-  return es
+
+  void poll()
+  return { close }
 }
 
 // ---------------- url helpers ----------------
@@ -500,6 +567,11 @@ export async function generateJob(
     if (params.season) fd.append("season", params.season)
     if (params.fabric) fd.append("fabric", params.fabric)
   }
+  // One id per Generate click, sent on the retry too: the gateway can answer
+  // 502/503/504 after the server already created the job, and the backend
+  // returns that same job for a repeated id instead of making a second one.
+  const requestId = Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => b.toString(16).padStart(2, "0")).join("")
+  fd.append("request_id", requestId)
   // A 502/503/504 without a JSON body is the platform's gateway answering for an
   // app that is restarting (right after a new version goes live): try once more
   // after a moment instead of failing the upload with a bare "request failed".
@@ -543,6 +615,78 @@ export async function deleteJobApi(pluginId: string, jobId: string): Promise<voi
   await apiCall(`${jobsBase(pluginId)}/${jobId}`, { method: "DELETE" })
 }
 
+export async function listMembers(
+  pluginId: string,
+  platform?: PlatformContext,
+): Promise<{ available: boolean; members: OrgMember[] }> {
+  try {
+    // jobsBase() minus its trailing "/jobs": apiCall wants a path, not base()'s full URL
+    const res = await apiCall(`${jobsBase(pluginId).slice(0, -"/jobs".length)}/members`)
+    if (res.ok) {
+      const data = await res.json()
+      if (data.available) return data
+    }
+  } catch {
+    // fall through to the platform's own member list
+  }
+  // The backend's member service isn't there (pltt dev, or a runtime without it):
+  // ask the platform directly -- same organisation, same members:read grant.
+  if (!canReadMembers(platform)) return { available: false, members: [] }
+  try {
+    const raw = await createPaletteClient(platform).organization.listMembers()
+    const me = platform?.user?.id != null ? String(platform.user.id) : null
+    const members = (raw || [])
+      .filter((m) => m && m.is_active !== false && String(m.id) !== me)
+      .map((m) => ({ id: String(m.id), name: m.name || null, email: m.email || null, role: m.role || null }))
+    return { available: true, members }
+  } catch {
+    return { available: false, members: [] }
+  }
+}
+
+// SDK hasPermission() is false when the context carries no permission list at
+// all, so only a list that is there and lacks members:read counts as a "no".
+function canReadMembers(platform?: PlatformContext): boolean {
+  return !platform?.permissions || hasPermission(platform, "members:read")
+}
+
+/** One org member by email (SDK organization.getMemberByEmail), or null when
+ *  nobody in this organisation has that address or the lookup isn't available. */
+export async function findMemberByEmail(email: string, platform?: PlatformContext): Promise<OrgMember | null> {
+  if (!canReadMembers(platform)) return null
+  try {
+    const m = await createPaletteClient(platform).organization.getMemberByEmail(email)
+    if (!m || m.is_active === false) return null
+    return { id: String(m.id), name: m.name || null, email: m.email || null, role: m.role || null }
+  } catch {
+    return null
+  }
+}
+
+export async function getShare(pluginId: string, jobId: string): Promise<JobShare | null> {
+  try {
+    const res = await apiCall(`${jobsBase(pluginId)}/${jobId}/share`)
+    return res.ok ? await res.json() : null
+  } catch {
+    return null
+  }
+}
+
+export async function setShare(pluginId: string, jobId: string, share: JobShare): Promise<{ error?: string }> {
+  try {
+    const res = await apiCall(`${jobsBase(pluginId)}/${jobId}/share`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(share),
+    })
+    if (res.ok) return {}
+    const data = await res.json().catch(() => ({}))
+    return { error: data.error || data.detail || `HTTP ${res.status}` }
+  } catch (err: any) {
+    return { error: err?.message || String(err) }
+  }
+}
+
 export async function cancelJobApi(pluginId: string, jobId: string, stage?: string): Promise<void> {
   const query = stage ? `?stage=${encodeURIComponent(stage)}` : ""
   try {
@@ -552,7 +696,7 @@ export async function cancelJobApi(pluginId: string, jobId: string, stage?: stri
   }
 }
 
-export async function startStage4(pluginId: string, jobId: string): Promise<{ ok?: boolean; error?: string }> {
+export async function startStage4(pluginId: string, jobId: string): Promise<{ ok?: boolean; error?: string; generating?: boolean }> {
   try {
     const res = await apiCall(`${jobsBase(pluginId)}/${jobId}/stage4`, { method: "POST" })
     return await res.json()
@@ -588,7 +732,7 @@ export async function startStage5(
   pluginId: string,
   jobId: string,
   params?: PatternParams,
-): Promise<{ ok?: boolean; error?: string }> {
+): Promise<{ ok?: boolean; error?: string; generating?: boolean }> {
   let body: FormData | undefined
   if (params) {
     body = new FormData()

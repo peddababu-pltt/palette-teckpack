@@ -20,6 +20,7 @@ import Gallery from "./Gallery"
 import Overlay from "./Overlay"
 import TopBar from "./TopBar"
 import { ConfirmProvider, useConfirm } from "./ConfirmDialog"
+import ShareDialog from "./ShareDialog"
 
 // Measures the sticky sidebar's real usable height: it sits ~92px down until
 // the page header scrolls away, so its available height changes as the page
@@ -143,8 +144,14 @@ function AppInner(_props: PluginComponentProps) {
     return () => window.clearInterval(id)
   }, [anyGenerating, reloadJobs])
 
+  // A second click while the first upload is still in flight is ignored: the
+  // button only disables once React re-renders, and a quick double click got
+  // in before that and started two techpacks from one input.
+  const submittingRef = useRef(false)
   const handleGenerate = useCallback(
     async (sub: GenerateSubmission) => {
+      if (submittingRef.current) return
+      submittingRef.current = true
       setGenerating(true)
       setGenPercent(0)
       const res = await generateJob(pluginId, {
@@ -158,6 +165,7 @@ function AppInner(_props: PluginComponentProps) {
         season: sub.season,
         fabric: sub.fabric,
       })
+      submittingRef.current = false
       if ("error" in res) {
         setGenerating(false)
         void confirm({ title: t("app.generateFailed"), message: res.error, confirmLabel: t("app.confirmOk"), cancelLabel: "" })
@@ -226,16 +234,26 @@ function AppInner(_props: PluginComponentProps) {
   )
 
   const handleDeleteAll = useCallback(async () => {
-    if (jobs.length === 0) return
+    // Only the caller's own techpacks: ones shared with them aren't theirs to delete
+    // (the backend refuses those anyway).
+    const owned = jobs.filter((j) => j.owner !== false)
+    if (owned.length === 0) return
+    const someShared = owned.length < jobs.length
     const ok = await confirm({
-      title: t("app.confirmDeleteTitle"), message: t("app.confirmDeleteAll", { count: jobs.length }),
+      title: t("app.confirmDeleteTitle"),
+      message: someShared
+        ? t("app.confirmDeleteAllOwned", { count: owned.length })
+        : t("app.confirmDeleteAll", { count: owned.length }),
       confirmLabel: t("app.confirmDeleteOk"), danger: true,
     })
     if (!ok) return
-    await Promise.all(jobs.map((j) => deleteJobApi(pluginId, j.job_id)))
+    await Promise.all(owned.map((j) => deleteJobApi(pluginId, j.job_id)))
     setOverlay(null)
     await reloadJobs()
   }, [jobs, pluginId, reloadJobs, t, confirm])
+
+  const [shareJobId, setShareJobId] = useState<string | null>(null)
+  const shareJob = shareJobId ? jobs.find((j) => j.job_id === shareJobId) : null
 
   const overlayJob = overlay ? jobs.find((j) => j.job_id === overlay.jobId) : null
 
@@ -271,11 +289,14 @@ function AppInner(_props: PluginComponentProps) {
           <Gallery
             jobs={jobs}
             generating={generating}
+            generatingJobId={generating ? latestJobId : null}
             genPercent={genPercent}
             search={search}
             onCancelGenerate={handleCancelGenerate}
+            onCancelJob={(job) => void cancelJobApi(pluginId, job.job_id)}
             onOpenCard={openCard}
             onDeleteJob={handleDeleteJob}
+            onShareJob={(job) => setShareJobId(job.job_id)}
           />
         </div>
       </main>
@@ -289,6 +310,18 @@ function AppInner(_props: PluginComponentProps) {
           onTabChange={(tab) => setOverlay({ jobId: overlayJob.job_id, tab })}
           onClose={() => setOverlay(null)}
           onPatchJob={patchJob}
+        />
+      )}
+
+      {shareJob && (
+        <ShareDialog
+          pluginId={pluginId}
+          job={shareJob}
+          onClose={() => setShareJobId(null)}
+          onSaved={() => {
+            setShareJobId(null)
+            void reloadJobs()
+          }}
         />
       )}
     </div>

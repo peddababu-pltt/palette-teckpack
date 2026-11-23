@@ -30,6 +30,7 @@ ensure(modules=["scipy", "skimage"], packages=["scipy==1.18.0", "scikit-image==0
 import numpy as np  # noqa: E402
 from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 from scipy import ndimage  # noqa: E402
+from scipy.spatial import cKDTree  # noqa: E402
 from skimage.draw import line as draw_line  # noqa: E402
 from skimage.morphology import skeletonize  # noqa: E402
 
@@ -279,6 +280,120 @@ GREY_PIXEL_MIN = 100  # a pixel at least this light can be grey design...
 GREY_CORE_T = 90      # ...unless within GREY_CORE_EDGE px of a pixel darker
 GREY_CORE_EDGE = 2    # than this (a black stroke's own anti-aliased edge)
 GREY_RUN_MIN = int(os.environ.get("GREY_RUN_MIN", "40"))  # px: shortest grey run kept
+# Texture fields (mesh, dot/check prints): hundreds of tiny marks whose
+# darkness straddles GREY_DESIGN_MIN, so the darkness rule kept the darker half
+# as black ink and sent the rest to grey.png -- and the tracer then dropped the
+# black dots as specks/stitch marks, leaving the yoke blank in patches with
+# black scraps. A mark that small with that many small neighbours in 2D is
+# texture as a whole. A dash run or a zip's teeth is 1D and never gets near
+# TEXTURE_MIN_NEIGHBOURS within the radius; buttons and snaps are isolated.
+TEXTURE_MARK_MAX = int(os.environ.get("TEXTURE_MARK_MAX", "40"))   # px area
+TEXTURE_RADIUS = int(os.environ.get("TEXTURE_RADIUS", "20"))       # px
+TEXTURE_MIN_NEIGHBOURS = int(os.environ.get("TEXTURE_MIN_NEIGHBOURS", "15"))  # 0 disables
+TEXTURE_CLUMP_MAX = int(os.environ.get("TEXTURE_CLUMP_MAX", "300"))
+                   # px area: a few dots fused into one mark inside the same
+                   # field is texture too (left black, the tracer read the
+                   # clumps as buttons). Judged by the SMALL marks around it,
+                   # so an isolated button or snap never qualifies.
+TEXTURE_MAX_ASPECT = float(os.environ.get("TEXTURE_MAX_ASPECT", "2.5"))
+TEXTURE_HALO_T = int(os.environ.get("TEXTURE_HALO_T", "210"))
+TEXTURE_RESIDUE_DENSITY = float(os.environ.get("TEXTURE_RESIDUE_DENSITY", "0.15"))
+
+
+def texture_field(a):
+    """Pixel mask of dense dot/mesh texture (see TEXTURE_MARK_MAX).
+
+    Labelled 4-connected, not 8: mesh dots touch diagonally, and chained
+    corner to corner they join the garment outline into one huge 8-connected
+    mark that no per-mark rule can split -- the yoke kept a black border of
+    dots that the tracer dropped, leaving white patches. Only compact marks
+    count (>= 3px, aspect <= TEXTURE_MAX_ASPECT), so a 1px diagonal hairline
+    that 4-connectivity cuts into single pixels is never mistaken for dots."""
+    lab4, n4 = ndimage.label(a < GREY_DESIGN_INK)
+    if not n4:
+        return None
+    idx = np.arange(1, n4 + 1)
+    areas = ndimage.sum_labels(np.ones_like(a), lab4, idx)
+    objs = ndimage.find_objects(lab4)
+    hw = np.array([(sl[0].stop - sl[0].start, sl[1].stop - sl[1].start) for sl in objs])
+    aspect = hw.max(axis=1) / np.maximum(1, hw.min(axis=1))
+    compact = (areas >= 3) & (aspect <= TEXTURE_MAX_ASPECT)
+    small = np.nonzero(compact & (areas <= TEXTURE_MARK_MAX))[0]
+    if len(small) <= TEXTURE_MIN_NEIGHBOURS:
+        return None
+    cen = np.array(ndimage.center_of_mass(np.ones_like(a), lab4, small + 1))
+    near_n = np.array([len(x) - 1 for x in
+                       cKDTree(cen).query_ball_point(cen, TEXTURE_RADIUS)])
+    in_field = near_n >= TEXTURE_MIN_NEIGHBOURS
+    if not in_field.any():
+        return None
+    # A dot on the field's own edge has half the neighbours of one inside
+    # it; let it join on a third of the count, all of which must already be
+    # field marks.
+    edge_n = np.array([len(x) for x in cKDTree(cen[in_field]).query_ball_point(
+        cen, TEXTURE_RADIUS)])
+    in_field |= edge_n >= max(1, TEXTURE_MIN_NEIGHBOURS // 3)
+    field = small[in_field]
+    clump = np.nonzero(compact & (areas > TEXTURE_MARK_MAX) & (areas <= TEXTURE_CLUMP_MAX))[0]
+    if len(clump):
+        ccen = np.array(ndimage.center_of_mass(np.ones_like(a), lab4, clump + 1))
+        c_n = np.array([len(x) for x in
+                        cKDTree(cen[in_field]).query_ball_point(ccen, TEXTURE_RADIUS)])
+        field = np.concatenate([field, clump[c_n >= TEXTURE_MIN_NEIGHBOURS]])
+    keep = np.zeros(n4 + 1, bool)
+    keep[field + 1] = True
+    return keep[lab4]
+
+
+TEXTURE_ZONE = os.environ.get("TEXTURE_ZONE", "1") != "0"
+TEXTURE_ZONE_DENSITY = 0.18   # ink fraction in a 15px window
+TEXTURE_ZONE_COHERENCE = 0.35  # below = no dominant direction (mesh/check/dots)
+TEXTURE_ZONE_MIN_AREA = 1500   # px: smaller patches are not a fabric zone
+TEXTURE_ZONE_GROW = 12         # px: reach from the zone core out to its seams
+TEXTURE_LINE_CORE = 60         # darker than this inside a zone = a real seam
+
+
+def texture_zone(a):
+    """Pixel mask of all-over texture (mesh, check, dense dots) and none of
+    the seams running through or around it.
+
+    Per-mark rules split a connected mesh into a patchwork -- part of it grey,
+    part left as black ink the tracer then dropped -- so the yoke came out
+    with white patches and black scraps. A texture zone is found from local
+    structure instead: dense ink with NO dominant direction (low structure-
+    tensor coherence). Lines, rib ticks, quilting and stripes are all strongly
+    oriented and never qualify; on the garments tested only the mesh yokes
+    did. Inside the zone, a seam is told from the texture by darkness: the
+    mesh never prints darker than ~80 while drawn lines have near-black cores,
+    so pixels within 2px of a <TEXTURE_LINE_CORE core stay black ink."""
+    f = a.astype(np.float32)
+    dens = ndimage.uniform_filter((f < 200).astype(np.float32), 15)
+    g = ndimage.gaussian_filter(f, 1.0)
+    gx, gy = ndimage.sobel(g, 1), ndimage.sobel(g, 0)
+    jxx = ndimage.gaussian_filter(gx * gx, 5)
+    jyy = ndimage.gaussian_filter(gy * gy, 5)
+    jxy = ndimage.gaussian_filter(gx * gy, 5)
+    tr = jxx + jyy
+    coh = np.sqrt((jxx - jyy) ** 2 + 4 * jxy ** 2) / (tr + 1e-6)
+    z = ((dens >= TEXTURE_ZONE_DENSITY) & (coh <= TEXTURE_ZONE_COHERENCE)
+         & (tr > np.percentile(tr, 50)))
+    z = ndimage.binary_opening(z, iterations=3)
+    lab, n = ndimage.label(z)
+    if not n:
+        return None
+    ar = ndimage.sum_labels(z, lab, np.arange(1, n + 1))
+    z = np.isin(lab, np.nonzero(ar >= TEXTURE_ZONE_MIN_AREA)[0] + 1)
+    if not z.any():
+        return None
+    z = ndimage.binary_dilation(ndimage.binary_fill_holes(z), iterations=TEXTURE_ZONE_GROW)
+    core = a < TEXTURE_LINE_CORE
+    # an isolated dark fleck inside the mesh is texture, not a seam
+    cl, cn = ndimage.label(core & z, structure=np.ones((3, 3)))
+    if cn:
+        small = ndimage.sum_labels(np.ones_like(a), cl, np.arange(1, cn + 1)) < 20
+        core &= ~np.concatenate([[False], small])[cl]
+    keep = ndimage.binary_dilation(core, iterations=2)
+    return (a < GREY_DESIGN_INK) & z & ~keep
 
 
 def strip_grey_design(img):
@@ -295,7 +410,15 @@ def strip_grey_design(img):
     idx = np.arange(1, n + 1)
     darkest = ndimage.minimum(a, lab, idx)
     is_grey = darkest >= GREY_DESIGN_MIN
+    areas = ndimage.sum_labels(np.ones_like(a), lab, idx)
+    tex = texture_field(a) if TEXTURE_MIN_NEIGHBOURS else None
+    zone = texture_zone(a) if TEXTURE_ZONE else None
+    if zone is not None:
+        tex = zone if tex is None else (tex | zone)
     grey = np.concatenate([[False], is_grey])[lab]
+    if tex is not None and tex.any():
+        print(f"grey design: {int((tex & ~grey).sum())}px of texture-field dots moved to grey")
+        grey |= tex
     # Pixel rule on top of the whole-mark rule: the redraw does not always
     # keep its grey lines clear of the black ones, and one quilting lattice
     # touching the outline makes the whole lattice a single mark with a black
@@ -317,11 +440,23 @@ def strip_grey_design(img):
     # prints darker than either line and splits off as its own tiny mark that
     # passes the darkness test -- it was traced as a black dot at every
     # quilting crossing. A speck that small sitting on grey design is grey.
-    areas = ndimage.sum_labels(np.ones_like(a), lab, idx)
     near = ndimage.binary_dilation(grey, iterations=2)
     touches = ndimage.maximum(near, lab, idx).astype(bool)
     speck = (~is_grey) & (areas <= GREY_SPECK_MAX) & touches
     grey |= np.concatenate([[False], speck])[lab]
+    if TEXTURE_MIN_NEIGHBOURS and grey.any():
+        # The pixel rule peels a connected dot lattice down to its darkest
+        # cores, leaving 1-8px black bits all over the texture that the tracer
+        # then reads as buttons. A mark that small in an area this dense with
+        # grey design is part of it (a quilting line is ~5% of such a window).
+        density = ndimage.uniform_filter(grey.astype(np.float32), 2 * TEXTURE_RADIUS + 1)
+        rl, rn = ndimage.label((a < GREY_DESIGN_INK) & ~grey, structure=np.ones((3, 3)))
+        if rn:
+            ridx = np.arange(1, rn + 1)
+            r_area = ndimage.sum_labels(np.ones_like(a), rl, ridx)
+            r_dens = ndimage.mean(density, rl, ridx)
+            residue = (r_area <= TEXTURE_MARK_MAX) & (r_dens >= TEXTURE_RESIDUE_DENSITY)
+            grey |= np.concatenate([[False], residue])[rl]
     out = a.copy()
     out[grey] = 255
     if not grey.any():
@@ -452,7 +587,43 @@ def split_dangling_seams(ink, final, min_area, gap_tol=25):
 FILL_GAP_MAX = 30  # px: farthest an enclosed unlabeled pixel may sit from a region
 
 
-def fill_enclosed_gaps(ink, final):
+# A sealed rib band (see fill_enclosed_gaps): at least this many separate white
+# strips between rib lines, packed this close together.
+RIB_BAND_MIN_STRIPS = 3
+RIB_BAND_JOIN_PX = 4
+
+
+def _rib_bands(gaps, final, min_area):
+    """Groups of enclosed white strips that are a whole rib band with no region.
+
+    When ribbing is drawn tighter than the barrier closing's reach (gaps of
+    ~4px), every strip between the rib lines is sealed shut, so a rib cuff gets
+    NO region at all -- not even a small one to hand its leftover white to. Its
+    outline then belonged to nothing but a sliver of the sleeve, and the cuff
+    came out of the SVG with broken sides and open corners. Strips packed
+    together like that are one band: returned as label masks to become their
+    own region (closed across the rib lines between them)."""
+    joined = ndimage.binary_dilation(gaps, structure=np.ones((3, 3)), iterations=RIB_BAND_JOIN_PX)
+    gl, gn = ndimage.label(joined)
+    bands = []
+    for g in range(1, gn + 1):
+        zone = gl == g
+        strips = gaps & zone
+        _, ns = ndimage.label(strips)
+        if ns < RIB_BAND_MIN_STRIPS:
+            continue
+        # the band's body: its strips plus the rib ink between them, kept off
+        # every region that already exists
+        body = ndimage.binary_closing(strips, structure=np.ones((3, 3)),
+                                      iterations=RIB_BAND_JOIN_PX) & (final == 0)
+        body = ndimage.binary_fill_holes(body) & (final == 0)
+        if body.sum() < min_area // 4:
+            continue
+        bands.append(body)
+    return bands
+
+
+def fill_enclosed_gaps(ink, final, min_area=0):
     """Hand enclosed white the segmentation left unlabeled to the nearest region.
 
     The barrier closing that seals hairline breaks also fills tight gaps
@@ -469,6 +640,13 @@ def fill_enclosed_gaps(ink, final):
     gaps = white & ~np.isin(wl, border) & (final == 0)
     if not gaps.any() or not final.any():
         return final
+    # whole rib bands that got no region become regions of their own first
+    if min_area:
+        final = final.copy()
+        for band in _rib_bands(gaps, final, min_area):
+            final[band] = int(final.max()) + 1
+            gaps &= ~band
+            print(f"rib band sealed shut by the closing: kept as its own region ({int(band.sum())}px)")
     dist, (iy, ix) = ndimage.distance_transform_edt(final == 0, return_indices=True)
     take = gaps & (dist <= FILL_GAP_MAX)
     out = final.copy()
@@ -476,6 +654,61 @@ def fill_enclosed_gaps(ink, final):
     print(f"enclosed gaps: {int(take.sum())}px of unlabeled interior joined "
           f"to the nearest region")
     return out
+
+
+OUTSIDE_MARGIN = int(os.environ.get("OUTSIDE_MARGIN", "15"))   # px; 0 disables
+OUTSIDE_MAX_FRAC = 0.01   # only marks this small vs the biggest drawing go
+
+
+def strip_outside_marks(src):
+    """Drop caption text that sits entirely outside the garment drawing --
+    "FRONT" / "BACK" labels. Nothing out there is a piece, but
+    caption letters are rings (O, R, B, A) and were traced as buttons on the
+    nearest part (the hem). The silhouette is every large drawing (each view)
+    with its holes filled, grown by OUTSIDE_MARGIN so a detached drawcord tip
+    or a detail drawn just off the edge still counts as inside."""
+    if not OUTSIDE_MARGIN:
+        return src
+    aa = np.array(src)
+    lab, n = ndimage.label(aa < 160, structure=np.ones((3, 3)))
+    if n < 2:
+        return src
+    areas = ndimage.sum_labels(np.ones_like(aa), lab, np.arange(1, n + 1))
+    biggest = areas.max()
+    garment = np.isin(lab, np.nonzero(areas >= biggest * 0.05)[0] + 1)
+    sil = ndimage.binary_dilation(ndimage.binary_fill_holes(garment),
+                                  iterations=OUTSIDE_MARGIN)
+    inside = ndimage.maximum(sil, lab, np.arange(1, n + 1)).astype(bool)
+    out = np.nonzero((~inside) & (areas < biggest * OUTSIDE_MAX_FRAC))[0]
+    if not len(out):
+        return src
+    # Outside the filled silhouette is not proof on its own: a view whose
+    # outline is drawn broken never fills, and its seams would read as
+    # outside. Only drop what looks like a caption -- letter-sized marks of
+    # similar height sitting in a row with each other. (Not bare specks: a
+    # faint raw flat draws whole seams as dotted fragments.)
+    objs = ndimage.find_objects(lab)
+    H = aa.shape[0]
+    box = np.array([(objs[i][0].start, objs[i][0].stop, objs[i][1].start, objs[i][1].stop)
+                    for i in out])
+    hh = box[:, 1] - box[:, 0]
+    ww = box[:, 3] - box[:, 2]
+    cy = (box[:, 0] + box[:, 1]) / 2
+    cx = (box[:, 2] + box[:, 3]) / 2
+    letter = (hh >= 6) & (hh <= 0.06 * H) & (ww <= 1.6 * hh)
+    drop = np.zeros(n, bool)
+    for k, i in enumerate(out):
+        if not letter[k]:
+            continue
+        row = (letter & (np.abs(cy - cy[k]) < 0.3 * hh[k])
+               & (np.abs(hh - hh[k]) < 0.4 * hh[k]) & (np.abs(cx - cx[k]) < 3 * hh[k]))
+        row[k] = False
+        drop[i] = row.any()
+    if not drop.any():
+        return src
+    aa[np.concatenate([[False], drop])[lab]] = 255
+    print(f"  stripped {int(drop.sum())} marks outside the garment (captions, specks)")
+    return Image.fromarray(aa)
 
 
 def main(in_png, outdir, min_area=1500, _tile_escalations=0, _drop_thin=False):
@@ -488,6 +721,15 @@ def main(in_png, outdir, min_area=1500, _tile_escalations=0, _drop_thin=False):
     # onto work.png (which is this image at most upscaled and edge-trimmed).
     grey_img = np.full(grey.shape, 255, np.uint8)
     grey_img[grey] = np.array(load_gray(in_png))[grey]
+    if TEXTURE_MIN_NEIGHBOURS and grey.any():
+        # Inside a dense dot field, the dots' light anti-aliased halos touch
+        # corner to corner, and the traced grey layer fused the mesh into
+        # worm-like strands. Dropping the halo there keeps every dot its own
+        # mark. Quilting and stripe lines are far below the field density and
+        # keep their full weight.
+        dense = ndimage.uniform_filter(grey.astype(np.float32),
+                                       2 * TEXTURE_RADIUS + 1) >= TEXTURE_RESIDUE_DENSITY
+        grey_img[grey & dense & (grey_img >= TEXTURE_HALO_T)] = 255
     Image.fromarray(grey_img).save(os.path.join(outdir, "grey.png"))
     # thin-line sketches trace badly at low res: upscale small images 2x
     if max(src.size) < 1400:
@@ -534,6 +776,7 @@ def main(in_png, outdir, min_area=1500, _tile_escalations=0, _drop_thin=False):
                 print(f"  stripped view-divider line: bbox "
                       f"{sl[1].start},{sl[0].start},{sl[1].stop},{sl[0].stop}")
         src = Image.fromarray(aa)
+    src = strip_outside_marks(src)
     src.save(os.path.join(outdir, "work.png"))   # canonical working image
     a = np.array(src)
     H, W = a.shape
@@ -784,7 +1027,7 @@ def main(in_png, outdir, min_area=1500, _tile_escalations=0, _drop_thin=False):
         final[lab == i] = remap[r]
 
     final = split_dangling_seams(seg_ink, final, min_area)
-    final = fill_enclosed_gaps(ink, final)
+    final = fill_enclosed_gaps(ink, final, min_area)
     next_id = int(final.max()) + 1
 
     np.save(os.path.join(outdir, "labels.npy"), final)
